@@ -1,0 +1,102 @@
+{
+  "name": "cinchpos-frontend",
+  "version": "1.0.0",
+  "description": "CinchPOS desktop billing and ERP app.",
+  "author": "CinchLive Technologies Pvt. Ltd.",
+  "private": true,
+  "type": "module",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "desktop:prepare": "node scripts/prepare-desktop-assets.mjs",
+    "backend:prepare:win-runtime": "node scripts/prepare-windows-backend-runtime.mjs",
+    "backend:prepare:vendor": "node scripts/prepare-backend-vendor.mjs",
+    "backend:bundle": "node scripts/bundle-backend.mjs",
+    "test:frontend": "node scripts/run-frontend-tests.mjs",
+    "test:backend": "node scripts/run-backend-tests.mjs",
+    "test": "npm run test:frontend && npm run test:backend",
+    "desktop": "npm run build && electron electron/main.cjs",
+    "desktop:open": "electron electron/main.cjs",
+    "desktop:dist": "npm run desktop:prepare && npm run backend:bundle && npm run build && electron-builder",
+    "desktop:dist:mac": "npm run desktop:prepare && npm run backend:bundle && npm run build && electron-builder --mac dmg pkg zip dir",
+    "desktop:dist:win": "npm run desktop:prepare && npm run backend:prepare:win-runtime && npm run build && electron-builder --win nsis portable zip --x64",
+    "desktop:dist:linux": "npm run desktop:prepare && npm run backend:prepare:vendor && npm run build && electron-builder --linux AppImage zip --x64",
+    "desktop:dist:all": "npm run desktop:dist:mac && npm run desktop:dist:win && npm run desktop:dist:linux"
+  },
+  "dependencies": {
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "electron": "^41.2.1",
+    "electron-builder": "^26.8.1",
+    "next": "16.2.4",
+    "png-to-ico": "^3.0.1",
+    "react": "19.2.5",
+    "react-dom": "19.2.5"
+  },
+  "build": {
+    "appId": "com.cinchlive.cinchpos",
+    "productName": "CinchPOS",
+    "asar": true,
+    "compression": "maximum",
+    "files": [
+      "out/**/*",
+      "electron/**/*",
+      "build/icon.icns",
+      "build/icon.ico",
+      "build/icon.png",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "../backend",
+        "to": "backend",
+        "filter": [
+          "app.py",
+          "database.db",
+          "requirements.txt",
+          "dist/cinchpos-backend",
+          "dist/cinchpos-backend.exe",
+          "runtime/windows-python/**",
+          "vendor/**",
+          "!__pycache__/**",
+          "!build/**",
+          "!.venv/**",
+          "!*.spec"
+        ]
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.business",
+      "icon": "build/icon.icns",
+      "target": [
+        "dir",
+        "dmg",
+        "pkg",
+        "zip"
+      ]
+    },
+    "win": {
+      "icon": "build/icon.ico",
+      "target": [
+        "nsis",
+        "portable",
+        "zip"
+      ]
+    },
+    "linux": {
+      "icon": "build/icon.png",
+      "category": "Office",
+      "target": [
+        "AppImage",
+        "zip"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  }
+}

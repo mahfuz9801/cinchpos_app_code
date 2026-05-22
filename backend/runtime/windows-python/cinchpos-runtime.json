@@ -1,0 +1,14 @@
+{
+  "pythonUrl": "https://www.python.org/ftp/python/3.13.7/python-3.13.7-embed-amd64.zip",
+  "pythonVersion": "3.13.7",
+  "generatedAt": "2026-05-18T17:07:22.444Z",
+  "packagedDependencies": [
+    "flask",
+    "blinker",
+    "click",
+    "itsdangerous",
+    "jinja2",
+    "werkzeug",
+    "markupsafe"
+  ]
+}
