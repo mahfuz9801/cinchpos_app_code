@@ -2,6 +2,10 @@ export const APP_NAME = "CinchPOS";
 export const APP_COMPANY = "CinchLive Technologies Pvt. Ltd.";
 export const DEFAULT_STORE_NAME = "Store Name";
 export const CINCHPOS_LOGO_SRC = "/brand/cinchpos-logo.png";
+export const DEFAULT_WALK_IN_CUSTOMER_NAME = "Walk-in Customer";
+export const DEFAULT_WALK_IN_CUSTOMER_PHONE = "+9100000000";
+export const SUPPORT_PHONE = "+91 9038956555";
+export const SUPPORT_EMAIL = "cinchlive@gmail.com";
 
 export const defaultSettings = {
   appearance: "system",
@@ -21,6 +25,8 @@ export const defaultSettings = {
   invoiceNotes: "",
   startupView: "dashboardView",
   printPaperSize: "80mm",
+  printLayout: "thermal",
+  printMargin: "default",
   printFooter: "Thank you for shopping with us.",
   printShopLogoOnBill: false,
   autoPrintAfterBilling: false,
@@ -43,6 +49,7 @@ export const storageKeys = {
   purchaseBills: "cinchPOSPurchaseBills",
   documents: "cinchPOSStoreDocuments",
   employees: "cinchPOSEmployees",
+  sellOnline: "cinchPOSSellOnline",
   pos: "cinchPOSReactPOSState",
   trendView: "billingTrendView",
   trendStart: "billingTrendStartDate",
@@ -55,6 +62,7 @@ export const appViews = [
   { id: "invoicesView", title: "Invoices", icon: "invoice" },
   { id: "customerInfoView", title: "Customer Info", icon: "customer" },
   { id: "inventoryView", title: "Inventory", icon: "inventory" },
+  { id: "sellOnlineView", title: "Sell Online", icon: "online" },
   { id: "purchaseView", title: "Purchase", icon: "purchase" },
   { id: "expensesView", title: "Expenses", icon: "expenses" },
   { id: "salesReportView", title: "Sales Report", icon: "report" },
@@ -70,6 +78,8 @@ export const routeViewMap = {
   invoices: "invoicesView",
   customers: "customerInfoView",
   inventory: "inventoryView",
+  "sell-online": "sellOnlineView",
+  sellOnline: "sellOnlineView",
   purchase: "purchaseView",
   expenses: "expensesView",
   sales: "salesReportView",
@@ -82,6 +92,8 @@ export const routeViewMap = {
 export const defaultPOSCustomer = {
   phone: "",
   name: "",
+  email: "",
+  address: "",
   customerId: "",
   paymentMethod: "Cash",
   paymentType: "full",

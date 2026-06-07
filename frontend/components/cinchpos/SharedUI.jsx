@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { currency, statusClass } from "@/lib/format";
-import { APP_NAME, CINCHPOS_LOGO_SRC } from "@/lib/cinchpos/constants";
+import { APP_NAME, CINCHPOS_LOGO_SRC, SUPPORT_EMAIL, SUPPORT_PHONE } from "@/lib/cinchpos/constants";
 
 export function AppLogo({ className = "" }) {
   return (
@@ -40,10 +40,12 @@ export function HeaderTitle({ storeName, title, eyebrow }) {
 }
 
 export function HeaderSupportMenu() {
+  const phoneHref = `tel:${SUPPORT_PHONE.replace(/\s+/g, "")}`;
+  const mailHref = `mailto:${SUPPORT_EMAIL}`;
   return (
     <nav className="toolbar-actions header-support-menu" aria-label="Support links">
-      <a className="button button-secondary" href="mailto:support@cinchlive.com">Contact Us</a>
-      <a className="button button-secondary" href="#support">Support</a>
+      <a className="button button-secondary" href={phoneHref} title={`${SUPPORT_PHONE} | ${SUPPORT_EMAIL}`}>Contact Us</a>
+      <a className="button button-secondary" href={mailHref}>Support</a>
       <a className="button button-secondary" href="#help-center">Help Center</a>
     </nav>
   );
@@ -78,6 +80,7 @@ export function IconSprite() {
       <symbol id="icon-invoice" viewBox="0 0 24 24"><path d="M7 4h10v16l-2-1-2 1-2-1-2 1-2-1zM9 8h6M9 11h6M9 15h2.5M13 15h2M10 18h4"></path></symbol>
       <symbol id="icon-customer" viewBox="0 0 24 24"><path d="M4 6h16v12H4zM8 10.25a2 2 0 1 0 0 4 2 2 0 0 0 0-4zM12 10h5M12 13h4M12 16h3M5 6l2-2h10l2 2"></path></symbol>
       <symbol id="icon-inventory" viewBox="0 0 24 24"><path d="M5 5h14v14H5zM5 10h14M5 15h14M8 7.5h3M13 7.5h3M8 12.5h2.5M13 12.5h3M8 17.5h3M14 17.5h2"></path></symbol>
+      <symbol id="icon-online" viewBox="0 0 24 24"><path d="M4 7h16l-1.5 12h-13zM7 7a5 5 0 0 1 10 0M8 11h8M9 15h6M12 11v4M6.5 19h11"></path></symbol>
       <symbol id="icon-purchase" viewBox="0 0 24 24"><path d="M7 4h10v16H7zM9 8h6M9 11h5M9 14h3M15.5 15.5a2.5 2.5 0 1 0 0 5 2.5 2.5 0 0 0 0-5zM14.2 17.2h1.4M14.2 18.8h1.4"></path></symbol>
       <symbol id="icon-expenses" viewBox="0 0 24 24"><path d="M6 5h12v14H6zM9 9h6M9 12h4M9 15h2M15.5 14.5h4M17.5 12.5v4M8 5l1-2h6l1 2"></path></symbol>
       <symbol id="icon-report" viewBox="0 0 24 24"><path d="M5 19V5M5 19h15M8 15l3-3 3 2 4-6M9 19v-3M13 19v-4M17 19v-7"></path></symbol>

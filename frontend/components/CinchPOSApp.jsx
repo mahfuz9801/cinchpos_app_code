@@ -39,6 +39,10 @@ import { flushStoredWrites, readStoredJSON, readStoredValue, writeStoredJSON, wr
 import {
   APP_COMPANY,
   APP_NAME,
+  DEFAULT_WALK_IN_CUSTOMER_NAME,
+  DEFAULT_WALK_IN_CUSTOMER_PHONE,
+  SUPPORT_EMAIL,
+  SUPPORT_PHONE,
   appViews,
   dataTransferConfigs,
   defaultAccount,
@@ -97,6 +101,151 @@ import {
   TrendChart
 } from "@/components/cinchpos/SharedUI";
 
+function sortCustomersByName(collection = []) {
+  return [...collection].sort((first, second) => (
+    cleanText(first?.name).localeCompare(cleanText(second?.name), undefined, { sensitivity: "base" })
+  ));
+}
+
+function buildPOSCustomerFromRecord(customer) {
+  if (!customer) {
+    return {};
+  }
+  return {
+    customerId: customer.id ? String(customer.id) : "",
+    name: cleanText(customer.name),
+    phone: normalizePhone(customer.phone).slice(-10),
+    email: cleanText(customer.email),
+    address: cleanText(customer.address)
+  };
+}
+
+function buildSmartInventoryReview(items = []) {
+  const barcodeGroups = new Map();
+  const nameGroups = new Map();
+  const cleanupCandidates = [];
+
+  items.forEach((item, index) => {
+    const id = getInventoryItemKey(item, index);
+    const name = cleanText(getInventoryItemName(item), "Untitled item");
+    const normalizedName = normalizeKey(name);
+    const barcodes = getInventoryItemBarcodes(item);
+    const price = Number(item.inclusivePrice || item.inclusive_price || item.price || 0);
+    const stock = Number(item.stock || 0);
+    const summaryEntry = { id, name, barcodes, price, stock };
+
+    if (normalizedName) {
+      const known = nameGroups.get(normalizedName) || [];
+      known.push(summaryEntry);
+      nameGroups.set(normalizedName, known);
+    }
+
+    barcodes.forEach((barcode) => {
+      const normalizedBarcode = normalizeKey(barcode);
+      if (!normalizedBarcode) {
+        return;
+      }
+      const known = barcodeGroups.get(normalizedBarcode) || [];
+      known.push(summaryEntry);
+      barcodeGroups.set(normalizedBarcode, known);
+    });
+
+    if (stock <= 0 || !barcodes.length || price <= 0) {
+      cleanupCandidates.push(summaryEntry);
+    }
+  });
+
+  const suggestions = [];
+  let overlapCount = 0;
+
+  barcodeGroups.forEach((entries, normalizedBarcode) => {
+    const uniqueIds = new Set(entries.map((entry) => entry.id));
+    if (uniqueIds.size <= 1) {
+      return;
+    }
+    overlapCount += 1;
+    const labels = [...new Set(entries.map((entry) => entry.name))].slice(0, 3);
+    suggestions.push({
+      type: "overlap",
+      title: "Shared barcode detected",
+      detail: `${labels.join(", ")} ${labels.length > 1 ? "use" : "uses"} barcode ${normalizedBarcode}. Review these items before billing.`
+    });
+  });
+
+  nameGroups.forEach((entries) => {
+    const uniqueIds = new Set(entries.map((entry) => entry.id));
+    if (uniqueIds.size <= 1) {
+      return;
+    }
+    overlapCount += 1;
+    const prices = [...new Set(entries.map((entry) => currency(entry.price)))];
+    suggestions.push({
+      type: "overlap",
+      title: "Possible duplicate item name",
+      detail: `${entries[0].name} appears ${entries.length} times${prices.length > 1 ? ` with different prices (${prices.join(", ")})` : ""}. Check whether all copies are needed.`
+    });
+  });
+
+  const cleanupSuggestions = cleanupCandidates.slice(0, 8).map((entry) => {
+    const reasons = [];
+    if (entry.stock <= 0) {
+      reasons.push("zero or negative stock");
+    }
+    if (!entry.barcodes.length) {
+      reasons.push("no barcode");
+    }
+    if (entry.price <= 0) {
+      reasons.push("missing price");
+    }
+    return {
+      type: "cleanup",
+      title: "Possible cleanup candidate",
+      detail: `${entry.name} has ${reasons.join(", ")}. Review whether it still belongs in active inventory.`
+    };
+  });
+
+  return {
+    overlapCount,
+    cleanupCount: cleanupCandidates.length,
+    suggestionCount: suggestions.length + cleanupSuggestions.length,
+    suggestions: [...suggestions, ...cleanupSuggestions].slice(0, 12)
+  };
+}
+
+const PRINT_PAPER_PROFILES = {
+  "58mm": { label: "58mm Thermal", pageWidth: "58mm", margin: "2mm", layout: "thermal" },
+  "76mm": { label: "76mm Thermal", pageWidth: "76mm", margin: "3mm", layout: "thermal" },
+  "80mm": { label: "80mm Thermal", pageWidth: "80mm", margin: "3mm", layout: "thermal" },
+  A5: { label: "A5 Invoice", pageWidth: "148mm", pageSize: "A5", margin: "8mm", layout: "invoice" },
+  A4: { label: "A4 Invoice", pageWidth: "210mm", pageSize: "A4", margin: "10mm", layout: "invoice" },
+  Letter: { label: "Letter Invoice", pageWidth: "216mm", pageSize: "letter", margin: "10mm", layout: "invoice" }
+};
+
+function getPrintProfile(paperSize, layout = "") {
+  const profile = PRINT_PAPER_PROFILES[paperSize] || PRINT_PAPER_PROFILES["80mm"];
+  return {
+    ...profile,
+    layout: layout || profile.layout
+  };
+}
+
+function normalizeIFSC(value) {
+  return cleanText(value).toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 11);
+}
+
+function isValidIFSC(value) {
+  return /^[A-Z]{4}0[A-Z0-9]{6}$/.test(normalizeIFSC(value));
+}
+
+function isValidUPI(value) {
+  const upi = cleanText(value).toLowerCase();
+  return !upi || /^[a-z0-9.\-_]{2,256}@[a-z][a-z0-9.\-_]{2,64}$/.test(upi);
+}
+
+function normalizeAccountNumber(value) {
+  return cleanText(value).replace(/\D/g, "").slice(0, 24);
+}
+
 export default function CinchPOSApp({ initialView = "dashboard" }) {
   const resolvedInitialView = routeViewMap[initialView] || initialView || "dashboardView";
   const [activeView, setActiveView] = useState(resolvedInitialView);
@@ -115,8 +264,11 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
   const [trendStartDate, setTrendStartDate] = useState("");
   const [trendEndDate, setTrendEndDate] = useState("");
   const [inventorySearch, setInventorySearch] = useState("");
+  const [inventorySort, setInventorySort] = useState("nameAsc");
   const [inventoryItems, setInventoryItems] = useState([]);
   const [inventoryVisibleCount, setInventoryVisibleCount] = useState(120);
+  const [sellOnlineSearch, setSellOnlineSearch] = useState("");
+  const [sellOnlineCatalog, setSellOnlineCatalog] = useState({});
   const [settingsDraft, setSettingsDraft] = useState(defaultSettings);
   const [settingsPanelSection, setSettingsPanelSection] = useState("account");
   const [bankAccount, setBankAccount] = useState(null);
@@ -140,6 +292,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
   const messageTimer = useRef(null);
   const appWorkspaceRef = useRef(null);
   const posModuleContextRef = useRef(null);
+  const inventoryViewContextRef = useRef(null);
   const transferFileRefs = useRef({});
   const transferFiles = useRef({});
   const dashboardRetryTimer = useRef(null);
@@ -203,7 +356,8 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     purchaseBills: purchaseBills.length,
     expenses: expenseRecords.length,
     employees: employees.length,
-    documents: storeDocuments.length
+    documents: storeDocuments.length,
+    sellOnline: Object.values(sellOnlineCatalog || {}).filter(Boolean).length
   }), [
     allInvoices.length,
     customers.length,
@@ -213,8 +367,45 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     outstandingInvoices.length,
     purchaseBills.length,
     purchaseRecords.length,
+    sellOnlineCatalog,
     storeDocuments.length
   ]);
+  const smartInventoryReview = useMemo(() => buildSmartInventoryReview(inventoryItems), [inventoryItems]);
+  const sellOnlineProducts = useMemo(() => {
+    const search = normalizeKey(sellOnlineSearch);
+    return inventoryItems.map((item, index) => {
+      const id = getInventoryItemKey(item, index);
+      const name = getInventoryItemName(item);
+      const barcode = getInventoryBarcodeLabel(item);
+      const stock = Number(item.stock || 0);
+      const price = Number(item.inclusivePrice || item.inclusive_price || item.price || 0);
+      const searchable = normalizeKey(`${name} ${barcode} ${item.category || ""} ${item.hsn || item.hsnSac || ""}`);
+      return {
+        id,
+        name,
+        barcode,
+        stock,
+        price,
+        selected: Boolean(sellOnlineCatalog?.[id]),
+        searchable
+      };
+    }).filter((item) => !search || item.searchable.includes(search));
+  }, [inventoryItems, sellOnlineCatalog, sellOnlineSearch]);
+  const selectedSellOnlineProducts = useMemo(() => (
+    inventoryItems.map((item, index) => {
+      const id = getInventoryItemKey(item, index);
+      if (!sellOnlineCatalog?.[id]) {
+        return null;
+      }
+      return {
+        id,
+        name: getInventoryItemName(item),
+        barcode: getInventoryBarcodeLabel(item),
+        price: Number(item.inclusivePrice || item.inclusive_price || item.price || 0),
+        stock: Number(item.stock || 0)
+      };
+    }).filter(Boolean)
+  ), [inventoryItems, sellOnlineCatalog]);
   const appPlatform = useMemo(() => {
     if (typeof navigator === "undefined") {
       return "Unknown platform";
@@ -279,6 +470,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     setPurchaseBills(readStoredJSON(storageKeys.purchaseBills, []));
     setStoreDocuments(readStoredJSON(storageKeys.documents, []));
     setEmployees(readStoredJSON(storageKeys.employees, []));
+    setSellOnlineCatalog(readStoredJSON(storageKeys.sellOnline, {}));
     setPosState(readStoredJSON(storageKeys.pos, makeInitialPOSState()));
     setTrendView(readStoredValue(storageKeys.trendView, "weekly"));
     setTrendStartDate(readStoredValue(storageKeys.trendStart, ""));
@@ -355,6 +547,12 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     }
     writeStoredJSON(storageKeys.employees, employees);
   }, [employees, workspaceLoaded]);
+  useEffect(() => {
+    if (!workspaceLoaded) {
+      return;
+    }
+    writeStoredJSON(storageKeys.sellOnline, sellOnlineCatalog);
+  }, [sellOnlineCatalog, workspaceLoaded]);
   useEffect(() => {
     if (!workspaceLoaded) {
       return;
@@ -489,6 +687,31 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     return customers.find((customer) => phonesMatch(customer.phone, normalizedPhone)) || null;
   }
 
+  function replaceCustomerInState(customerRecord) {
+    setCustomers((current) => sortCustomersByName([
+      ...current.filter((customer) => String(customer.id || "") !== String(customerRecord.id || "")),
+      customerRecord
+    ]));
+  }
+
+  async function ensureDefaultWalkInCustomer() {
+    const existingCustomer = customers.find((customer) => (
+      phonesMatch(customer.phone, DEFAULT_WALK_IN_CUSTOMER_PHONE)
+      || cleanText(customer.name).toLowerCase() === DEFAULT_WALK_IN_CUSTOMER_NAME.toLowerCase()
+    ));
+    if (existingCustomer) {
+      return existingCustomer;
+    }
+    const walkInCustomer = await createCustomer({
+      name: DEFAULT_WALK_IN_CUSTOMER_NAME,
+      phone: DEFAULT_WALK_IN_CUSTOMER_PHONE,
+      email: "",
+      address: ""
+    });
+    replaceCustomerInState(walkInCustomer);
+    return walkInCustomer;
+  }
+
   function getPOSInstance(formId) {
     return posState[formId] || makePOSInstance(formId);
   }
@@ -523,21 +746,41 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
 
   function handlePOSPhone(formId, value) {
     const phone = normalizePhone(value).slice(-10);
-    const matchedCustomer = findCustomerByPhone(phone);
-    updatePOSCustomer(formId, {
-      phone,
-      customerId: phone.length === 10 && matchedCustomer ? String(matchedCustomer.id) : "",
-      name: phone.length === 10 && matchedCustomer ? matchedCustomer.name : getActiveBill(formId).customer?.name || ""
+    updateActiveBill(formId, (bill) => {
+      const currentCustomer = { ...defaultPOSCustomer, ...(bill.customer || {}) };
+      const matchedCustomer = phone.length === 10 ? findCustomerByPhone(phone) : null;
+      return {
+        ...bill,
+        customer: matchedCustomer
+          ? {
+              ...currentCustomer,
+              ...buildPOSCustomerFromRecord(matchedCustomer),
+              paymentMethod: currentCustomer.paymentMethod,
+              paymentType: currentCustomer.paymentType,
+              partialAmount: currentCustomer.partialAmount
+            }
+          : {
+              ...currentCustomer,
+              phone,
+              customerId: ""
+            }
+      };
     });
   }
 
   function getCustomerStatus(customer) {
     const phone = normalizePhone(customer.phone).slice(-10);
-    if (!phone) {
-      return "";
+    const name = cleanText(customer.name);
+    const email = cleanText(customer.email);
+    const address = cleanText(customer.address);
+    if (!phone && !name && !email && !address) {
+      return `Customer details are optional. ${DEFAULT_WALK_IN_CUSTOMER_NAME} (${formatIndianPhone(DEFAULT_WALK_IN_CUSTOMER_PHONE)}) will be used if you save the bill without filling this section.`;
+    }
+    if (!phone && name) {
+      return "Customer will be saved without a phone number unless you add one.";
     }
     if (phone.length !== 10) {
-      return "Phone number must be exactly 10 digits.";
+      return "Phone number should be 10 digits to match an existing customer.";
     }
     const matchedCustomer = findCustomerByPhone(phone);
     if (matchedCustomer) {
@@ -658,30 +901,35 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     const customer = getActiveBill(formId).customer || defaultPOSCustomer;
     const phone = normalizePhone(customer.phone).slice(-10);
     const name = cleanText(customer.name);
-    const existingCustomer = findCustomerByPhone(phone);
+    const email = cleanText(customer.email);
+    const address = cleanText(customer.address);
+    const existingCustomer = phone.length === 10 ? findCustomerByPhone(phone) : null;
     if (existingCustomer) {
-      updatePOSCustomer(formId, { customerId: String(existingCustomer.id), name: existingCustomer.name });
-      return existingCustomer.id;
+      updatePOSCustomer(formId, buildPOSCustomerFromRecord(existingCustomer));
+      return { record: existingCustomer, usedWalkInCustomer: false };
     }
-    if (phone.length !== 10) {
-      throw new Error("Enter a valid 10 digit Indian customer phone number.");
+    if (!phone && !name && !email && !address) {
+      const walkInCustomer = await ensureDefaultWalkInCustomer();
+      updatePOSCustomer(formId, buildPOSCustomerFromRecord(walkInCustomer));
+      return { record: walkInCustomer, usedWalkInCustomer: true };
     }
-    if (!name) {
-      throw new Error("Enter the customer name before POS billing.");
-    }
-    const newCustomer = await createCustomer({ name, phone: `+91${phone}`, email: "" });
-    setCustomers((current) => [...current, newCustomer].sort((first, second) => first.name.localeCompare(second.name)));
-    updatePOSCustomer(formId, { customerId: String(newCustomer.id) });
-    return newCustomer.id;
+    const newCustomer = await createCustomer({
+      name: name || DEFAULT_WALK_IN_CUSTOMER_NAME,
+      phone: phone.length === 10 ? `+91${phone}` : "",
+      email,
+      address
+    });
+    replaceCustomerInState(newCustomer);
+    updatePOSCustomer(formId, buildPOSCustomerFromRecord(newCustomer));
+    return { record: newCustomer, usedWalkInCustomer: false };
   }
 
-  function printPOSBill(payload, printWindow = null) {
-    const targetWindow = printWindow || window.open("", "_blank", "width=420,height=720");
-    if (!targetWindow) {
-      showMessage("Bill saved. Allow pop-ups to print the bill.");
-      return;
-    }
-    const printPageWidth = payload.paperSize === "58mm" ? "58mm" : payload.paperSize === "A4" ? "210mm" : "80mm";
+  function printPOSBill(payload) {
+    const printProfile = getPrintProfile(payload.paperSize, payload.printLayout);
+    const printPageWidth = printProfile.pageWidth;
+    const printPageSize = printProfile.pageSize || printPageWidth;
+    const printMargin = payload.printMargin === "none" ? "0" : printProfile.margin;
+    const printClass = printProfile.layout === "invoice" ? "invoice-print" : "thermal-print";
     const rows = payload.items.map((item) => `
       <tr>
         <td>${item.serial}</td>
@@ -689,8 +937,8 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         <td>${item.quantity}</td>
         <td>${currency(item.mrp)}</td>
         <td>${currency(item.inclusivePrice)}</td>
-        <td>${item.discountPercent.toFixed(2)}%</td>
-        <td>${currency(item.taxableValue)}</td>
+        <td class="print-hide-thermal">${item.discountPercent.toFixed(2)}%</td>
+        <td class="print-hide-thermal">${currency(item.taxableValue)}</td>
         <td>${currency(item.gstAmount * item.quantity)}<span>${item.gstRate}%</span></td>
         <td>${currency(item.lineTotal)}</td>
       </tr>
@@ -710,8 +958,19 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     const safePaymentMethod = escapeHTML(payload.paymentMethod);
     const safePaymentType = escapeHTML(payload.paymentType);
     const businessContact = [payload.businessPhone ? safeBusinessPhone : "", payload.businessEmail ? safeBusinessEmail : ""].filter(Boolean).join(" | ");
-    targetWindow.document.open();
-    targetWindow.document.write(`
+    const frame = document.createElement("iframe");
+    frame.className = "print-frame";
+    frame.setAttribute("aria-hidden", "true");
+    frame.style.position = "fixed";
+    frame.style.right = "100%";
+    frame.style.bottom = "100%";
+    frame.style.width = "0";
+    frame.style.height = "0";
+    frame.style.border = "0";
+    frame.style.visibility = "hidden";
+    document.body.appendChild(frame);
+
+    const markup = `
       <!DOCTYPE html>
       <html lang="en">
       <head>
@@ -719,24 +978,28 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         <title>${safeInvoiceNumber}</title>
         <style>
           * { box-sizing: border-box; }
-          body { margin: 0; padding: 12px; color: #111; font-family: Arial, sans-serif; font-size: 11px; }
+          @page { size: ${printPageSize}; margin: ${printMargin}; }
+          html, body { width: ${printPageWidth}; }
+          body { margin: 0 auto; padding: ${printProfile.layout === "invoice" ? "10mm" : "2mm"}; color: #111; font-family: Arial, sans-serif; font-size: ${printProfile.layout === "invoice" ? "12px" : "10px"}; }
           .print-head { display: grid; justify-items: center; gap: 4px; margin-bottom: 10px; text-align: center; }
-          .print-logo { width: 52px; height: 52px; object-fit: contain; }
-          h1 { margin: 0; font-size: 16px; font-weight: 700; }
+          .print-logo { width: ${printProfile.layout === "invoice" ? "72px" : "52px"}; height: ${printProfile.layout === "invoice" ? "72px" : "52px"}; object-fit: contain; }
+          h1 { margin: 0; font-size: ${printProfile.layout === "invoice" ? "20px" : "15px"}; font-weight: 700; }
           p { margin: 0; }
           .print-meta { display: grid; gap: 3px; margin: 8px 0; padding: 8px 0; border-top: 1px dashed #777; border-bottom: 1px dashed #777; }
           table { width: 100%; border-collapse: collapse; }
-          th, td { padding: 4px 3px; border-bottom: 1px solid #ddd; text-align: left; vertical-align: top; }
-          th { font-size: 9px; font-weight: 700; }
-          td span { display: block; color: #555; font-size: 9px; }
+          th, td { padding: ${printProfile.layout === "invoice" ? "6px 5px" : "3px 2px"}; border-bottom: 1px solid #ddd; text-align: left; vertical-align: top; }
+          th { font-size: ${printProfile.layout === "invoice" ? "10px" : "8px"}; font-weight: 700; }
+          td span { display: block; color: #555; font-size: ${printProfile.layout === "invoice" ? "10px" : "8px"}; }
+          .thermal-print .print-hide-thermal { display: none; }
+          .invoice-print .totals { max-width: 280px; margin-left: auto; }
           .totals { display: grid; gap: 4px; margin-top: 10px; padding-top: 8px; border-top: 1px dashed #777; }
           .totals div { display: flex; justify-content: space-between; gap: 10px; }
-          .grand { font-size: 14px; font-weight: 700; }
+          .grand { font-size: ${printProfile.layout === "invoice" ? "15px" : "13px"}; font-weight: 700; }
           .print-footer { margin-top: 10px; padding-top: 8px; border-top: 1px dashed #777; text-align: center; color: #444; font-size: 10px; }
           @media print { body { width: ${printPageWidth}; } }
         </style>
       </head>
-      <body>
+      <body class="${printClass}">
         <div class="print-head">${logoMarkup}<h1>${safeBusinessName}</h1>${payload.ownerName ? `<p>${safeOwnerName}</p>` : ""}${businessContact ? `<p>${businessContact}</p>` : ""}${payload.businessAddress ? `<p>${safeBusinessAddress}</p>` : ""}${payload.gstin ? `<p>GSTIN: ${safeGstin}</p>` : ""}</div>
         <div class="print-meta">
           <p>Bill: ${safeInvoiceNumber}</p>
@@ -745,7 +1008,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
           <p>Payment: ${safePaymentMethod} | ${safePaymentType}</p>
         </div>
         <table>
-          <thead><tr><th>No.</th><th>Item</th><th>Qty</th><th>MRP</th><th>SP</th><th>Disc</th><th>Rate</th><th>GST</th><th>Total</th></tr></thead>
+          <thead><tr><th>No.</th><th>Item</th><th>Qty</th><th>MRP</th><th>SP</th><th class="print-hide-thermal">Disc</th><th class="print-hide-thermal">Rate</th><th>GST</th><th>Total</th></tr></thead>
           <tbody>${rows}</tbody>
         </table>
         <div class="totals">
@@ -760,12 +1023,73 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         ${payload.printFooter ? `<div class="print-footer">${safeFooter}</div>` : ""}
       </body>
       </html>
-    `);
-    targetWindow.document.close();
-    setTimeout(() => {
-      targetWindow.focus();
-      targetWindow.print();
-    }, 250);
+    `;
+
+    const frameWindow = frame.contentWindow;
+    const frameDocument = frame.contentDocument || frameWindow?.document;
+    if (!frameWindow || !frameDocument) {
+      frame.remove();
+      showMessage("Bill saved, but the print view could not open.");
+      return;
+    }
+
+    const cleanup = () => {
+      window.setTimeout(() => {
+        frame.remove();
+      }, 400);
+    };
+
+    const finalizePrint = () => {
+      frameWindow.focus();
+      frameWindow.print();
+      cleanup();
+    };
+
+    const waitForAssetsAndPrint = () => {
+      const images = Array.from(frameDocument.images || []);
+      if (!images.length) {
+        window.setTimeout(finalizePrint, 80);
+        return;
+      }
+
+      let pending = 0;
+      let finished = false;
+      const settle = () => {
+        if (finished) {
+          return;
+        }
+        finished = true;
+        window.setTimeout(finalizePrint, 80);
+      };
+      const onAssetDone = () => {
+        pending -= 1;
+        if (pending <= 0) {
+          settle();
+        }
+      };
+
+      images.forEach((image) => {
+        if (image.complete) {
+          return;
+        }
+        pending += 1;
+        image.addEventListener("load", onAssetDone, { once: true });
+        image.addEventListener("error", onAssetDone, { once: true });
+      });
+
+      if (pending <= 0) {
+        settle();
+        return;
+      }
+
+      window.setTimeout(settle, 900);
+    };
+
+    frameWindow.addEventListener("afterprint", cleanup, { once: true });
+    frameDocument.open();
+    frameDocument.write(markup);
+    frameDocument.close();
+    window.setTimeout(waitForAssetsAndPrint, 40);
   }
 
   async function submitPOSBilling(formId, { printAfter = false, closePOSModal = false } = {}) {
@@ -780,8 +1104,6 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       : summaryRows.total;
     const unpaidAmount = Math.max(0, summaryRows.total - paidAmount);
     const issuedOn = todayISO();
-    let printWindow = null;
-
     if (!items.length) {
       showMessage("Add at least one inventory item to the bill.");
       return;
@@ -790,14 +1112,11 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       showMessage("POS billing total must be greater than zero.");
       return;
     }
-    if (printAfter) {
-      printWindow = window.open("", "_blank", "width=420,height=720");
-    }
 
     try {
-      const customerId = await ensurePOSCustomer(formId);
+      const { record: savedCustomer, usedWalkInCustomer } = await ensurePOSCustomer(formId);
       const invoice = await createInvoice({
-        customer_id: customerId,
+        customer_id: savedCustomer.id,
         invoice_number: buildClientInvoiceNumber(issuedOn),
         amount: summaryRows.total,
         issued_on: issuedOn,
@@ -820,13 +1139,17 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         businessEmail: settings.businessEmail || "",
         businessAddress: settings.businessAddress || "",
         gstin: settings.gstin || "",
-        logo: settings.printShopLogoOnBill && settings.printPaperSize !== "A4" ? (settings.storeLogo || settings.storeLogoUrl || "") : "",
+        logo: settings.printShopLogoOnBill ? (settings.storeLogo || settings.storeLogoUrl || "") : "",
         paperSize: settings.printPaperSize || defaultSettings.printPaperSize,
+        printLayout: settings.printLayout || defaultSettings.printLayout,
+        printMargin: settings.printMargin || defaultSettings.printMargin,
         printFooter: settings.printFooter || "",
         invoiceNumber: invoice.invoice_number || "",
         date: issuedOn,
-        customerName: cleanText(customer.name, "Walk-in Customer"),
-        customerPhone: customer.phone ? formatIndianPhone(customer.phone) : "",
+        customerName: cleanText(savedCustomer?.name || customer.name, DEFAULT_WALK_IN_CUSTOMER_NAME),
+        customerPhone: savedCustomer?.phone
+          ? formatIndianPhone(savedCustomer.phone)
+          : (usedWalkInCustomer ? formatIndianPhone(DEFAULT_WALK_IN_CUSTOMER_PHONE) : ""),
         paymentMethod: customer.paymentMethod || "Cash",
         paymentType: paymentType === "partial" ? "Partial Payment" : "Full Payment",
         paidAmount,
@@ -861,13 +1184,10 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         closeModal();
       }
       if (printAfter) {
-        printPOSBill(printPayload, printWindow);
+        printPOSBill(printPayload);
       }
       showMessage(unpaidAmount > 0 ? `POS billing completed. Unpaid amount: ${currency(unpaidAmount)}.` : "POS billing completed.");
     } catch (error) {
-      if (printWindow && !printWindow.closed) {
-        printWindow.close();
-      }
       showMessage(error.message);
     }
   }
@@ -883,6 +1203,38 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     } catch (error) {
       showMessage(error.message);
     }
+  }
+
+  function toggleSellOnlineProduct(productId) {
+    setSellOnlineCatalog((current) => {
+      const next = { ...(current || {}) };
+      if (next[productId]) {
+        delete next[productId];
+      } else {
+        next[productId] = { selectedAt: new Date().toISOString() };
+      }
+      return next;
+    });
+  }
+
+  function selectVisibleSellOnlineProducts(productIds = []) {
+    if (!productIds.length) {
+      showMessage("No matching products to add online.");
+      return;
+    }
+    setSellOnlineCatalog((current) => {
+      const next = { ...(current || {}) };
+      productIds.forEach((productId) => {
+        next[productId] = next[productId] || { selectedAt: new Date().toISOString() };
+      });
+      return next;
+    });
+    showMessage("Visible products added to Sell Online.");
+  }
+
+  function clearSellOnlineProducts() {
+    setSellOnlineCatalog({});
+    showMessage("Sell Online product selection cleared.");
   }
 
   async function submitInvoice(event) {
@@ -952,13 +1304,22 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     event.preventDefault();
     const form = event.currentTarget;
     const data = Object.fromEntries(new FormData(form).entries());
+    const supplier = cleanText(data.supplier);
+    const item = cleanText(data.item);
+    const amount = Number(data.amount || 0);
+
+    if (!supplier || !item || amount <= 0) {
+      showMessage("Add supplier, item, and a valid amount before saving purchase.");
+      return;
+    }
+
     setPurchaseRecords((current) => [{
       id: String(Date.now()),
-      supplier: cleanText(data.supplier),
-      item: cleanText(data.item),
+      supplier,
+      item,
       billNumber: cleanText(data.bill_number),
       purchaseDate: data.purchase_date || todayISO(),
-      amount: Number(data.amount || 0),
+      amount,
       paymentStatus: cleanText(data.payment_status, "Pending"),
       notes: cleanText(data.notes),
       createdAt: new Date().toISOString()
@@ -1013,19 +1374,54 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     }
   }
 
-  function submitBank(event) {
+  async function submitBank(event) {
     event.preventDefault();
-    const data = Object.fromEntries(new FormData(event.currentTarget).entries());
-    setBankAccount({
-      accountHolder: cleanText(data.account_holder),
-      bankName: cleanText(data.bank_name),
-      accountNumber: cleanText(data.account_number),
-      ifsc: cleanText(data.ifsc).toUpperCase(),
-      upiId: cleanText(data.upi_id),
-      branch: cleanText(data.branch),
-      linkedAt: new Date().toISOString()
-    });
-    showMessage("Bank account linked.");
+    const form = event.currentTarget;
+    const data = Object.fromEntries(new FormData(form).entries());
+    const accountNumber = normalizeAccountNumber(data.account_number);
+    const confirmAccountNumber = normalizeAccountNumber(data.confirm_account_number || data.account_number);
+    const ifsc = normalizeIFSC(data.ifsc);
+    const upiId = cleanText(data.upi_id).toLowerCase();
+    const qrFile = form.elements.qr_file?.files?.[0];
+
+    if (accountNumber.length < 9) {
+      showMessage("Enter a valid bank account number.");
+      return;
+    }
+    if (accountNumber !== confirmAccountNumber) {
+      showMessage("Account number and confirmation do not match.");
+      return;
+    }
+    if (!isValidIFSC(ifsc)) {
+      showMessage("Enter a valid IFSC code.");
+      return;
+    }
+    if (!isValidUPI(upiId)) {
+      showMessage("Enter a valid UPI ID, for example store@bank.");
+      return;
+    }
+
+    try {
+      const qrFileData = await readFileAsDataURL(qrFile);
+      setBankAccount({
+        accountHolder: cleanText(data.account_holder),
+        bankName: cleanText(data.bank_name),
+        accountType: cleanText(data.account_type, "Current"),
+        accountNumber,
+        ifsc,
+        upiId,
+        branch: cleanText(data.branch),
+        settlementMode: cleanText(data.settlement_mode, "Manual reconciliation"),
+        reconciliationFrequency: cleanText(data.reconciliation_frequency, "Daily"),
+        qrFileName: qrFile ? qrFile.name : bankAccount?.qrFileName || "",
+        qrFileData: qrFileData || bankAccount?.qrFileData || "",
+        notes: cleanText(data.notes),
+        linkedAt: new Date().toISOString()
+      });
+      showMessage("Bank details saved.");
+    } catch (error) {
+      showMessage(error.message || "Could not save bank details.");
+    }
   }
 
   async function submitDocument(event) {
@@ -1054,20 +1450,44 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     }
   }
 
-  function submitEmployee(event) {
+  async function submitEmployee(event) {
     event.preventDefault();
     const form = event.currentTarget;
     const data = Object.fromEntries(new FormData(form).entries());
-    setEmployees((current) => [{
-      id: String(Date.now()),
-      name: cleanText(data.name),
-      role: cleanText(data.role, "Counter Staff"),
-      phone: cleanText(data.phone),
-      status: cleanText(data.status, "Active"),
-      createdAt: new Date().toISOString()
-    }, ...current]);
-    form.reset();
-    showMessage("Employee saved.");
+    const aadharFile = form.elements.aadhar_file?.files?.[0];
+    const panFile = form.elements.pan_file?.files?.[0];
+    try {
+      const [aadharFileData, panFileData] = await Promise.all([
+        readFileAsDataURL(aadharFile),
+        readFileAsDataURL(panFile)
+      ]);
+      setEmployees((current) => [{
+        id: String(Date.now()),
+        name: cleanText(data.name),
+        role: cleanText(data.role, "Counter Staff"),
+        phone: cleanText(data.phone),
+        address: cleanText(data.address),
+        aadharFileName: aadharFile ? aadharFile.name : "",
+        aadharFileData,
+        panFileName: panFile ? panFile.name : "",
+        panFileData,
+        status: cleanText(data.status, "Active"),
+        createdAt: new Date().toISOString()
+      }, ...current]);
+      form.reset();
+      showMessage("Employee saved.");
+    } catch (error) {
+      showMessage(error.message || "Could not save employee documents.");
+    }
+  }
+
+  function deleteEmployee(employeeId) {
+    const employee = employees.find((entry) => String(entry.id) === String(employeeId));
+    if (!window.confirm(`Delete ${employee?.name || "this employee"} from employee records?`)) {
+      return;
+    }
+    setEmployees((current) => current.filter((entry) => String(entry.id) !== String(employeeId)));
+    showMessage("Employee deleted.");
   }
 
   function markEmployeeAttendance(employeeId, attendanceStatus) {
@@ -1203,12 +1623,14 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     }
     const nextName = cleanText(importedCustomer?.name || importedCustomer?.customerName, cleanText(existingCustomer.name));
     const nextEmail = cleanText(importedCustomer?.email || importedCustomer?.customerEmail, cleanText(existingCustomer.email));
+    const nextAddress = cleanText(importedCustomer?.address || importedCustomer?.customerAddress, cleanText(existingCustomer.address));
     const nextPhone = cleanText(importedCustomer?.phone || importedCustomer?.customerPhone, cleanText(existingCustomer.phone));
     const currentName = cleanText(existingCustomer.name);
     const currentEmail = cleanText(existingCustomer.email);
+    const currentAddress = cleanText(existingCustomer.address);
     const currentPhone = cleanText(existingCustomer.phone);
     const phoneChanged = normalizePhone(currentPhone) !== normalizePhone(nextPhone);
-    const changed = nextName !== currentName || nextEmail !== currentEmail || phoneChanged;
+    const changed = nextName !== currentName || nextEmail !== currentEmail || nextAddress !== currentAddress || phoneChanged;
 
     if (!changed || !nextName) {
       return null;
@@ -1217,6 +1639,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     return {
       name: nextName,
       email: nextEmail,
+      address: nextAddress,
       phone: nextPhone
     };
   }
@@ -1552,7 +1975,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         if (dataType === "customers") {
           for (const row of (packageData.customers || [])) {
             const customer = normalizeCustomerImport(row);
-            if (!customer.name && !customer.phone && !customer.email) {
+            if (!customer.name && !customer.phone && !customer.email && !customer.address) {
               transferSummary.skipped += 1;
               continue;
             }
@@ -1584,6 +2007,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
               const savedCustomer = await createCustomer({
                 name: fallbackName,
                 email: customer.email,
+                address: customer.address,
                 phone: customer.phone
               });
               knownCustomers.push(savedCustomer);
@@ -1628,6 +2052,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                   const savedCustomer = await createCustomer({
                     name: fallbackName,
                     email: invoice.customerEmail,
+                    address: invoice.customerAddress,
                     phone: invoice.customerPhone
                   });
                   knownCustomers.push(savedCustomer);
@@ -1688,23 +2113,41 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
 
   const filteredInventory = useMemo(() => {
     const query = deferredInventorySearch.trim().toLowerCase();
-    if (!query) {
-      return inventoryItems;
-    }
-    return inventoryItems.filter((item) => [
-      getInventoryItemName(item),
-      getInventoryBarcodeLabel(item),
-      item.category,
-      item.hsn,
-      item.unit,
-      item.inclusivePrice || item.inclusive_price,
-      item.mrp
-    ].some((value) => String(value || "").toLowerCase().includes(query)));
-  }, [deferredInventorySearch, inventoryItems]);
+    const matchedInventory = query
+      ? inventoryItems.filter((item) => [
+          getInventoryItemName(item),
+          getInventoryBarcodeLabel(item),
+          item.category,
+          item.hsn,
+          item.unit,
+          item.inclusivePrice || item.inclusive_price,
+          item.mrp
+        ].some((value) => String(value || "").toLowerCase().includes(query)))
+      : inventoryItems;
+    const compareByName = (first, second) => cleanText(getInventoryItemName(first)).localeCompare(
+      cleanText(getInventoryItemName(second)),
+      undefined,
+      { sensitivity: "base", numeric: true }
+    );
+    return [...matchedInventory].sort((first, second) => {
+      if (inventorySort === "stockAsc") {
+        return (Number(first.stock || 0) - Number(second.stock || 0)) || compareByName(first, second);
+      }
+      if (inventorySort === "stockDesc") {
+        return (Number(second.stock || 0) - Number(first.stock || 0)) || compareByName(first, second);
+      }
+      if (inventorySort === "sellingDesc") {
+        const firstPrice = Number(first.inclusivePrice || first.inclusive_price || first.price || 0);
+        const secondPrice = Number(second.inclusivePrice || second.inclusive_price || second.price || 0);
+        return (secondPrice - firstPrice) || compareByName(first, second);
+      }
+      return compareByName(first, second);
+    });
+  }, [deferredInventorySearch, inventoryItems, inventorySort]);
 
   useEffect(() => {
     setInventoryVisibleCount(deferredInventorySearch.trim() ? 200 : 120);
-  }, [deferredInventorySearch, inventoryItems.length]);
+  }, [deferredInventorySearch, inventoryItems.length, inventorySort]);
 
   const visibleInventory = useMemo(() => (
     filteredInventory.slice(0, inventoryVisibleCount)
@@ -1730,6 +2173,23 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     updatePOSPrice,
     removePOSItem,
     inventoryItems
+  };
+
+  inventoryViewContextRef.current = {
+    inventoryItems,
+    setInventoryItems,
+    inventorySearch,
+    setInventorySearch,
+    inventorySort,
+    setInventorySort,
+    inventoryVisibleCount,
+    setInventoryVisibleCount,
+    deferredInventorySearch,
+    filteredInventory,
+    visibleInventory,
+    hasMoreInventory,
+    smartInventoryReview,
+    showMessage
   };
 
   const POSModule = useMemo(() => function POSModule({ formId, modal = false }) {
@@ -1770,7 +2230,8 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       ? Math.min(posSummary.total, Math.max(0, Number(customer.partialAmount || 0)))
       : posSummary.total;
     const unpaidAmount = Math.max(0, posSummary.total - paidAmount);
-    const meta = `${bill.label} | ${cleanText(customer.name, "Customer pending")} | ${customer.phone?.length === 10 ? formatIndianPhone(customer.phone) : "+91 phone pending"} | ${posSummary.quantity} item(s)`;
+    const hasCustomerDraft = Boolean(cleanText(customer.name) || cleanText(customer.email) || cleanText(customer.address) || cleanText(customer.phone));
+    const meta = `${bill.label} | ${cleanText(customer.name, hasCustomerDraft ? "Customer draft" : DEFAULT_WALK_IN_CUSTOMER_NAME)} | ${customer.phone?.length === 10 ? formatIndianPhone(customer.phone) : formatIndianPhone(DEFAULT_WALK_IN_CUSTOMER_PHONE)} | ${posSummary.quantity} item(s)`;
     const showUppercaseKeyboard = keyboardCaps || keyboardShift;
     const keyboardLetterRows = [
       ["q", "w", "e", "r", "t", "y", "u", "i", "o", "p"],
@@ -1835,12 +2296,20 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                     Phone
                     <span className="phone-input">
                       <span className="country-code">+91</span>
-                      <input name="customer_phone" type="tel" inputMode="numeric" autoComplete="tel-national" maxLength="14" pattern="[0-9]{10}" placeholder="10 digit number" required value={customer.phone || ""} onChange={(event) => handlePOSPhone(formId, event.target.value)} />
+                      <input name="customer_phone" type="tel" inputMode="numeric" autoComplete="tel-national" maxLength="14" pattern="[0-9]{10}" placeholder="10 digit number" value={customer.phone || ""} onChange={(event) => handlePOSPhone(formId, event.target.value)} />
                     </span>
                   </label>
                   <label>
                     Name
-                    <input name="customer_name" type="text" autoComplete="name" placeholder="Required for new customer" required value={customer.name || ""} onChange={(event) => updatePOSCustomer(formId, { name: event.target.value })} />
+                    <input name="customer_name" type="text" autoComplete="name" placeholder="Optional customer name" value={customer.name || ""} onChange={(event) => updatePOSCustomer(formId, { name: event.target.value })} />
+                  </label>
+                  <label>
+                    Email
+                    <input name="customer_email" type="email" autoComplete="email" placeholder="Optional email address" value={customer.email || ""} onChange={(event) => updatePOSCustomer(formId, { email: event.target.value })} />
+                  </label>
+                  <label className="pos-customer-address-field">
+                    Address
+                    <textarea name="customer_address" rows="2" placeholder="Optional address" value={customer.address || ""} onChange={(event) => updatePOSCustomer(formId, { address: event.target.value })}></textarea>
                   </label>
                   <label>
                     Payment Mode
@@ -2022,6 +2491,10 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       </>
     );
     return form;
+  }, []);
+
+  const StableInventoryView = useMemo(() => function StableInventoryView(props) {
+    return InventoryView(props);
   }, []);
 
   return (
@@ -2226,6 +2699,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                           <th>Customer Name</th>
                           <th>Phone No.</th>
                           <th>Email</th>
+                          <th>Address</th>
                           <th>Total Invoices</th>
                           <th>Outstanding</th>
                         </tr>
@@ -2239,6 +2713,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                               <td>{customer.name}</td>
                               <td>{customer.phone || "Not added"}</td>
                               <td>{customer.email || "Not added"}</td>
+                              <td>{customer.address || "Not added"}</td>
                               <td>{stats.count}</td>
                               <td>{currency(stats.outstanding)}</td>
                             </tr>
@@ -2251,21 +2726,22 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
               </section>
             </section> : null}
 
-            {renderedViews.inventoryView ? <InventoryView active={activeView === "inventoryView"} /> : null}
-            {renderedViews.purchaseView ? <PurchaseView active={activeView === "purchaseView"} /> : null}
-            {renderedViews.expensesView ? <ExpensesView active={activeView === "expensesView"} /> : null}
-            {renderedViews.salesReportView ? <SalesReportView active={activeView === "salesReportView"} /> : null}
-            {renderedViews.employeeView ? <EmployeeView active={activeView === "employeeView"} /> : null}
-            {renderedViews.bankView ? <BankView active={activeView === "bankView"} /> : null}
-            {renderedViews.documentsView ? <DocumentsView active={activeView === "documentsView"} /> : null}
-            {renderedViews.dataTransferView ? <DataTransferView active={activeView === "dataTransferView"} /> : null}
+            {renderedViews.inventoryView ? <StableInventoryView active={activeView === "inventoryView"} /> : null}
+            {renderedViews.sellOnlineView ? SellOnlineView({ active: activeView === "sellOnlineView" }) : null}
+            {renderedViews.purchaseView ? PurchaseView({ active: activeView === "purchaseView" }) : null}
+            {renderedViews.expensesView ? ExpensesView({ active: activeView === "expensesView" }) : null}
+            {renderedViews.salesReportView ? SalesReportView({ active: activeView === "salesReportView" }) : null}
+            {renderedViews.employeeView ? EmployeeView({ active: activeView === "employeeView" }) : null}
+            {renderedViews.bankView ? BankView({ active: activeView === "bankView" }) : null}
+            {renderedViews.documentsView ? DocumentsView({ active: activeView === "documentsView" }) : null}
+            {renderedViews.dataTransferView ? DataTransferView({ active: activeView === "dataTransferView" }) : null}
           </div>
         </section>
 
         <aside className="right-navigation" aria-label="Application navigation">
           <button className={`brand ${activeView === "dashboardView" ? "active" : ""}`} type="button" onClick={() => switchView("dashboardView")}>
-            <span className="brand-logo-wrap"><AppLogo /></span>
-            <span><span>{APP_NAME}</span><small>{businessName} workspace</small></span>
+            <StoreLogo source={storeLogoSource} fallback={fallbackInitials} alt={settings.logoName || `${businessName} logo`} className="nav-store-logo" />
+            <span><span>{businessName}</span><small>Store workspace</small></span>
           </button>
           <nav className="right-nav-links">
             {navigationViews.map((view) => (
@@ -2286,6 +2762,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
             <label>Email<input name="email" type="email" placeholder="Optional" /></label>
             <label>Phone<input name="phone" type="text" placeholder="Optional" /></label>
           </div>
+          <label>Address<textarea name="address" rows="3" placeholder="Optional"></textarea></label>
           <div className="modal-actions"><button type="button" className="button button-secondary" onClick={closeModal}>Cancel</button><button type="submit" className="button button-primary">Save Customer</button></div>
         </form>
       </Modal>
@@ -2369,7 +2846,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       </Modal>
 
       <Modal open={activeModal === "settings"} title="Settings" subtitle="Change appearance and personalize this billing workspace." large cardClass="settings-modal-card" onClose={closeModal}>
-        <SettingsForm />
+        {SettingsForm()}
       </Modal>
 
       <Modal open={activeModal === "login"} title="Login or Sign Up" subtitle="Login to an existing account or create one for this billing counter." onClose={closeModal}>
@@ -2391,6 +2868,30 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
   );
 
   function InventoryView({ active }) {
+    const {
+      inventoryItems,
+      setInventoryItems,
+      inventorySearch,
+      setInventorySearch,
+      inventorySort,
+      setInventorySort,
+      inventoryVisibleCount,
+      setInventoryVisibleCount,
+      deferredInventorySearch,
+      filteredInventory,
+      visibleInventory,
+      hasMoreInventory,
+      smartInventoryReview,
+      showMessage
+    } = inventoryViewContextRef.current;
+    const inventorySortOptions = [
+      ["nameAsc", "Alphabetically"],
+      ["stockAsc", "Qty low to high"],
+      ["stockDesc", "Qty high to low"],
+      ["sellingDesc", "Selling high to low"]
+    ];
+    const activeInventorySortLabel = inventorySortOptions.find(([value]) => value === inventorySort)?.[1] || "Sort";
+
     function makeEmptyInventoryDraft() {
       return {
         item_name: "",
@@ -2431,6 +2932,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     const [draft, setDraft] = useState(makeEmptyInventoryDraft);
     const [barcodeInputs, setBarcodeInputs] = useState([""]);
     const [selectedInventoryItemId, setSelectedInventoryItemId] = useState("");
+    const [smartInventoryOpen, setSmartInventoryOpen] = useState(false);
     const mrp = Number(draft.mrp || 0);
     const sellingPrice = Number(draft.inclusive_price || 0);
     const discountPercent = calculateDiscountPercent(mrp, sellingPrice);
@@ -2603,9 +3105,40 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
             </form>
           </section>
           <section className="panel inventory-list-panel">
-            <div className="panel-header"><div><h2>Inventory Items</h2><div className="panel-subtitle">Saved locally in this app workspace.</div></div></div>
-            <label className="inventory-search">Search Products<input id="inventorySearch" type="search" placeholder="Search by item name or barcode" value={inventorySearch} onChange={(event) => setInventorySearch(event.target.value)} /></label>
-            {inventoryItems.length ? <p className="inventory-list-summary">Showing {visibleInventory.length} of {filteredInventory.length} items. Click an item for full details.</p> : null}
+            <div className="panel-header inventory-list-header">
+              <div><h2>Inventory Items</h2><div className="panel-subtitle">Saved locally in this app workspace.</div></div>
+              <div className="inventory-header-stack">
+                <span className="inventory-total-chip">{inventoryItems.length} products</span>
+                <button type="button" className="inventory-smart-button" aria-expanded={smartInventoryOpen} onClick={() => setSmartInventoryOpen((current) => !current)}>
+                  <span>Smart Inventory</span>
+                  <strong>{smartInventoryReview.suggestionCount}</strong>
+                </button>
+              </div>
+            </div>
+            <div className="inventory-list-controls">
+              <label className="inventory-search">Search Products<input id="inventorySearch" type="search" placeholder="Search by item name or barcode" value={inventorySearch} onChange={(event) => setInventorySearch(event.target.value)} /></label>
+              <label className="inventory-sort-icon-control inventory-sort-inline" title={`Sort products: ${activeInventorySortLabel}`}>
+                <span className="inventory-sort-icon" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" focusable="false">
+                    <path d="M4 7h10M4 12h7M4 17h4M16 5v14M12 15l4 4 4-4" />
+                  </svg>
+                </span>
+                <span className="inventory-sort-current">{activeInventorySortLabel}</span>
+                <select aria-label="Sort Products" value={inventorySort} onChange={(event) => setInventorySort(event.target.value)}>
+                  {inventorySortOptions.map(([value, label]) => <option value={value} key={value}>{label}</option>)}
+                </select>
+              </label>
+              {smartInventoryOpen ? (
+                <div className="inventory-smart-panel" role="region" aria-label="Smart inventory suggestions">
+                  {smartInventoryReview.suggestions.length ? smartInventoryReview.suggestions.map((suggestion, suggestionIndex) => (
+                    <article className={`inventory-smart-item ${suggestion.type}`} key={`${suggestion.title}-${suggestionIndex}`}>
+                      <strong>{suggestion.title}</strong>
+                      <span>{suggestion.detail}</span>
+                    </article>
+                  )) : <p>No inventory suggestions right now.</p>}
+                </div>
+              ) : null}
+            </div>
             <div id="inventoryList" className="inventory-list">
               {!inventoryItems.length ? <Empty>No inventory items yet. Add an item with an inclusive GST price to see CGST and SGST breakup here.</Empty> : null}
               {inventoryItems.length && !filteredInventory.length ? <Empty>No products match your search. Try item name, barcode, category, HSN/SAC, or price.</Empty> : null}
@@ -2662,13 +3195,91 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     );
   }
 
+  function SellOnlineView({ active }) {
+    const visibleProducts = sellOnlineProducts.slice(0, 180);
+    const hiddenCount = Math.max(0, sellOnlineProducts.length - visibleProducts.length);
+
+    return (
+      <section id="sellOnlineView" className={`app-view ${active ? "active" : ""}`} data-title="Sell Online">
+        <section className="panel sell-online-panel">
+          <div className="panel-header sell-online-header">
+            <div>
+              <h2>Sell Online</h2>
+              <div className="panel-subtitle">Choose which inventory products should be available for online selling.</div>
+            </div>
+            <div className="sell-online-stats">
+              <span>{selectedSellOnlineProducts.length} selected</span>
+              <span>{inventoryItems.length} inventory items</span>
+            </div>
+          </div>
+
+          <div className="sell-online-controls">
+            <label>Search Products
+              <input
+                type="search"
+                placeholder="Search by item name or barcode"
+                value={sellOnlineSearch}
+                onChange={(event) => setSellOnlineSearch(event.target.value)}
+              />
+            </label>
+            <div className="sell-online-actions">
+              <button type="button" className="button button-secondary" onClick={() => selectVisibleSellOnlineProducts(visibleProducts.map((product) => product.id))}>Select Visible</button>
+              <button type="button" className="button button-secondary" onClick={clearSellOnlineProducts} disabled={!selectedSellOnlineProducts.length}>Clear Selection</button>
+            </div>
+          </div>
+
+          <div className="sell-online-layout">
+            <div className="sell-online-list" aria-label="Inventory products available for online selling">
+              {!inventoryItems.length ? <Empty>Add inventory items first, then choose which products should be sold online.</Empty> : null}
+              {inventoryItems.length && !sellOnlineProducts.length ? <Empty>No products match this search.</Empty> : null}
+              {visibleProducts.map((product) => (
+                <article className={`sell-online-card ${product.selected ? "selected" : ""}`} key={product.id}>
+                  <div className="sell-online-card-copy">
+                    <h3>{product.name || "Untitled item"}</h3>
+                    <p>Barcode {product.barcode || "Not added"}</p>
+                    <span>{currency(product.price)} | Qty {product.stock}</span>
+                  </div>
+                  <button
+                    type="button"
+                    className={`button ${product.selected ? "button-secondary" : "button-primary"}`}
+                    onClick={() => toggleSellOnlineProduct(product.id)}
+                  >
+                    {product.selected ? "Remove" : "Sell Online"}
+                  </button>
+                </article>
+              ))}
+              {hiddenCount ? <p className="sell-online-more-note">Showing first 180 matches. Search by name or barcode to narrow the list.</p> : null}
+            </div>
+
+            <aside className="sell-online-summary">
+              <h3>Online Catalog</h3>
+              <p className="panel-subtitle">Selected products stay saved on this device and can be connected to website, WhatsApp catalog, or marketplace publishing later.</p>
+              <div className="sell-online-count-card">
+                <span>Ready to sell online</span>
+                <strong>{selectedSellOnlineProducts.length}</strong>
+              </div>
+              <div className="sell-online-selected-list">
+                {selectedSellOnlineProducts.length ? selectedSellOnlineProducts.slice(0, 12).map((product) => (
+                  <article key={product.id}>
+                    <span>{product.name || "Untitled item"}</span>
+                    <small>{currency(product.price)} | Qty {product.stock}</small>
+                  </article>
+                )) : <Empty>No products selected yet.</Empty>}
+              </div>
+            </aside>
+          </div>
+        </section>
+      </section>
+    );
+  }
+
   function PurchaseView({ active }) {
     return (
       <section id="purchaseView" className={`app-view ${active ? "active" : ""}`} data-title="Purchase">
-        <section className="panel">
+        <section className="panel purchase-entry-panel">
           <div className="panel-header"><div><h2>Purchase</h2><div className="panel-subtitle">Supplier purchases, inward stock, and payment status.</div></div></div>
-          <form id="purchaseForm" className="workspace-form" onSubmit={submitPurchase}>
-            <div className="module-grid">
+          <form id="purchaseForm" className="workspace-form purchase-form" noValidate onSubmit={submitPurchase}>
+            <div className="module-grid purchase-grid">
               <label>Supplier<input name="supplier" type="text" placeholder="Supplier name" required /></label>
               <label>Item / Material<input name="item" type="text" placeholder="Purchase item" required /></label>
               <label>Bill Number<input name="bill_number" type="text" placeholder="Optional" /></label>
@@ -2676,8 +3287,8 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
               <label>Amount<input name="amount" type="number" min="0.01" step="0.01" placeholder="0.00" required /></label>
               <label>Payment Status<select name="payment_status"><option>Paid</option><option>Pending</option><option>Partial</option></select></label>
             </div>
-            <label>Notes<input name="notes" type="text" placeholder="Optional" /></label>
-            <div className="modal-actions"><button type="submit" className="button button-primary">Save Purchase</button></div>
+            <label className="purchase-notes-field">Notes<input name="notes" type="text" placeholder="Optional" /></label>
+            <div className="modal-actions purchase-actions"><button type="submit" className="button button-primary">Save Purchase</button></div>
           </form>
         </section>
         <section className="panel">
@@ -2760,6 +3371,9 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
               <label>Role<input name="role" type="text" placeholder="Counter Staff" required /></label>
               <label>Phone<input name="phone" type="tel" placeholder="Phone number" /></label>
               <label>Status<select name="status"><option>Active</option><option>Inactive</option></select></label>
+              <label className="module-span-2">Address<textarea name="address" rows="2" placeholder="Employee address"></textarea></label>
+              <label>Aadhaar Card<input name="aadhar_file" type="file" accept="image/*,.pdf" /></label>
+              <label>PAN Card<input name="pan_file" type="file" accept="image/*,.pdf" /></label>
             </div>
             <div className="modal-actions"><button type="submit" className="button button-primary">Save Employee</button></div>
           </form>
@@ -2771,9 +3385,22 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
             return (
               <article className="record-card" key={employee.id}>
                 <div className="record-top">
-                  <div><h3>{employee.name}</h3><p className="record-meta">{employee.role} | {employee.phone || "No phone"}</p></div>
-                  <span className="record-chip">{employee.status}</span>
+                  <div><h3>{employee.name}</h3><p className="record-meta">{employee.role} | {employee.phone || "No phone"} | {employee.address || "No address"}</p></div>
+                  <div className="employee-card-actions">
+                    <span className="record-chip">{employee.status}</span>
+                    <button type="button" className="button button-danger file-action" onClick={() => deleteEmployee(employee.id)}>Delete</button>
+                  </div>
                 </div>
+                <div className="record-meta-grid">
+                  <span>Aadhaar {employee.aadharFileName || "Not uploaded"}</span>
+                  <span>PAN {employee.panFileName || "Not uploaded"}</span>
+                </div>
+                {(employee.aadharFileData || employee.panFileData) ? (
+                  <div className="record-actions">
+                    {employee.aadharFileData ? <FileAction record={{ fileData: employee.aadharFileData, fileName: employee.aadharFileName }} label="Download Aadhaar" /> : null}
+                    {employee.panFileData ? <FileAction record={{ fileData: employee.panFileData, fileName: employee.panFileName }} label="Download PAN" /> : null}
+                  </div>
+                ) : null}
                 <div className="attendance-row">
                   <span className="attendance-status">Today: {attendanceToday?.status || "Not marked"}</span>
                   <div className="attendance-actions">
@@ -2794,22 +3421,29 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     return (
       <section id="bankView" className={`app-view ${active ? "active" : ""}`} data-title="Your Bank">
         <section className="panel">
-          <div className="panel-header"><div><h2>Your Bank</h2><div className="panel-subtitle">Link the store bank account used for settlements.</div></div></div>
+          <div className="panel-header"><div><h2>Your Bank</h2><div className="panel-subtitle">Store settlement account, UPI, and reconciliation details.</div></div></div>
           <form id="bankForm" className="workspace-form" onSubmit={submitBank}>
             <div className="module-grid">
               <label>Account Holder<input name="account_holder" type="text" placeholder="Store or owner name" defaultValue={bankAccount?.accountHolder || ""} required /></label>
               <label>Bank Name<input name="bank_name" type="text" placeholder="Bank name" defaultValue={bankAccount?.bankName || ""} required /></label>
-              <label>Account Number<input name="account_number" type="text" inputMode="numeric" placeholder="Account number" defaultValue={bankAccount?.accountNumber || ""} required /></label>
-              <label>IFSC<input name="ifsc" type="text" placeholder="IFSC code" defaultValue={bankAccount?.ifsc || ""} required /></label>
-              <label>UPI ID<input name="upi_id" type="text" placeholder="Optional" defaultValue={bankAccount?.upiId || ""} /></label>
+              <label>Account Type<select name="account_type" defaultValue={bankAccount?.accountType || "Current"}><option>Current</option><option>Savings</option><option>Cash Credit</option><option>Overdraft</option></select></label>
+              <label>Account Number<input name="account_number" type="password" inputMode="numeric" placeholder="Account number" defaultValue={bankAccount?.accountNumber || ""} required /></label>
+              <label>Confirm Account<input name="confirm_account_number" type="password" inputMode="numeric" placeholder="Re-enter account number" defaultValue={bankAccount?.accountNumber || ""} required /></label>
+              <label>IFSC<input name="ifsc" type="text" placeholder="ABCD0123456" defaultValue={bankAccount?.ifsc || ""} maxLength="11" required /></label>
+              <label>UPI ID<input name="upi_id" type="text" placeholder="store@bank" defaultValue={bankAccount?.upiId || ""} /></label>
               <label>Branch<input name="branch" type="text" placeholder="Optional" defaultValue={bankAccount?.branch || ""} /></label>
+              <label>Settlement Mode<select name="settlement_mode" defaultValue={bankAccount?.settlementMode || "Manual reconciliation"}><option>Manual reconciliation</option><option>UPI settlement</option><option>Card settlement</option><option>Bank transfer settlement</option></select></label>
+              <label>Reconcile<select name="reconciliation_frequency" defaultValue={bankAccount?.reconciliationFrequency || "Daily"}><option>Daily</option><option>Weekly</option><option>Monthly</option></select></label>
+              <label>UPI QR / Bank Proof<input name="qr_file" type="file" accept="image/*,.pdf" /></label>
+              <label className="module-span-2">Notes<input name="notes" type="text" placeholder="Optional bank or settlement note" defaultValue={bankAccount?.notes || ""} /></label>
             </div>
-            <div className="modal-actions"><button type="submit" className="button button-primary">Link Bank Account</button></div>
+            <p className="settings-help">CinchPOS stores only merchant settlement details on this device. It does not store card data, login credentials, OTPs, or perform bank transfers.</p>
+            <div className="modal-actions"><button type="submit" className="button button-primary">Save Bank Details</button></div>
           </form>
         </section>
         <section className="panel">
           <div className="panel-header"><div><h2>Linked Account</h2><div className="panel-subtitle">Settlement account details for this store.</div></div></div>
-          <div id="bankAccountCard" className="record-list">{bankAccount ? <article className="record-card bank-card"><div className="record-top"><div><h3>{bankAccount.bankName || "Linked Bank"}</h3><p className="record-meta">{bankAccount.accountHolder || "Account holder not added"}</p></div><strong className="record-amount">{maskAccountNumber(bankAccount.accountNumber)}</strong></div><div className="record-meta-grid"><span>IFSC {bankAccount.ifsc || "Not added"}</span><span>UPI {bankAccount.upiId || "Not added"}</span><span>Branch {bankAccount.branch || "Not added"}</span></div></article> : <Empty>No bank account linked yet. Add the store account used for settlements.</Empty>}</div>
+          <div id="bankAccountCard" className="record-list">{bankAccount ? <article className="record-card bank-card"><div className="record-top"><div><h3>{bankAccount.bankName || "Linked Bank"}</h3><p className="record-meta">{bankAccount.accountHolder || "Account holder not added"} | {bankAccount.accountType || "Account type not added"}</p></div><strong className="record-amount">{maskAccountNumber(bankAccount.accountNumber)}</strong></div><div className="record-meta-grid"><span>IFSC {bankAccount.ifsc || "Not added"}</span><span>UPI {bankAccount.upiId || "Not added"}</span><span>Branch {bankAccount.branch || "Not added"}</span><span>{bankAccount.settlementMode || "Manual reconciliation"}</span><span>{bankAccount.reconciliationFrequency || "Daily"} check</span></div>{bankAccount.notes ? <p className="record-meta">{bankAccount.notes}</p> : null}{bankAccount.qrFileData ? <div className="record-actions"><FileAction record={{ fileData: bankAccount.qrFileData, fileName: bankAccount.qrFileName }} label="Download QR / Proof" /></div> : null}</article> : <Empty>No bank account linked yet. Add the store account used for settlements.</Empty>}</div>
         </section>
       </section>
     );
@@ -3133,7 +3767,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
   function DataTransferView({ active }) {
     return (
       <section id="dataTransferView" className={`app-view ${active ? "active" : ""}`} data-title="Retrieve Data">
-        <DataTransferPanel />
+        {DataTransferPanel()}
       </section>
     );
   }
@@ -3157,6 +3791,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     const invoicePreviewNumber = buildClientInvoiceNumber(todayISO());
     const backupModuleSummary = [
       ["Inventory", workspaceStats.inventory],
+      ["Sell Online", workspaceStats.sellOnline],
       ["Purchases", workspaceStats.purchases],
       ["Purchase Bills", workspaceStats.purchaseBills],
       ["Expenses", workspaceStats.expenses],
@@ -3189,6 +3824,8 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         invoiceNotes: cleanText(draft.invoiceNotes),
         startupView: sanitizedStartupView,
         printPaperSize: cleanText(draft.printPaperSize, defaultSettings.printPaperSize),
+        printLayout: cleanText(draft.printLayout, defaultSettings.printLayout),
+        printMargin: cleanText(draft.printMargin, defaultSettings.printMargin),
         printFooter: cleanText(draft.printFooter),
         printShopLogoOnBill: Boolean(draft.printShopLogoOnBill),
         autoPrintAfterBilling: Boolean(draft.autoPrintAfterBilling),
@@ -3214,6 +3851,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
           purchaseBills,
           storeDocuments,
           employees,
+          sellOnlineCatalog,
           posState
         }
       };
@@ -3250,6 +3888,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         setPurchaseBills(Array.isArray(snapshot.purchaseBills) ? snapshot.purchaseBills : []);
         setStoreDocuments(Array.isArray(snapshot.storeDocuments) ? snapshot.storeDocuments : []);
         setEmployees(Array.isArray(snapshot.employees) ? snapshot.employees : []);
+        setSellOnlineCatalog(snapshot.sellOnlineCatalog && typeof snapshot.sellOnlineCatalog === "object" ? snapshot.sellOnlineCatalog : {});
         setPosState(snapshot.posState ? { ...makeInitialPOSState(), ...snapshot.posState } : makeInitialPOSState());
         setDataTransferResult(null);
         setTransferDrafts(makeTransferDraftState());
@@ -3262,10 +3901,11 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     }
 
     function resetLocalModules() {
-      if (!window.confirm("Clear local inventory, purchases, expenses, employees, documents, and open POS bills on this device? API customers and invoices will stay untouched.")) {
+      if (!window.confirm("Clear local inventory, Sell Online selections, purchases, expenses, employees, documents, and open POS bills on this device? API customers and invoices will stay untouched.")) {
         return;
       }
       setInventoryItems([]);
+      setSellOnlineCatalog({});
       setBankAccount(null);
       setPurchaseRecords([]);
       setExpenseRecords([]);
@@ -3445,7 +4085,13 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
           <section className="settings-section">
             <h4>Printing</h4>
             <div className="form-grid settings-form-grid">
-              <label>Paper Size<select name="printPaperSize" value={draft.printPaperSize || "80mm"} onChange={(event) => setDraft((current) => ({ ...current, printPaperSize: event.target.value }))}><option value="58mm">58mm Receipt</option><option value="80mm">80mm Receipt</option><option value="A4">A4 Invoice</option></select></label>
+              <label>Paper Size<select name="printPaperSize" value={draft.printPaperSize || "80mm"} onChange={(event) => {
+                const nextPaperSize = event.target.value;
+                const profile = getPrintProfile(nextPaperSize);
+                setDraft((current) => ({ ...current, printPaperSize: nextPaperSize, printLayout: profile.layout }));
+              }}><option value="58mm">58mm Thermal Receipt</option><option value="76mm">76mm Thermal Receipt</option><option value="80mm">80mm Thermal Receipt</option><option value="A5">A5 Invoice</option><option value="A4">A4 Invoice</option><option value="Letter">Letter Invoice</option></select></label>
+              <label>Print Layout<select name="printLayout" value={draft.printLayout || getPrintProfile(draft.printPaperSize).layout} onChange={(event) => setDraft((current) => ({ ...current, printLayout: event.target.value }))}><option value="thermal">Thermal Compact</option><option value="invoice">Invoice Page</option></select></label>
+              <label>Print Margin<select name="printMargin" value={draft.printMargin || "default"} onChange={(event) => setDraft((current) => ({ ...current, printMargin: event.target.value }))}><option value="default">Recommended Margin</option><option value="none">No App Margin</option></select></label>
               <label>Print Footer<input name="printFooter" type="text" value={draft.printFooter || ""} onChange={(event) => setDraft((current) => ({ ...current, printFooter: event.target.value }))} /></label>
             </div>
             <label className="settings-check">
@@ -3456,8 +4102,8 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                 onChange={(event) => setDraft((current) => ({ ...current, printShopLogoOnBill: event.target.checked }))}
               />
               <span>
-                <strong>Print shop logo on thermal bill</strong>
-                <small>Uses the current business logo and prints it at the top of 58mm and 80mm receipts only.</small>
+                <strong>Print shop logo on bill</strong>
+                <small>Uses the current business logo at the top of thermal receipts and invoice pages.</small>
               </span>
             </label>
             <label className="settings-check">
@@ -3485,11 +4131,12 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
               </span>
             </label>
             <div className="settings-metric-grid">
-              <article className="settings-metric"><strong>{draft.printPaperSize || "80mm"}</strong><span>Receipt size</span></article>
+              <article className="settings-metric"><strong>{getPrintProfile(draft.printPaperSize).label}</strong><span>Paper profile</span></article>
+              <article className="settings-metric"><strong>{(draft.printLayout || getPrintProfile(draft.printPaperSize).layout) === "invoice" ? "Invoice" : "Thermal"}</strong><span>Layout mode</span></article>
               <article className="settings-metric"><strong>{draft.autoPrintAfterBilling ? "On" : "Off"}</strong><span>Auto print</span></article>
               <article className="settings-metric"><strong>{draft.showPreviewWatermark === false ? "Hidden" : "Visible"}</strong><span>Preview watermark</span></article>
             </div>
-            <p className="settings-help">Printing now uses the saved business identity, footer, and receipt controls for POS billing.</p>
+            <p className="settings-help">Thermal mode keeps receipts narrow and simple. Invoice mode keeps full table columns for A4, A5, and Letter printers. The final printer/paper tray is still chosen in the system print dialog.</p>
           </section>
         );
       }
@@ -3530,12 +4177,38 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                   <span className="record-chip">Careful</span>
                 </div>
                 <div className="record-meta-grid">
-                  <span>Clears Inventory, Purchase, Expense, Employee, Document, and open POS data from this device workspace.</span>
+                  <span>Clears Inventory, Sell Online, Purchase, Expense, Employee, Document, and open POS data from this device workspace.</span>
                   <span>Does not delete API customers or API invoices.</span>
                 </div>
                 <div className="record-actions settings-data-actions">
                   <button className="button button-secondary" type="button" onClick={resetLocalModules}>Reset Local Modules</button>
                 </div>
+              </article>
+              <article className="record-card smart-inventory-card">
+                <div className="record-top">
+                  <div>
+                    <h3>Smart Inventory Review</h3>
+                    <p className="record-meta">Keeps reviewing the saved inventory and flags overlapping products, barcode conflicts, and items that may not be needed anymore.</p>
+                  </div>
+                  <span className="record-chip">Smart Inventory</span>
+                </div>
+                <div className="settings-metric-grid">
+                  <article className="settings-metric"><strong>{smartInventoryReview.overlapCount}</strong><span>Overlap checks</span></article>
+                  <article className="settings-metric"><strong>{smartInventoryReview.cleanupCount}</strong><span>Cleanup candidates</span></article>
+                  <article className="settings-metric"><strong>{smartInventoryReview.suggestionCount}</strong><span>Total suggestions</span></article>
+                </div>
+                {smartInventoryReview.suggestions.length ? (
+                  <div className="smart-inventory-list">
+                    {smartInventoryReview.suggestions.map((suggestion, index) => (
+                      <article className={`smart-inventory-item ${suggestion.type}`} key={`${suggestion.title}-${index}`}>
+                        <strong>{suggestion.title}</strong>
+                        <span>{suggestion.detail}</span>
+                      </article>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="settings-inline-copy">No overlap or cleanup warnings right now. Smart Inventory will keep scanning this workspace as the list changes.</p>
+                )}
               </article>
               <details className="settings-advanced-panel">
                 <summary>Advanced Inventory Settings</summary>
@@ -3573,7 +4246,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
               <article className="record-card">
                 <h3>Contact Us</h3>
                 <p className="record-meta">For setup, data import, branding, printing, and billing workflow help.</p>
-                <div className="record-meta-grid"><span>Email support@cinchlive.com</span><span>Business hours support</span></div>
+                <div className="record-meta-grid"><span>Phone {SUPPORT_PHONE}</span><span>Email {SUPPORT_EMAIL}</span></div>
               </article>
               <article className="record-card">
                 <h3>Migration Support</h3>
@@ -3624,6 +4297,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                   <article className="settings-metric"><strong>{workspaceStats.customers}</strong><span>Customers</span></article>
                   <article className="settings-metric"><strong>{workspaceStats.invoices}</strong><span>Invoices</span></article>
                   <article className="settings-metric"><strong>{workspaceStats.inventory}</strong><span>Inventory Items</span></article>
+                  <article className="settings-metric"><strong>{workspaceStats.sellOnline}</strong><span>Online Products</span></article>
                   <article className="settings-metric"><strong>{workspaceStats.lowStock}</strong><span>Low Stock (&lt;=5)</span></article>
                   <article className="settings-metric"><strong>{workspaceStats.employees}</strong><span>Employees</span></article>
                   <article className="settings-metric"><strong>{workspaceStats.documents}</strong><span>Documents</span></article>

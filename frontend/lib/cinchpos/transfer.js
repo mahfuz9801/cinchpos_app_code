@@ -977,6 +977,7 @@ export function normalizeCustomerImport(row) {
   return {
     name: cleanText(valueFrom(row, ["name", "customerName", "customer_name", "partyName", "party", "customer", "ledgerName"])),
     email: cleanText(valueFrom(row, ["email", "emailAddress", "emailId", "partyEmail"])),
+    address: cleanText(valueFrom(row, ["address", "customerAddress", "customer_address", "partyAddress", "billingAddress", "shippingAddress"])),
     phone: cleanText(valueFrom(row, ["phone", "mobile", "contact", "phoneNumber", "customerPhone", "customer_phone", "mobileNumber", "mobileNo", "phoneNo", "partyPhone", "partyMobile", "whatsapp"]))
   };
 }
@@ -987,6 +988,7 @@ export function normalizeInvoiceImport(row) {
     customerName: cleanText(valueFrom(row, ["customerName", "customer_name", "customer", "partyName", "party", "name", "ledgerName"])),
     customerPhone: cleanText(valueFrom(row, ["customerPhone", "customer_phone", "phone", "mobile", "contact", "phoneNo", "mobileNo", "partyMobile"])),
     customerEmail: cleanText(valueFrom(row, ["customerEmail", "customer_email", "email", "emailId"])),
+    customerAddress: cleanText(valueFrom(row, ["customerAddress", "customer_address", "address", "partyAddress", "billingAddress", "shippingAddress"])),
     invoiceNumber: cleanText(valueFrom(row, ["invoiceNumber", "invoice_number", "billNumber", "bill_number", "number", "voucherNumber", "referenceNo"])),
     amount: numberFrom(row, ["amount", "total", "invoiceAmount", "invoice_amount", "billAmount", "grandTotal", "invoiceValue", "voucherAmount", "netAmount"], 0),
     totalPaid: numberFrom(row, ["totalPaid", "total_paid", "paid", "paidAmount", "paid_amount", "received", "receivedAmount"], 0),

@@ -17,7 +17,7 @@ DATABASE = os.getenv(
     "DATABASE_PATH",
     os.path.join(os.path.dirname(__file__), "database.db"),
 )
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
 DB_INDEX_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS idx_customers_phone ON customers(phone)",
     "CREATE INDEX IF NOT EXISTS idx_invoices_customer_id ON invoices(customer_id)",
@@ -115,6 +115,7 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
                 email TEXT DEFAULT '',
+                address TEXT DEFAULT '',
                 phone TEXT DEFAULT '',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
@@ -158,6 +159,7 @@ def init_db():
         conn.commit()
 
     ensure_column("customers", "email", "TEXT DEFAULT ''")
+    ensure_column("customers", "address", "TEXT DEFAULT ''")
     ensure_column("customers", "phone", "TEXT DEFAULT ''")
     ensure_column("invoices", "total_paid", "REAL DEFAULT 0")
     ensure_column("invoices", "status", "TEXT DEFAULT 'Pending'")
@@ -200,6 +202,7 @@ def serialize_customer(row):
         "id": row["id"],
         "name": row["name"],
         "email": row["email"] or "",
+        "address": row["address"] or "",
         "phone": row["phone"] or "",
         "created_at": row["created_at"],
     }
@@ -547,7 +550,7 @@ def dashboard_trend():
 def list_customers():
     with closing(get_connection()) as conn:
         rows = conn.execute(
-            "SELECT id, name, email, phone, created_at FROM customers ORDER BY name ASC"
+            "SELECT id, name, email, address, phone, created_at FROM customers ORDER BY name ASC"
         ).fetchall()
     return jsonify([serialize_customer(row) for row in rows])
 
@@ -557,6 +560,7 @@ def add_customer():
     data = request.get_json() or {}
     name = (data.get("name") or "").strip()
     email = (data.get("email") or "").strip()
+    address = (data.get("address") or "").strip()
     phone = (data.get("phone") or "").strip()
 
     if not name:
@@ -564,12 +568,12 @@ def add_customer():
 
     with closing(get_connection()) as conn:
         cursor = conn.execute(
-            "INSERT INTO customers (name, email, phone) VALUES (?, ?, ?)",
-            (name, email, phone),
+            "INSERT INTO customers (name, email, address, phone) VALUES (?, ?, ?, ?)",
+            (name, email, address, phone),
         )
         conn.commit()
         customer = conn.execute(
-            "SELECT id, name, email, phone, created_at FROM customers WHERE id = ?",
+            "SELECT id, name, email, address, phone, created_at FROM customers WHERE id = ?",
             (cursor.lastrowid,),
         ).fetchone()
     return jsonify(serialize_customer(customer)), 201
@@ -580,6 +584,7 @@ def update_customer(customer_id):
     data = request.get_json() or {}
     name = (data.get("name") or "").strip()
     email = (data.get("email") or "").strip()
+    address = (data.get("address") or "").strip()
     phone = (data.get("phone") or "").strip()
 
     if not name:
@@ -594,12 +599,12 @@ def update_customer(customer_id):
             return jsonify({"error": "Customer not found."}), 404
 
         conn.execute(
-            "UPDATE customers SET name = ?, email = ?, phone = ? WHERE id = ?",
-            (name, email, phone, customer_id),
+            "UPDATE customers SET name = ?, email = ?, address = ?, phone = ? WHERE id = ?",
+            (name, email, address, phone, customer_id),
         )
         conn.commit()
         customer = conn.execute(
-            "SELECT id, name, email, phone, created_at FROM customers WHERE id = ?",
+            "SELECT id, name, email, address, phone, created_at FROM customers WHERE id = ?",
             (customer_id,),
         ).fetchone()
     return jsonify(serialize_customer(customer))
