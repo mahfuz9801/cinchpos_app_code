@@ -111,6 +111,7 @@ export function SummaryIcon({ type }) {
 }
 
 export function TrendChart({ points }) {
+  const [activeIndex, setActiveIndex] = useState(null);
   const safePoints = points?.length ? points : [{ label: "", value: 0 }, { label: "", value: 0 }];
   const width = 760;
   const height = 280;
@@ -125,6 +126,14 @@ export function TrendChart({ points }) {
   });
   const linePath = coordinates.map((point, index) => `${index === 0 ? "M" : "L"} ${point.x} ${point.y}`).join(" ");
   const areaPath = `${linePath} L ${coordinates[coordinates.length - 1].x} ${height - padding.bottom} L ${coordinates[0].x} ${height - padding.bottom} Z`;
+  const activePoint = activeIndex === null ? null : coordinates[activeIndex];
+  const hoverWidth = safePoints.length > 1 ? stepX : width - padding.left - padding.right;
+  const tooltipWidth = 150;
+  const tooltipHeight = 44;
+  const tooltipX = activePoint
+    ? Math.min(width - tooltipWidth - 8, Math.max(8, activePoint.x - tooltipWidth / 2))
+    : 0;
+  const tooltipY = activePoint ? Math.max(8, activePoint.y - tooltipHeight - 14) : 0;
 
   return (
     <svg id="trendChart" className="chart-svg" viewBox={`0 0 ${width} ${height}`} aria-label="Revenue trend chart">
@@ -146,6 +155,37 @@ export function TrendChart({ points }) {
           <text x={point.x} y={height - 14} textAnchor="middle" fill="var(--muted)" fontSize="12">{point.label}</text>
         </g>
       ))}
+      {coordinates.map((point, index) => {
+        const x = Math.max(padding.left, point.x - hoverWidth / 2);
+        const maxWidth = width - padding.left - padding.right;
+        const nextWidth = Math.min(hoverWidth || maxWidth, width - padding.right - x);
+        return (
+          <rect
+            key={`hover-${point.label}-${index}`}
+            className="chart-hover-zone"
+            x={x}
+            y={padding.top}
+            width={Math.max(18, nextWidth)}
+            height={height - padding.top - padding.bottom}
+            tabIndex="0"
+            role="button"
+            aria-label={`${point.label || "Trend"} ${currency(point.value)}`}
+            onPointerEnter={() => setActiveIndex(index)}
+            onPointerLeave={() => setActiveIndex(null)}
+            onFocus={() => setActiveIndex(index)}
+            onBlur={() => setActiveIndex(null)}
+          />
+        );
+      })}
+      {activePoint ? (
+        <g className="chart-tooltip">
+          <line className="chart-hover-line" x1={activePoint.x} x2={activePoint.x} y1={padding.top} y2={height - padding.bottom} />
+          <circle className="chart-active-dot" cx={activePoint.x} cy={activePoint.y} r="7" />
+          <rect x={tooltipX} y={tooltipY} width={tooltipWidth} height={tooltipHeight} rx="8" />
+          <text className="chart-tooltip-label" x={tooltipX + 10} y={tooltipY + 17}>{activePoint.label || "Trend"}</text>
+          <text className="chart-tooltip-value" x={tooltipX + 10} y={tooltipY + 35}>{currency(activePoint.value)}</text>
+        </g>
+      ) : null}
     </svg>
   );
 }

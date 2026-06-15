@@ -39,14 +39,18 @@ export function makeInitialPOSState() {
 export function getPOSBillSummary(items) {
   return (items || []).reduce((summary, item) => {
     const quantity = Number(item.quantity || 1);
+    const mrp = Number(item.mrp || item.inclusivePrice || 0);
+    const sale = Number(item.inclusivePrice || 0);
     summary.quantity += quantity;
+    summary.mrpTotal += mrp * quantity;
+    summary.discountTotal += Math.max(0, (mrp - sale) * quantity);
     summary.subtotal += Number(item.taxableValue || 0) * quantity;
     summary.cgst += Number(item.cgst || 0) * quantity;
     summary.sgst += Number(item.sgst || 0) * quantity;
     summary.gst += Number(item.gstAmount || 0) * quantity;
-    summary.total += Number(item.inclusivePrice || 0) * quantity;
+    summary.total += sale * quantity;
     return summary;
-  }, { quantity: 0, subtotal: 0, cgst: 0, sgst: 0, gst: 0, total: 0 });
+  }, { quantity: 0, mrpTotal: 0, discountTotal: 0, subtotal: 0, cgst: 0, sgst: 0, gst: 0, total: 0 });
 }
 
 export function buildPOSLineItem(item) {
@@ -64,6 +68,10 @@ export function buildPOSLineItem(item) {
     key: String(sourceId),
     itemName,
     barcode,
+    hsn: cleanText(item.hsn || item.hsnSac || item.hsn_sac || item.sac),
+    description: cleanText(item.description || item.itemDescription || item.desc || item.shortDescription),
+    batch: cleanText(item.batch || item.batchNo || item.batchNumber || item.batch_no || item.lot || item.lotNumber),
+    unit: cleanText(item.unit || item.uom || item.unitName, "Pcs"),
     quantity: 1,
     mrp,
     inclusivePrice,
@@ -111,19 +119,90 @@ export function findInventoryItemsByBarcodeCandidate(items, query) {
   }));
 }
 
+function getInventorySearchName(item) {
+  return cleanText(item?.itemName || item?.item_name || item?.name);
+}
+
+function scoreInventoryName(item, search, normalizedSearch) {
+  const itemName = getInventorySearchName(item).toLowerCase();
+  if (!itemName || !search) {
+    return Number.POSITIVE_INFINITY;
+  }
+
+  const normalizedName = normalizeKey(itemName);
+  const words = itemName.split(/\s+/).filter(Boolean);
+  const normalizedWords = normalizedName.split("-").filter(Boolean);
+
+  if (itemName === search || normalizedName === normalizedSearch) {
+    return 0;
+  }
+  if (itemName.startsWith(search) || normalizedName.startsWith(normalizedSearch)) {
+    return 10;
+  }
+  if (words.some((word) => word.startsWith(search)) || normalizedWords.some((word) => word.startsWith(normalizedSearch))) {
+    return 20;
+  }
+  if (itemName.includes(search) || normalizedName.includes(normalizedSearch)) {
+    return 40;
+  }
+  return Number.POSITIVE_INFINITY;
+}
+
+function scoreInventoryBarcode(item, query) {
+  if (!isBarcodeLikeQuery(query)) {
+    return Number.POSITIVE_INFINITY;
+  }
+
+  const search = cleanText(query).toLowerCase();
+  const normalizedSearch = normalizeKey(query);
+  const barcodes = getInventoryItemBarcodes(item).map((barcode) => barcode.toLowerCase());
+  let bestScore = Number.POSITIVE_INFINITY;
+
+  barcodes.forEach((barcode) => {
+    const normalizedBarcode = normalizeKey(barcode);
+    if (barcode === search || normalizedBarcode === normalizedSearch) {
+      bestScore = Math.min(bestScore, 1);
+      return;
+    }
+    if (barcode.startsWith(search) || normalizedBarcode.startsWith(normalizedSearch)) {
+      bestScore = Math.min(bestScore, 12);
+      return;
+    }
+    if (barcode.includes(search) || normalizedBarcode.includes(normalizedSearch)) {
+      bestScore = Math.min(bestScore, 45);
+    }
+  });
+
+  return bestScore;
+}
+
 export function findInventoryMatches(items, query) {
   const search = cleanText(query).toLowerCase();
   const normalizedSearch = normalizeKey(query);
   if (!search) {
     return [];
   }
-  return items.filter((item) => {
-    const itemName = getInventoryItemName(item).toLowerCase();
-    const barcodes = getInventoryItemBarcodes(item).map((barcode) => barcode.toLowerCase());
-    return itemName.includes(search)
-      || normalizeKey(itemName).includes(normalizedSearch)
-      || barcodes.some((barcode) => barcode.includes(search) || normalizeKey(barcode).includes(normalizedSearch));
-  });
+
+  return items
+    .map((item, index) => {
+      const nameScore = scoreInventoryName(item, search, normalizedSearch);
+      const barcodeScore = scoreInventoryBarcode(item, query);
+      return {
+        item,
+        index,
+        score: Math.min(nameScore, barcodeScore),
+        name: getInventorySearchName(item).toLowerCase()
+      };
+    })
+    .filter((entry) => Number.isFinite(entry.score))
+    .sort((first, second) => {
+      if (first.score !== second.score) {
+        return first.score - second.score;
+      }
+      const nameSort = first.name.localeCompare(second.name);
+      return nameSort || first.index - second.index;
+    })
+    .map((entry) => entry.item);
 }
 
 export function findInventoryItemForPOS(items, query) {

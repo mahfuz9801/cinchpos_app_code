@@ -1,10 +1,18 @@
-const { app, BrowserWindow, dialog, protocol, shell } = require("electron");
+const { app, BrowserWindow, dialog, ipcMain, protocol, safeStorage, shell } = require("electron");
 const { spawn } = require("child_process");
 const fs = require("fs");
+const https = require("https");
 const http = require("http");
 const net = require("net");
 const path = require("path");
 const { pathToFileURL } = require("url");
+
+let autoUpdater = null;
+try {
+  ({ autoUpdater } = require("electron-updater"));
+} catch (error) {
+  console.warn(`CinchPOS updater unavailable: ${error.message || error}`);
+}
 
 const APP_NAME = "CinchPOS";
 const APP_ID = "com.cinchlive.cinchpos";
@@ -13,6 +21,10 @@ const FRONTEND_HOST = "127.0.0.1";
 const FRONTEND_SCHEME = "cinchpos";
 const FRONTEND_ORIGIN = `${FRONTEND_SCHEME}://app`;
 const RUNTIME_CONFIG_PATH = "/__cinchpos_runtime.json";
+const UPDATE_FEED_URL = process.env.CINCHPOS_UPDATE_FEED_URL
+  || "https://7aakdg0aolddhlmb.public.blob.vercel-storage.com/updates";
+const RELEASE_MANIFEST_URL = process.env.CINCHPOS_RELEASE_MANIFEST_URL
+  || `${UPDATE_FEED_URL.replace(/\/+$/, "")}/release.json`;
 const STATIC_MIME_TYPES = {
   ".css": "text/css; charset=UTF-8",
   ".gif": "image/gif",
@@ -45,9 +57,25 @@ let frontendProtocolRegistered = false;
 const runtimeConfig = {
   backendPort: DEFAULT_BACKEND_PORT
 };
+const updateState = {
+  currentVersion: app.getVersion(),
+  status: "idle",
+  message: "CinchPOS will check for updates after startup.",
+  updateInfo: null,
+  progress: null,
+  downloadPath: "",
+  canInstall: false,
+  source: "native"
+};
+let updateCheckInFlight = null;
+let fallbackDownloadRequest = null;
+let promptedUpdateVersion = "";
+let promptedDownloadedVersion = "";
 const MAX_WINDOW_RETRY_COUNT = 5;
 const RETRYABLE_WINDOW_ERROR_CODES = new Set([-102, -105, -106, -118, -300]);
 const BACKEND_DATA_DIR_NAME = "backend-data";
+const SECURE_STORAGE_DIR_NAME = "secure-storage";
+const PRINT_JOBS_DIR_NAME = "print-jobs";
 
 app.setName(APP_NAME);
 if (process.platform === "win32") {
@@ -137,6 +165,667 @@ function getAppDataDir() {
 
 function getWritableBackendDataDir() {
   return path.join(getAppDataDir(), BACKEND_DATA_DIR_NAME);
+}
+
+function getSecureStorageDir() {
+  return ensureDirectorySync(path.join(getAppDataDir(), SECURE_STORAGE_DIR_NAME));
+}
+
+function getSecureStoragePath(key) {
+  const safeKey = String(key || "")
+    .replace(/[^a-zA-Z0-9._-]/g, "_")
+    .slice(0, 80);
+  if (!safeKey) {
+    throw new Error("Secure storage key is required.");
+  }
+  return path.join(getSecureStorageDir(), `${safeKey}.json`);
+}
+
+function registerSecureStorageBridge() {
+  ipcMain.handle("cinchpos:secure-store:set", async (_event, key, value) => {
+    const normalizedValue = typeof value === "string" ? value : JSON.stringify(value ?? "");
+    const storagePath = getSecureStoragePath(key);
+    const encrypted = Boolean(safeStorage && safeStorage.isEncryptionAvailable());
+    const payload = encrypted
+      ? { encrypted: true, value: safeStorage.encryptString(normalizedValue).toString("base64") }
+      : { encrypted: false, value: normalizedValue };
+    await fs.promises.writeFile(storagePath, JSON.stringify(payload), { mode: 0o600 });
+    return { ok: true, encrypted };
+  });
+
+  ipcMain.handle("cinchpos:secure-store:get", async (_event, key) => {
+    const storagePath = getSecureStoragePath(key);
+    if (!fs.existsSync(storagePath)) {
+      return null;
+    }
+    const payload = JSON.parse(await fs.promises.readFile(storagePath, "utf8"));
+    if (payload.encrypted) {
+      return safeStorage.decryptString(Buffer.from(payload.value || "", "base64"));
+    }
+    return payload.value || null;
+  });
+
+  ipcMain.handle("cinchpos:secure-store:remove", async (_event, key) => {
+    const storagePath = getSecureStoragePath(key);
+    if (fs.existsSync(storagePath)) {
+      await fs.promises.unlink(storagePath);
+    }
+    return { ok: true };
+  });
+}
+
+function registerRuntimeConfigBridge() {
+  ipcMain.handle("cinchpos:get-runtime-config", async () => ({
+    appUrl: getAppUrl(),
+    apiBaseUrl: getApiBaseUrl(),
+    backendPort: runtimeConfig.backendPort
+  }));
+}
+
+function cloneUpdateState() {
+  return {
+    ...updateState,
+    currentVersion: app.getVersion(),
+    feedUrl: UPDATE_FEED_URL,
+    manifestUrl: RELEASE_MANIFEST_URL,
+    packaged: app.isPackaged
+  };
+}
+
+function setUpdateState(patch = {}) {
+  Object.assign(updateState, patch, { currentVersion: app.getVersion() });
+  const payload = cloneUpdateState();
+  BrowserWindow.getAllWindows().forEach((targetWindow) => {
+    if (!targetWindow.isDestroyed()) {
+      targetWindow.webContents.send("cinchpos:update-status", payload);
+    }
+  });
+  return payload;
+}
+
+function getUpdateVersion(info = {}) {
+  return String(info.version || updateState.updateInfo?.version || "").trim();
+}
+
+async function promptForAvailableUpdate(info = {}) {
+  const version = getUpdateVersion(info);
+  if (!app.isPackaged || !mainWindow || mainWindow.isDestroyed() || !version || promptedUpdateVersion === version) {
+    return;
+  }
+  promptedUpdateVersion = version;
+
+  const result = await dialog.showMessageBox(mainWindow, {
+    type: "info",
+    title: "CinchPOS update available",
+    message: `CinchPOS ${version} is available.`,
+    detail: "This update includes the latest billing, printing, inventory, and layout fixes. You can update now or continue billing and update later from Settings.",
+    buttons: ["Update Now", "Later"],
+    defaultId: 0,
+    cancelId: 1,
+    noLink: true
+  });
+
+  if (result.response === 0) {
+    downloadUpdate().catch((error) => {
+      console.warn(`CinchPOS update download prompt failed: ${error.message || error}`);
+      setUpdateState({
+        status: "error",
+        message: `Could not start the update download. ${error.message || error}`
+      });
+    });
+  }
+}
+
+async function promptForDownloadedUpdate(info = {}) {
+  const version = getUpdateVersion(info);
+  if (!app.isPackaged || !mainWindow || mainWindow.isDestroyed() || !version || promptedDownloadedVersion === version) {
+    return;
+  }
+  promptedDownloadedVersion = version;
+
+  const result = await dialog.showMessageBox(mainWindow, {
+    type: "question",
+    title: "CinchPOS update ready",
+    message: `CinchPOS ${version} is ready to install.`,
+    detail: "Install when the billing counter is free. CinchPOS will restart to finish the update.",
+    buttons: ["Restart & Install", "Later"],
+    defaultId: 0,
+    cancelId: 1,
+    noLink: true
+  });
+
+  if (result.response === 0) {
+    installUpdate().catch((error) => {
+      console.warn(`CinchPOS update install prompt failed: ${error.message || error}`);
+      setUpdateState({
+        status: "error",
+        message: `Could not start the installer. ${error.message || error}`
+      });
+    });
+  }
+}
+
+function compareVersions(left, right) {
+  const leftParts = String(left || "0.0.0").split(/[.-]/).map((part) => Number(part) || 0);
+  const rightParts = String(right || "0.0.0").split(/[.-]/).map((part) => Number(part) || 0);
+  const maxLength = Math.max(leftParts.length, rightParts.length);
+  for (let index = 0; index < maxLength; index += 1) {
+    const diff = (leftParts[index] || 0) - (rightParts[index] || 0);
+    if (diff !== 0) {
+      return diff > 0 ? 1 : -1;
+    }
+  }
+  return 0;
+}
+
+function requestUrl(url, redirectCount = 0) {
+  return new Promise((resolve, reject) => {
+    const client = String(url || "").startsWith("https:") ? https : http;
+    const request = client.get(url, {
+      headers: {
+        "User-Agent": `${APP_NAME}/${app.getVersion()}`
+      }
+    }, (response) => {
+      const statusCode = response.statusCode || 0;
+      const location = response.headers.location;
+      if (statusCode >= 300 && statusCode < 400 && location && redirectCount < 5) {
+        response.resume();
+        const nextUrl = new URL(location, url).toString();
+        requestUrl(nextUrl, redirectCount + 1).then(resolve).catch(reject);
+        return;
+      }
+      if (statusCode < 200 || statusCode >= 300) {
+        response.resume();
+        reject(new Error(`Update server returned ${statusCode}.`));
+        return;
+      }
+      resolve(response);
+    });
+    request.setTimeout(15000, () => {
+      request.destroy(new Error("Update server timed out."));
+    });
+    request.once("error", reject);
+  });
+}
+
+async function fetchJSON(url) {
+  const response = await requestUrl(url);
+  return new Promise((resolve, reject) => {
+    let body = "";
+    response.setEncoding("utf8");
+    response.on("data", (chunk) => {
+      body += chunk;
+    });
+    response.on("end", () => {
+      try {
+        resolve(JSON.parse(body));
+      } catch (error) {
+        reject(new Error(`Update manifest is not valid JSON: ${error.message || error}`));
+      }
+    });
+    response.once("error", reject);
+  });
+}
+
+function getFallbackDownload(manifest = {}) {
+  const key = process.platform === "darwin" ? "mac" : "windows";
+  const download = manifest.downloads && manifest.downloads[key];
+  if (!download || !download.url) {
+    return null;
+  }
+  return {
+    platform: key,
+    url: download.url,
+    fileName: download.fileName || path.basename(new URL(download.url).pathname) || (key === "mac" ? "CinchPOS.dmg" : "CinchPOS-Setup.exe"),
+    size: Number(download.size || 0),
+    sha512: download.sha512 || ""
+  };
+}
+
+async function checkFallbackRelease() {
+  const manifest = await fetchJSON(RELEASE_MANIFEST_URL);
+  const download = getFallbackDownload(manifest);
+  if (!download) {
+    throw new Error("No update download is configured for this operating system.");
+  }
+  const remoteVersion = String(manifest.version || "").trim();
+  if (!remoteVersion) {
+    throw new Error("Update manifest is missing a version.");
+  }
+  if (compareVersions(remoteVersion, app.getVersion()) <= 0) {
+    return setUpdateState({
+      status: "no-update",
+      message: `CinchPOS is up to date. Current version ${app.getVersion()}.`,
+      updateInfo: { version: remoteVersion, releaseDate: manifest.releaseDate || "", notes: manifest.notes || [] },
+      progress: null,
+      downloadPath: "",
+      canInstall: false,
+      source: "manifest"
+    });
+  }
+
+  return setUpdateState({
+    status: "available",
+    message: `CinchPOS ${remoteVersion} is available.`,
+    updateInfo: {
+      version: remoteVersion,
+      releaseDate: manifest.releaseDate || "",
+      notes: manifest.notes || [],
+      download
+    },
+    progress: null,
+    downloadPath: "",
+    canInstall: false,
+    source: "manifest"
+  });
+}
+
+async function downloadFallbackInstaller() {
+  const info = updateState.updateInfo || {};
+  const download = info.download;
+  if (!download || !download.url) {
+    throw new Error("No installer URL is available for this update.");
+  }
+
+  const downloadsDir = ensureDirectorySync(path.join(getAppDataDir(), "updates"));
+  const filePath = path.join(downloadsDir, makeSafePrintFileName(download.fileName));
+  setUpdateState({
+    status: "downloading",
+    message: `Downloading CinchPOS ${info.version || "update"}...`,
+    progress: { percent: 0, transferred: 0, total: download.size || 0 },
+    downloadPath: "",
+    canInstall: false,
+    source: "manifest"
+  });
+
+  const response = await requestUrl(download.url);
+  const total = Number(response.headers["content-length"] || download.size || 0);
+  let transferred = 0;
+
+  await new Promise((resolve, reject) => {
+    const fileStream = fs.createWriteStream(filePath);
+    fallbackDownloadRequest = response;
+    response.on("data", (chunk) => {
+      transferred += chunk.length;
+      const percent = total > 0 ? Math.min(100, Math.round((transferred / total) * 100)) : 0;
+      setUpdateState({
+        status: "downloading",
+        message: `Downloading CinchPOS ${info.version || "update"}... ${percent || ""}%`.trim(),
+        progress: { percent, transferred, total },
+        source: "manifest"
+      });
+    });
+    response.once("error", reject);
+    fileStream.once("error", reject);
+    fileStream.once("finish", resolve);
+    response.pipe(fileStream);
+  }).finally(() => {
+    fallbackDownloadRequest = null;
+  });
+
+  return setUpdateState({
+    status: "downloaded",
+    message: "Update downloaded. Install it when the billing counter is free.",
+    progress: { percent: 100, transferred, total },
+    downloadPath: filePath,
+    canInstall: true,
+    source: "manifest"
+  });
+}
+
+let updaterConfigured = false;
+
+function configureAutoUpdater() {
+  if (updaterConfigured || !autoUpdater) {
+    return;
+  }
+  updaterConfigured = true;
+  autoUpdater.autoDownload = false;
+  autoUpdater.autoInstallOnAppQuit = true;
+  autoUpdater.allowPrerelease = false;
+  autoUpdater.allowDowngrade = false;
+  autoUpdater.setFeedURL({
+    provider: "generic",
+    url: UPDATE_FEED_URL
+  });
+
+  autoUpdater.on("checking-for-update", () => {
+    setUpdateState({
+      status: "checking",
+      message: "Checking for CinchPOS updates...",
+      progress: null,
+      source: "native"
+    });
+  });
+
+  autoUpdater.on("update-available", (info) => {
+    setUpdateState({
+      status: "available",
+      message: `CinchPOS ${info.version || "update"} is available.`,
+      updateInfo: info,
+      progress: null,
+      downloadPath: "",
+      canInstall: false,
+      source: "native"
+    });
+    promptForAvailableUpdate(info).catch((error) => {
+      console.warn(`CinchPOS update prompt failed: ${error.message || error}`);
+    });
+  });
+
+  autoUpdater.on("update-not-available", (info) => {
+    setUpdateState({
+      status: "no-update",
+      message: `CinchPOS is up to date. Current version ${app.getVersion()}.`,
+      updateInfo: info,
+      progress: null,
+      downloadPath: "",
+      canInstall: false,
+      source: "native"
+    });
+  });
+
+  autoUpdater.on("download-progress", (progress) => {
+    setUpdateState({
+      status: "downloading",
+      message: `Downloading CinchPOS update... ${Math.round(progress.percent || 0)}%`,
+      progress,
+      source: "native"
+    });
+  });
+
+  autoUpdater.on("update-downloaded", (info) => {
+    setUpdateState({
+      status: "downloaded",
+      message: "Update downloaded. Restart CinchPOS to install it.",
+      updateInfo: info,
+      progress: { percent: 100 },
+      canInstall: true,
+      source: "native"
+    });
+    promptForDownloadedUpdate(info).catch((error) => {
+      console.warn(`CinchPOS downloaded update prompt failed: ${error.message || error}`);
+    });
+  });
+
+  autoUpdater.on("error", (error) => {
+    console.error(`CinchPOS native updater failed: ${error.message || error}`);
+    setUpdateState({
+      status: "error",
+      message: `Native update check failed. ${error.message || error}`,
+      progress: null,
+      source: "native"
+    });
+  });
+}
+
+async function checkForUpdates({ manual = false } = {}) {
+  if (updateCheckInFlight) {
+    return updateCheckInFlight;
+  }
+
+  updateCheckInFlight = (async () => {
+    configureAutoUpdater();
+    if (!app.isPackaged) {
+      return setUpdateState({
+        status: "idle",
+        message: "Updates are checked only in the packaged desktop app.",
+        progress: null,
+        source: "development"
+      });
+    }
+
+    try {
+      if (autoUpdater) {
+        await autoUpdater.checkForUpdates();
+        return cloneUpdateState();
+      }
+    } catch (error) {
+      console.warn(`CinchPOS native update check failed, trying release manifest: ${error.message || error}`);
+    }
+
+    try {
+      const fallbackState = await checkFallbackRelease();
+      if (!manual && fallbackState.status === "available") {
+        promptForAvailableUpdate(fallbackState.updateInfo).catch((error) => {
+          console.warn(`CinchPOS fallback update prompt failed: ${error.message || error}`);
+        });
+      }
+      return fallbackState;
+    } catch (error) {
+      const message = manual
+        ? `Could not check for updates. ${error.message || error}`
+        : "Could not check for updates automatically.";
+      return setUpdateState({
+        status: "error",
+        message,
+        progress: null,
+        source: "manifest"
+      });
+    }
+  })();
+
+  try {
+    return await updateCheckInFlight;
+  } finally {
+    updateCheckInFlight = null;
+  }
+}
+
+async function downloadUpdate() {
+  configureAutoUpdater();
+  if (!app.isPackaged) {
+    return setUpdateState({
+      status: "idle",
+      message: "Download updates from packaged CinchPOS, not from development mode.",
+      progress: null,
+      canInstall: false
+    });
+  }
+
+  if (updateState.source === "native" && autoUpdater) {
+    try {
+      await autoUpdater.downloadUpdate();
+      return cloneUpdateState();
+    } catch (error) {
+      console.warn(`CinchPOS native update download failed, trying installer fallback: ${error.message || error}`);
+      await checkFallbackRelease();
+      return downloadFallbackInstaller();
+    }
+  }
+
+  return downloadFallbackInstaller();
+}
+
+async function installUpdate() {
+  configureAutoUpdater();
+  if (updateState.source === "native" && autoUpdater && updateState.canInstall) {
+    autoUpdater.quitAndInstall(false, true);
+    return { ok: true, mode: "native" };
+  }
+
+  if (updateState.downloadPath && fs.existsSync(updateState.downloadPath)) {
+    const result = await shell.openPath(updateState.downloadPath);
+    if (result) {
+      throw new Error(result);
+    }
+    setUpdateState({
+      status: "installing",
+      message: "Installer opened. Close CinchPOS before completing the update.",
+      canInstall: true,
+      source: "manifest"
+    });
+    return { ok: true, mode: "installer" };
+  }
+
+  const download = updateState.updateInfo && updateState.updateInfo.download;
+  if (download && download.url) {
+    await shell.openExternal(download.url);
+    return { ok: true, mode: "browser" };
+  }
+
+  throw new Error("No downloaded update is ready to install.");
+}
+
+function registerUpdateBridge() {
+  configureAutoUpdater();
+  ipcMain.handle("cinchpos:update:get-state", async () => cloneUpdateState());
+  ipcMain.handle("cinchpos:update:check", async () => checkForUpdates({ manual: true }));
+  ipcMain.handle("cinchpos:update:download", async () => downloadUpdate());
+  ipcMain.handle("cinchpos:update:install", async () => installUpdate());
+  ipcMain.handle("cinchpos:update:cancel-download", async () => {
+    if (fallbackDownloadRequest && typeof fallbackDownloadRequest.destroy === "function") {
+      fallbackDownloadRequest.destroy(new Error("Download cancelled."));
+    }
+    return setUpdateState({
+      status: "available",
+      message: "Update download cancelled.",
+      progress: null,
+      canInstall: false
+    });
+  });
+}
+
+function getPrintJobsDir() {
+  return ensureDirectorySync(path.join(getAppDataDir(), PRINT_JOBS_DIR_NAME));
+}
+
+function makeSafePrintFileName(value) {
+  return String(value || "cinchpos-print")
+    .replace(/[^a-zA-Z0-9._-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "")
+    .slice(0, 80) || "cinchpos-print";
+}
+
+async function waitForPrintAssets(targetWindow) {
+  if (!targetWindow || targetWindow.isDestroyed()) {
+    return;
+  }
+
+  const assetWaitScript = `
+    new Promise((resolve) => {
+      const images = Array.from(document.images || []);
+      let pending = images.filter((image) => !image.complete).length;
+      if (!pending) {
+        resolve(true);
+        return;
+      }
+      const done = () => {
+        pending -= 1;
+        if (pending <= 0) {
+          resolve(true);
+        }
+      };
+      images.forEach((image) => {
+        if (image.complete) {
+          return;
+        }
+        image.addEventListener("load", done, { once: true });
+        image.addEventListener("error", done, { once: true });
+      });
+      setTimeout(() => resolve(false), 1600);
+    })
+  `;
+
+  await Promise.race([
+    targetWindow.webContents.executeJavaScript(assetWaitScript, true).catch(() => false),
+    new Promise((resolve) => setTimeout(resolve, 1800))
+  ]);
+}
+
+function registerPrintBridge() {
+  ipcMain.handle("cinchpos:print-html", async (event, payload = {}) => {
+    const html = typeof payload.html === "string" ? payload.html : "";
+    if (!html.trim()) {
+      throw new Error("Nothing was prepared for printing.");
+    }
+
+    const title = makeSafePrintFileName(payload.title || "CinchPOS Bill");
+    const printFilePath = path.join(getPrintJobsDir(), `${Date.now()}-${title}.html`);
+    await fs.promises.writeFile(printFilePath, html, "utf8");
+
+    const ownerWindow = BrowserWindow.fromWebContents(event.sender) || mainWindow;
+    const printWindow = new BrowserWindow({
+      width: 900,
+      height: 760,
+      minWidth: 640,
+      minHeight: 520,
+      title: `Print ${payload.title || "CinchPOS Bill"}`,
+      backgroundColor: "#ffffff",
+      show: false,
+      autoHideMenuBar: true,
+      parent: ownerWindow && !ownerWindow.isDestroyed() ? ownerWindow : undefined,
+      modal: false,
+      webPreferences: {
+        contextIsolation: true,
+        nodeIntegration: false,
+        sandbox: true
+      }
+    });
+
+    attachCommonWindowHandlers(printWindow);
+
+    const cleanup = () => {
+      fs.promises.unlink(printFilePath).catch(() => {});
+    };
+    printWindow.on("closed", cleanup);
+
+    try {
+      await printWindow.loadFile(printFilePath);
+      await waitForPrintAssets(printWindow);
+      if (printWindow.isDestroyed()) {
+        return { ok: false, cancelled: true };
+      }
+
+      printWindow.show();
+      printWindow.focus();
+
+      const printOptions = {
+        silent: false,
+        printBackground: true
+      };
+      if (payload.pageSize) {
+        printOptions.pageSize = payload.pageSize;
+      }
+
+      const result = await new Promise((resolve) => {
+        let settled = false;
+        const settle = (value) => {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          resolve(value);
+        };
+        printWindow.once("closed", () => settle({ ok: false, cancelled: true }));
+        printWindow.webContents.print(printOptions, (success, failureReason) => {
+          settle({
+            ok: Boolean(success),
+            cancelled: !success && /cancel/i.test(String(failureReason || "")),
+            failureReason: failureReason || ""
+          });
+        });
+      });
+
+      if (!result.ok && !result.cancelled) {
+        throw new Error(result.failureReason || "The system print dialog could not open.");
+      }
+
+      setTimeout(() => {
+        if (!printWindow.isDestroyed()) {
+          printWindow.destroy();
+        }
+      }, 800);
+      return result;
+    } catch (error) {
+      if (!printWindow.isDestroyed()) {
+        printWindow.destroy();
+      }
+      cleanup();
+      throw error;
+    }
+  });
 }
 
 function getBundledDatabasePath() {
@@ -681,6 +1370,7 @@ function getWindowOptions(overrides = {}) {
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
+      preload: path.join(__dirname, "preload.cjs"),
       sandbox: false
     },
     ...overrides
@@ -834,9 +1524,14 @@ async function boot() {
     await frontendBoot;
     frontendLoadedAt = Date.now();
     console.log(`CinchPOS shell ready in ${frontendLoadedAt - startedAt}ms`);
-    await loadAppIntoWindow();
     await backendBoot;
     servicesReady = true;
+    await loadAppIntoWindow();
+    setTimeout(() => {
+      checkForUpdates({ manual: false }).catch((error) => {
+        console.warn(`CinchPOS background update check failed: ${error.message || error}`);
+      });
+    }, 3500);
     console.log(`CinchPOS ready in ${Date.now() - startedAt}ms`);
   } catch (error) {
     console.error("CinchPOS could not start:", error?.message || error);
@@ -856,6 +1551,10 @@ if (!app.requestSingleInstanceLock()) {
   });
 
   app.whenReady().then(() => {
+    registerSecureStorageBridge();
+    registerRuntimeConfigBridge();
+    registerPrintBridge();
+    registerUpdateBridge();
     bootPromise = boot();
   });
 

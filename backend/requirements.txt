@@ -1,1 +1,2 @@
 Flask>=3.0,<4
+PyJWT[crypto]>=2.9,<3

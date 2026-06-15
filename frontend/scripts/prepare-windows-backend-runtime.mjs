@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { createWriteStream, existsSync } from "node:fs";
-import { cp, mkdir, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, readdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import https from "node:https";
@@ -17,15 +17,11 @@ const PYTHON_VERSION = process.env.CINCHPOS_WINDOWS_PYTHON_VERSION || "3.13.7";
 const PYTHON_ZIP_NAME = `python-${PYTHON_VERSION}-embed-amd64.zip`;
 const PYTHON_URL = `https://www.python.org/ftp/python/${PYTHON_VERSION}/${PYTHON_ZIP_NAME}`;
 const PYTHON_ZIP_PATH = path.join(downloadsDir, PYTHON_ZIP_NAME);
-const REQUIRED_PACKAGES = [
-  "flask",
-  "blinker",
-  "click",
-  "itsdangerous",
-  "jinja2",
-  "werkzeug",
-  "markupsafe"
-];
+const TARGET_PLATFORM = "win_amd64";
+const TARGET_IMPLEMENTATION = "cp";
+const [PYTHON_MAJOR, PYTHON_MINOR] = PYTHON_VERSION.split(".");
+const TARGET_PYTHON_VERSION = `${PYTHON_MAJOR}.${PYTHON_MINOR}`;
+const TARGET_ABI = `cp${PYTHON_MAJOR}${PYTHON_MINOR}`;
 
 function streamDownload(url, destination) {
   return new Promise((resolve, reject) => {
@@ -55,28 +51,6 @@ function streamDownload(url, destination) {
       reject(error);
     });
   });
-}
-
-async function findSitePackagesDir() {
-  const windowsCandidate = path.join(backendDir, ".venv", "Lib", "site-packages");
-  if (existsSync(windowsCandidate)) {
-    return windowsCandidate;
-  }
-
-  const libDir = path.join(backendDir, ".venv", "lib");
-  const pythonVersions = await readdir(libDir, { withFileTypes: true });
-  const pythonDir = pythonVersions.find((entry) => entry.isDirectory() && entry.name.startsWith("python"));
-
-  if (!pythonDir) {
-    throw new Error("Could not locate backend virtualenv site-packages.");
-  }
-
-  const unixCandidate = path.join(libDir, pythonDir.name, "site-packages");
-  if (!existsSync(unixCandidate)) {
-    throw new Error("Could not locate backend virtualenv site-packages.");
-  }
-
-  return unixCandidate;
 }
 
 async function ensureDownload() {
@@ -122,28 +96,61 @@ async function configurePth() {
   await writeFile(path.join(windowsPythonDir, pthName), `${contents}\n`);
 }
 
-async function copyDependencies() {
-  const sitePackagesDir = await findSitePackagesDir();
+function getBuildPythonExecutable() {
+  const windowsCandidate = path.join(backendDir, ".venv", "Scripts", "python.exe");
+  if (existsSync(windowsCandidate)) {
+    return windowsCandidate;
+  }
+
+  const unixCandidate = path.join(backendDir, ".venv", "bin", "python");
+  if (existsSync(unixCandidate)) {
+    return unixCandidate;
+  }
+
+  throw new Error("Could not locate backend virtualenv Python. Create backend/.venv and install requirements first.");
+}
+
+function installDependencies() {
+  const buildPython = getBuildPythonExecutable();
   const targetSitePackagesDir = path.join(windowsPythonDir, "Lib", "site-packages");
 
-  await mkdir(targetSitePackagesDir, { recursive: true });
-
-  for (const packageName of REQUIRED_PACKAGES) {
-    const source = path.join(sitePackagesDir, packageName);
-    if (!existsSync(source)) {
-      throw new Error(`Missing Python package directory: ${source}`);
+  execFileSync(buildPython, [
+    "-m",
+    "pip",
+    "install",
+    "--disable-pip-version-check",
+    "--target",
+    targetSitePackagesDir,
+    "--platform",
+    TARGET_PLATFORM,
+    "--python-version",
+    TARGET_PYTHON_VERSION,
+    "--implementation",
+    TARGET_IMPLEMENTATION,
+    "--abi",
+    TARGET_ABI,
+    "--only-binary=:all:",
+    "--upgrade",
+    "-r",
+    path.join(backendDir, "requirements.txt")
+  ], {
+    stdio: "inherit",
+    env: {
+      ...process.env,
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
     }
-    await rm(path.join(targetSitePackagesDir, packageName), { recursive: true, force: true });
-    await cp(source, path.join(targetSitePackagesDir, packageName), { recursive: true });
-  }
+  });
 }
 
 async function writeRuntimeMetadata() {
   const metadata = {
     pythonUrl: PYTHON_URL,
     pythonVersion: PYTHON_VERSION,
+    targetPlatform: TARGET_PLATFORM,
+    targetPythonVersion: TARGET_PYTHON_VERSION,
+    targetAbi: TARGET_ABI,
     generatedAt: new Date().toISOString(),
-    packagedDependencies: REQUIRED_PACKAGES
+    dependencySource: "pip --target Windows wheels from backend/requirements.txt"
   };
 
   await writeFile(
@@ -158,7 +165,7 @@ async function main() {
   await mkdir(windowsPythonDir, { recursive: true });
   extractZip();
   await configurePth();
-  await copyDependencies();
+  installDependencies();
   await writeRuntimeMetadata();
   console.log(`Prepared Windows backend runtime at ${windowsPythonDir}`);
 }

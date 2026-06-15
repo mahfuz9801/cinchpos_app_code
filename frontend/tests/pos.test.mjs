@@ -6,6 +6,7 @@ import {
   buildPOSSearchPatch,
   createNextPOSBillInstance,
   deletePOSBillFromInstance,
+  findInventoryMatches,
   findInventoryItemsByBarcode,
   getPOSBillSummary,
   makePOSInstance
@@ -49,6 +50,24 @@ test("buildPOSSearchPatch surfaces a clear chooser when one barcode maps to mult
   assert.equal(patch.matchMode, "barcode");
   assert.equal(patch.matches.length, 2);
   assert.match(patch.matchMessage, /Choose the correct item/i);
+});
+
+test("findInventoryMatches ranks typed product names before unrelated inventory", () => {
+  const matches = findInventoryMatches([
+    { id: "item-vaseline", itemName: "Vaseline deep moisture 90ml", barcodes: ["8901030978449"] },
+    { id: "item-amul-milk", itemName: "Amul Milk 500ml", barcodes: ["11111"] },
+    { id: "item-amul-butter", itemName: "Amul Butter", barcodes: ["22222"] },
+    { id: "item-parle", itemName: "Parle-G Biscuit", barcodes: ["33333"] }
+  ], "Am");
+
+  assert.deepEqual(matches.map((item) => item.itemName), ["Amul Butter", "Amul Milk 500ml"]);
+});
+
+test("findInventoryMatches still supports barcode prefix lookup for scanners", () => {
+  const matches = findInventoryMatches(inventoryItems, "00012");
+
+  assert.equal(matches.length, 1);
+  assert.equal(matches[0].itemName, "Green Tea");
 });
 
 test("addInventoryItemToPOSInstance increments quantity instead of duplicating the line item", () => {

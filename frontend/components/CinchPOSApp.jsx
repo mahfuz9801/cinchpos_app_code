@@ -2,13 +2,21 @@
 
 import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import {
+  createOfflineSession,
   createCustomer,
   createInvoice,
+  deleteInvoice,
+  getAuthContext,
+  getAuthRoles,
   getCustomers,
   getDashboard,
   getInvoices,
   getTrend,
+  isApiNetworkError,
+  inviteEmployeeAccount,
   recordPayment,
+  setAuthContextProvider,
+  setAuthTokenProvider,
   updateCustomer
 } from "@/lib/api";
 import {
@@ -53,6 +61,20 @@ import {
   storageKeys
 } from "@/lib/cinchpos/constants";
 import {
+  accountFromAuthState,
+  clearOfflineAuthSession,
+  getClerkSessionToken,
+  hasPermission,
+  loadClerkClient,
+  makeLocalOwnerAuthState,
+  makeSignedOutAuthState,
+  normalizeBackendAuthContext,
+  permissionsForRole,
+  readOfflineAuthSession,
+  viewPermissionMap,
+  writeOfflineAuthSession
+} from "@/lib/cinchpos/auth";
+import {
   addInventoryItemToPOSInstance,
   buildPOSSearchPatch,
   createNextPOSBillInstance,
@@ -85,7 +107,7 @@ import {
   readFileAsDataURL,
   readFileAsText,
   summarizeInventoryImport,
-  transferSourceProfiles,
+  transferSourceProfiles
 } from "@/lib/cinchpos/transfer";
 import {
   AppLogo,
@@ -120,9 +142,29 @@ function buildPOSCustomerFromRecord(customer) {
   };
 }
 
+function compactCurrency(value) {
+  const amount = Number(value || 0);
+  if (!Number.isFinite(amount)) {
+    return currency(0);
+  }
+  const absolute = Math.abs(amount);
+  if (absolute >= 10000000) {
+    return `Rs ${(amount / 10000000).toLocaleString("en-IN", { maximumFractionDigits: 2 })} Cr`;
+  }
+  if (absolute >= 100000) {
+    return `Rs ${(amount / 100000).toLocaleString("en-IN", { maximumFractionDigits: 2 })} L`;
+  }
+  return currency(amount);
+}
+
 function buildSmartInventoryReview(items = []) {
   const barcodeGroups = new Map();
   const nameGroups = new Map();
+  const lowStock = [];
+  const reorder = [];
+  const overstock = [];
+  const slowMoving = [];
+  const fastMoving = [];
   const cleanupCandidates = [];
 
   items.forEach((item, index) => {
@@ -132,7 +174,10 @@ function buildSmartInventoryReview(items = []) {
     const barcodes = getInventoryItemBarcodes(item);
     const price = Number(item.inclusivePrice || item.inclusive_price || item.price || 0);
     const stock = Number(item.stock || 0);
-    const summaryEntry = { id, name, barcodes, price, stock };
+    const reorderLevel = Math.max(0, Number(item.reorderLevel || item.reorder_level || 5));
+    const maxStockLevel = Math.max(reorderLevel + 1, Number(item.maxStockLevel || item.max_stock_level || Math.max(25, reorderLevel * 4)));
+    const sold30 = Math.max(0, Number(item.sold30 || item.soldLast30Days || item.monthlySales || 0));
+    const summaryEntry = { id, name, barcodes, price, stock, reorderLevel, maxStockLevel, sold30 };
 
     if (normalizedName) {
       const known = nameGroups.get(normalizedName) || [];
@@ -153,6 +198,21 @@ function buildSmartInventoryReview(items = []) {
     if (stock <= 0 || !barcodes.length || price <= 0) {
       cleanupCandidates.push(summaryEntry);
     }
+    if (stock <= reorderLevel) {
+      lowStock.push(summaryEntry);
+    }
+    if (stock <= reorderLevel && price > 0) {
+      reorder.push(summaryEntry);
+    }
+    if (stock >= maxStockLevel) {
+      overstock.push(summaryEntry);
+    }
+    if (stock > 8 && sold30 === 0) {
+      slowMoving.push(summaryEntry);
+    }
+    if (sold30 >= Math.max(10, stock * 0.8)) {
+      fastMoving.push(summaryEntry);
+    }
   });
 
   const suggestions = [];
@@ -168,6 +228,10 @@ function buildSmartInventoryReview(items = []) {
     suggestions.push({
       type: "overlap",
       title: "Shared barcode detected",
+      problem: `Barcode ${normalizedBarcode} is assigned to more than one product.`,
+      affectedItems: labels,
+      itemIds: [...uniqueIds],
+      recommendedAction: "Open these products and keep the barcode only on the correct item before billing.",
       detail: `${labels.join(", ")} ${labels.length > 1 ? "use" : "uses"} barcode ${normalizedBarcode}. Review these items before billing.`
     });
   });
@@ -182,9 +246,59 @@ function buildSmartInventoryReview(items = []) {
     suggestions.push({
       type: "overlap",
       title: "Possible duplicate item name",
+      problem: `${entries[0].name} appears ${entries.length} times${prices.length > 1 ? ` with different prices (${prices.join(", ")})` : ""}.`,
+      affectedItems: entries.map((entry) => entry.name),
+      itemIds: [...uniqueIds],
+      recommendedAction: "Review the duplicate records, merge stock into the right item, and archive or delete unnecessary copies.",
       detail: `${entries[0].name} appears ${entries.length} times${prices.length > 1 ? ` with different prices (${prices.join(", ")})` : ""}. Check whether all copies are needed.`
     });
   });
+
+  const groupedSuggestions = [
+    {
+      type: "low-stock",
+      title: "Low stock alerts",
+      entries: lowStock,
+      problem: "These products are at or below their reorder level.",
+      recommendedAction: "Update stock after physical verification or create a purchase/reorder plan."
+    },
+    {
+      type: "reorder",
+      title: "Reorder recommendations",
+      entries: reorder,
+      problem: "Stock is low enough that the next billing cycle may run out.",
+      recommendedAction: "Reorder enough quantity to reach the preferred stock level."
+    },
+    {
+      type: "overstock",
+      title: "Overstock alerts",
+      entries: overstock,
+      problem: "These items are carrying more stock than their expected maximum level.",
+      recommendedAction: "Review demand, slow purchases, or run offers to reduce holding cost."
+    },
+    {
+      type: "slow-moving",
+      title: "Slow-moving inventory",
+      entries: slowMoving,
+      problem: "These products have stock but no recent movement data.",
+      recommendedAction: "Check expiry, shelf placement, and whether the item should stay active."
+    },
+    {
+      type: "fast-moving",
+      title: "Fast-moving inventory",
+      entries: fastMoving,
+      problem: "These products are moving quickly against available stock.",
+      recommendedAction: "Raise reorder level and keep buffer stock available."
+    }
+  ].filter((suggestion) => suggestion.entries.length).map((suggestion) => ({
+    type: suggestion.type,
+    title: suggestion.title,
+    problem: suggestion.problem,
+    affectedItems: suggestion.entries.slice(0, 8).map((entry) => entry.name),
+    itemIds: suggestion.entries.map((entry) => entry.id),
+    recommendedAction: suggestion.recommendedAction,
+    detail: `${suggestion.entries.length} item(s) need attention. ${suggestion.recommendedAction}`
+  }));
 
   const cleanupSuggestions = cleanupCandidates.slice(0, 8).map((entry) => {
     const reasons = [];
@@ -200,32 +314,470 @@ function buildSmartInventoryReview(items = []) {
     return {
       type: "cleanup",
       title: "Possible cleanup candidate",
+      problem: `${entry.name} has ${reasons.join(", ")}.`,
+      affectedItems: [entry.name],
+      itemIds: [entry.id],
+      recommendedAction: "Open this product, complete missing data, or remove it from active inventory.",
       detail: `${entry.name} has ${reasons.join(", ")}. Review whether it still belongs in active inventory.`
     };
   });
 
+  const allSuggestions = [...groupedSuggestions, ...suggestions, ...cleanupSuggestions].slice(0, 18);
   return {
     overlapCount,
     cleanupCount: cleanupCandidates.length,
-    suggestionCount: suggestions.length + cleanupSuggestions.length,
-    suggestions: [...suggestions, ...cleanupSuggestions].slice(0, 12)
+    lowStockCount: lowStock.length,
+    reorderCount: reorder.length,
+    overstockCount: overstock.length,
+    slowMovingCount: slowMoving.length,
+    fastMovingCount: fastMoving.length,
+    suggestionCount: allSuggestions.length,
+    suggestions: allSuggestions
   };
 }
 
 const PRINT_PAPER_PROFILES = {
-  "58mm": { label: "58mm Thermal", pageWidth: "58mm", margin: "2mm", layout: "thermal" },
-  "76mm": { label: "76mm Thermal", pageWidth: "76mm", margin: "3mm", layout: "thermal" },
-  "80mm": { label: "80mm Thermal", pageWidth: "80mm", margin: "3mm", layout: "thermal" },
-  A5: { label: "A5 Invoice", pageWidth: "148mm", pageSize: "A5", margin: "8mm", layout: "invoice" },
-  A4: { label: "A4 Invoice", pageWidth: "210mm", pageSize: "A4", margin: "10mm", layout: "invoice" },
-  Letter: { label: "Letter Invoice", pageWidth: "216mm", pageSize: "letter", margin: "10mm", layout: "invoice" }
+  "58mm": {
+    label: "58mm Thermal Bill",
+    pageWidth: "58mm",
+    printableWidth: "50.8mm",
+    margin: "0",
+    layout: "thermal",
+    padding: { top: 2, bottom: 2.5, left: 3.7, right: 3 }
+  },
+  "76mm": {
+    label: "76mm Thermal Bill",
+    pageWidth: "76mm",
+    printableWidth: "68mm",
+    margin: "0",
+    layout: "thermal",
+    padding: { top: 2, bottom: 2.5, left: 4, right: 4 }
+  },
+  "80mm": {
+    label: "80mm Thermal Bill",
+    pageWidth: "80mm",
+    printableWidth: "72.2mm",
+    margin: "0",
+    layout: "thermal",
+    padding: { top: 2, bottom: 2.5, left: 3.7, right: 3.7 }
+  },
+  A5: { label: "A5 Standard Bill", pageWidth: "148mm", pageSize: "A5", margin: "8mm", layout: "invoice" },
+  A4: { label: "A4 Standard Bill", pageWidth: "210mm", pageSize: "A4", margin: "10mm", layout: "invoice" },
+  Letter: { label: "Letter Standard Bill", pageWidth: "216mm", pageSize: "letter", margin: "10mm", layout: "invoice" }
 };
+
+const THERMAL_RECEIPT_CSS = `
+  .thermal-receipt { display: block; width: 100%; overflow: hidden; color: #000; background: #fff; font-family: Arial, Helvetica, sans-serif; font-weight: 700; letter-spacing: 0; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  .thermal-receipt * { box-sizing: border-box; color: #000; }
+  .thermal-receipt--58 { font-size: 8.2px; line-height: 1.14; }
+  .thermal-receipt--80 { font-size: 9.4px; line-height: 1.16; }
+  .thermal-receipt p, .thermal-receipt h1, .thermal-receipt h2, .thermal-receipt h3 { margin: 0; }
+  .thermal-header { text-align: center; }
+  .thermal-shop-logo { display: block; width: 14mm; max-width: 42%; max-height: 14mm; object-fit: contain; margin: 0 auto 2px; }
+  .thermal-receipt--58 .thermal-shop-logo { width: 11mm; max-height: 11mm; }
+  .thermal-tax-title { font-size: 1.2em; line-height: 1.08; font-weight: 900; text-transform: uppercase; }
+  .thermal-business-name { margin-top: 1px; font-size: 1.08em; line-height: 1.08; font-weight: 900; }
+  .thermal-header-line { overflow-wrap: anywhere; }
+  .thermal-separator { height: 0; margin: 4px 0; border-top: 1px dashed #000; }
+  .thermal-info-block { display: grid; gap: 1px; }
+  .thermal-info-line { display: flex; align-items: flex-start; gap: 3px; }
+  .thermal-info-line strong { flex: 0 0 auto; font-weight: 900; }
+  .thermal-info-line span { min-width: 0; overflow-wrap: anywhere; }
+  .thermal-item-table { display: grid; gap: 0; }
+  .thermal-item-head, .thermal-item-row { display: grid; grid-template-columns: 12px minmax(0, 1fr) 30px 27px 31px 36px 38px; column-gap: 2px; align-items: start; }
+  .thermal-receipt--58 .thermal-item-head, .thermal-receipt--58 .thermal-item-row { grid-template-columns: 10px minmax(0, 1fr) 23px 20px 25px 28px 31px; column-gap: 1px; }
+  .thermal-item-head { padding: 2px 0; border-top: 1px dashed #000; border-bottom: 1px dashed #000; font-size: 0.92em; font-weight: 900; line-height: 1.08; }
+  .thermal-item-head span { display: block; min-width: 0; overflow-wrap: anywhere; }
+  .thermal-item-head strong { display: block; font-weight: 900; }
+  .thermal-item-head small { display: block; font-size: 0.96em; font-weight: 900; line-height: 1.06; }
+  .thermal-item-row { padding: 4px 0 3px; border-bottom: 1px dashed #000; break-inside: avoid; }
+  .thermal-item-row:last-child { border-bottom: 0; }
+  .thermal-col-center { text-align: center; }
+  .thermal-col-right { text-align: right; }
+  .thermal-item-name { min-width: 0; overflow-wrap: anywhere; }
+  .thermal-item-name strong { display: block; font-size: 1.06em; line-height: 1.08; font-weight: 900; overflow-wrap: anywhere; }
+  .thermal-item-name small { display: block; margin-top: 1px; font-size: 0.86em; line-height: 1.08; font-weight: 700; overflow-wrap: anywhere; }
+  .thermal-col-center small, .thermal-col-right small { display: block; margin-top: 1px; font-size: 0.92em; line-height: 1.08; font-weight: 700; }
+  .thermal-item-amount { font-weight: 900; }
+  .thermal-summary-block, .thermal-payment-block, .thermal-policy-block { display: grid; gap: 2px; }
+  .thermal-summary-row, .thermal-payment-row { display: flex; justify-content: space-between; gap: 8px; }
+  .thermal-summary-row strong, .thermal-payment-row strong { text-align: right; white-space: nowrap; font-weight: 900; }
+  .thermal-grand-total { margin-top: 2px; padding: 3px 0; border-top: 1px solid #000; border-bottom: 1px solid #000; font-size: 1.22em; font-weight: 900; text-transform: uppercase; }
+  .thermal-grand-total strong { font-size: 1.12em; }
+  .thermal-savings { padding: 3px 0; text-align: center; font-size: 1.06em; font-weight: 900; }
+  .thermal-policy-block strong { display: block; margin-bottom: 1px; font-weight: 900; }
+  .thermal-policy-block p { margin: 0; overflow-wrap: anywhere; white-space: normal; }
+  .thermal-footer { padding-top: 6px; text-align: center; font-weight: 800; }
+  .thermal-footer strong { display: block; font-size: 1.02em; font-weight: 900; }
+`;
 
 function getPrintProfile(paperSize, layout = "") {
   const profile = PRINT_PAPER_PROFILES[paperSize] || PRINT_PAPER_PROFILES["80mm"];
   return {
     ...profile,
     layout: layout || profile.layout
+  };
+}
+
+function toMicrons(mm) {
+  return Math.max(1000, Math.round(Number(mm || 0) * 1000));
+}
+
+function getThermalReceiptHeightMm(itemCount = 0, { hasLogo = false, hasFooter = false, hasNotes = false } = {}) {
+  const estimatedHeight = 118 + Number(itemCount || 0) * 12 + (hasLogo ? 10 : 0) + (hasNotes ? 42 : 0) + (hasFooter ? 16 : 0);
+  return Math.max(150, Math.min(5000, estimatedHeight));
+}
+
+function getElectronPrintPageSize(profile, payload = {}) {
+  if (profile.layout === "invoice") {
+    return profile.pageSize || "A4";
+  }
+  const widthMm = Number(String(profile.pageWidth || "80mm").replace(/[^\d.]/g, "")) || 80;
+  return {
+    width: toMicrons(widthMm),
+    height: toMicrons(getThermalReceiptHeightMm(payload.items?.length || 0, {
+      hasLogo: Boolean(payload.logo),
+      hasFooter: Boolean(payload.printFooter),
+      hasNotes: Boolean(payload.notes || payload.paymentTerms || payload.terms)
+    }))
+  };
+}
+
+function getThermalBasePadding(profile = {}) {
+  return profile.padding || { top: 2, bottom: 2.5, left: 3.7, right: 3.7 };
+}
+
+function getPrintPadding(profile = {}, calibration = {}, isInvoice = false) {
+  const normalized = normalizePrintCalibration(calibration);
+  const base = isInvoice
+    ? { top: 10, bottom: 10, left: 10, right: 10 }
+    : getThermalBasePadding(profile);
+  return [
+    Math.max(0, base.top + normalized.top),
+    Math.max(0, base.right + normalized.right),
+    Math.max(0, base.bottom + normalized.bottom),
+    Math.max(0, base.left + normalized.left)
+  ].map((value) => `${value}mm`).join(" ");
+}
+
+const DEFAULT_PRINT_CALIBRATION = {
+  top: 0,
+  bottom: 0,
+  left: 0,
+  right: 0,
+  scale: 100
+};
+
+function getPrintProfileKey(paperSize = "80mm", layout = "") {
+  const profile = getPrintProfile(paperSize, layout);
+  return `${paperSize || "80mm"}-${profile.layout}`;
+}
+
+function normalizePrintCalibration(value = {}) {
+  return {
+    top: Math.max(-20, Math.min(40, Number(value.top ?? DEFAULT_PRINT_CALIBRATION.top) || 0)),
+    bottom: Math.max(-20, Math.min(40, Number(value.bottom ?? DEFAULT_PRINT_CALIBRATION.bottom) || 0)),
+    left: Math.max(-20, Math.min(40, Number(value.left ?? DEFAULT_PRINT_CALIBRATION.left) || 0)),
+    right: Math.max(-20, Math.min(40, Number(value.right ?? DEFAULT_PRINT_CALIBRATION.right) || 0)),
+    scale: Math.max(70, Math.min(130, Number(value.scale ?? DEFAULT_PRINT_CALIBRATION.scale) || 100))
+  };
+}
+
+function receiptNumber(value, fractionDigits = 2) {
+  const number = Number(value || 0);
+  const safeNumber = Number.isFinite(number) ? number : 0;
+  return safeNumber.toLocaleString("en-IN", {
+    minimumFractionDigits: fractionDigits,
+    maximumFractionDigits: fractionDigits
+  });
+}
+
+function receiptQuantity(value) {
+  const number = Number(value || 0);
+  if (!Number.isFinite(number)) {
+    return "0";
+  }
+  return Number.isInteger(number) ? String(number) : receiptNumber(number, 2);
+}
+
+function receiptPercent(value) {
+  return `${receiptNumber(value, 2)}%`;
+}
+
+function receiptMoney(value) {
+  return `Rs ${receiptNumber(value, 2)}`;
+}
+
+function receiptHTML(value) {
+  return escapeHTML(cleanText(value)).replace(/\n/g, "<br>");
+}
+
+function getDesktopUpdateBridge() {
+  if (typeof window === "undefined") {
+    return null;
+  }
+  return window.cinchposDesktop?.updates || null;
+}
+
+function getThermalReceiptWidthKey(paperSize = "80mm") {
+  return String(paperSize).startsWith("58") ? "58mm" : "80mm";
+}
+
+function buildReceiptSettings(settingsLike = {}) {
+  return {
+    template: cleanText(settingsLike.printReceiptTemplate, defaultSettings.printReceiptTemplate || "retail"),
+    showGSTNumber: settingsLike.printShowGSTNumber !== false,
+    showCustomerDetails: settingsLike.printShowCustomerDetails !== false,
+    showTaxBreakdown: settingsLike.printShowTaxBreakdown !== false,
+    showHSN: Boolean(settingsLike.printShowHSN),
+    showSavings: settingsLike.printShowSavings !== false,
+    showPaymentDetails: settingsLike.printShowPaymentDetails !== false,
+    showQRCode: Boolean(settingsLike.printShowQRCode),
+    showFooterMessage: settingsLike.printShowFooterMessage !== false,
+    showTerms: settingsLike.printShowTerms !== false,
+    showCashierName: settingsLike.printShowCashierName !== false,
+    showCounterName: settingsLike.printShowCounterName !== false,
+    fssai: cleanText(settingsLike.printFssai),
+    website: cleanText(settingsLike.printWebsite),
+    cashierName: cleanText(settingsLike.printCashierName, defaultSettings.printCashierName || "Admin"),
+    counterName: cleanText(settingsLike.printCounterName, defaultSettings.printCounterName || "Counter 1"),
+    orderType: cleanText(settingsLike.printOrderType, defaultSettings.printOrderType || "Retail"),
+    terms: cleanText(settingsLike.printTermsAndConditions || settingsLike.printFooterTerms),
+    refundPolicy: cleanText(settingsLike.printRefundPolicy),
+    returnPolicy: cleanText(settingsLike.printReturnPolicy),
+    exchangePolicy: cleanText(settingsLike.printExchangePolicy),
+    warrantyInfo: cleanText(settingsLike.printWarrantyInfo),
+    visitAgainMessage: cleanText(settingsLike.printVisitAgainMessage),
+    socialMedia: cleanText(settingsLike.printSocialMedia),
+    loyaltyMessage: cleanText(settingsLike.printLoyaltyMessage)
+  };
+}
+
+function getPayloadReceiptSettings(payload = {}) {
+  return {
+    ...buildReceiptSettings(defaultSettings),
+    ...(payload.receiptSettings || {})
+  };
+}
+
+function getReceiptTime(payload = {}) {
+  if (payload.time) {
+    return cleanText(payload.time);
+  }
+  return new Date().toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" });
+}
+
+function makeReceiptMetaRow(label, value) {
+  const displayValue = cleanText(value);
+  if (!displayValue) {
+    return "";
+  }
+  return `<div class="thermal-meta-row"><span>${escapeHTML(label)}</span><strong>${receiptHTML(displayValue)}</strong></div>`;
+}
+
+function makeReceiptInfoLine(label, value) {
+  const displayValue = cleanText(value);
+  if (!displayValue) {
+    return "";
+  }
+  return `<div class="thermal-info-line"><strong>${escapeHTML(label)}</strong><span>${receiptHTML(displayValue)}</span></div>`;
+}
+
+function makeThermalSeparator() {
+  return `<div class="thermal-separator" aria-hidden="true"></div>`;
+}
+
+function buildReceiptTaxRows(items = [], summary = {}) {
+  const rows = new Map();
+  (items || []).forEach((item) => {
+    const quantity = Math.max(0, Number(item.quantity || 0));
+    const gstRate = Math.max(0, Number(item.gstRate || 0));
+    const gstAmount = Math.max(0, Number(item.gstAmount || 0) * quantity);
+    if (!gstRate || !gstAmount) {
+      return;
+    }
+    const label = `GST @${receiptNumber(gstRate, gstRate % 1 ? 2 : 0)}%`;
+    rows.set(label, Number(rows.get(label) || 0) + Number(gstAmount || 0));
+  });
+  if (!rows.size && Number(summary.gst || 0) > 0) {
+    rows.set("GST", Number(summary.gst || 0));
+  }
+  return Array.from(rows.entries()).filter(([, amount]) => Number(amount || 0) > 0);
+}
+
+function getReceiptPaymentRows(payload = {}) {
+  const explicitRows = Array.isArray(payload.payments) ? payload.payments : [];
+  if (explicitRows.length) {
+    return explicitRows
+      .map((payment) => ({
+        method: cleanText(payment.method || payment.label || "Payment"),
+        amount: Number(payment.amount || 0)
+      }))
+      .filter((payment) => payment.amount > 0);
+  }
+  const paidAmount = Number(payload.paidAmount || 0);
+  return paidAmount > 0 ? [{ method: cleanText(payload.paymentMethod, "Cash"), amount: paidAmount }] : [];
+}
+
+function buildReceiptPolicyRows(receiptSettings = {}, payload = {}) {
+  if (!receiptSettings.showTerms) {
+    return [];
+  }
+  return [
+    ["Notes", payload.notes],
+    ["Terms & Conditions", payload.terms || receiptSettings.terms]
+  ].filter(([, value]) => cleanText(value));
+}
+
+function getReceiptItemDescription(item = {}) {
+  return cleanText(item.description || item.itemDescription || item.desc || item.notes || item.shortDescription);
+}
+
+function getReceiptItemBatch(item = {}) {
+  return cleanText(item.batch || item.batchNo || item.batchNumber || item.batch_no || item.lot || item.lotNumber);
+}
+
+function getReceiptItemUnit(item = {}) {
+  return cleanText(item.unit || item.uom || item.unitName, "Pcs");
+}
+
+function buildThermalItemsMarkup(payload = {}) {
+  const rows = payload.items || [];
+
+  if (!rows.length) {
+    return `<section class="thermal-item-table"><p>No items added.</p></section>`;
+  }
+
+  return `<section class="thermal-item-table">
+    <div class="thermal-item-head"><span>#</span><span><strong>Item Name</strong><small>HSN</small></span><span class="thermal-col-right"><strong>MRP</strong><small>Disc</small></span><span class="thermal-col-center">Qty</span><span class="thermal-col-right">SP</span><span class="thermal-col-right"><strong>Rate</strong><small>Tax</small></span><span class="thermal-col-right">Amt</span></div>
+    ${rows.map((item) => {
+      const quantity = Math.max(0, Number(item.quantity || 0));
+      const taxableValue = Number(item.taxableValue || 0);
+      const taxRate = Number(item.gstRate || 0);
+      const description = getReceiptItemDescription(item);
+      const batch = getReceiptItemBatch(item);
+      const barcode = cleanText(item.barcode);
+      const hsn = cleanText(item.hsn || item.hsnSac || item.hsn_sac || item.sac || barcode, "-");
+      const discount = Number(item.discountPercent || 0);
+      return `<div class="thermal-item-row">
+        <span>${receiptHTML(item.serial || "")}</span>
+        <span class="thermal-item-name"><strong>${receiptHTML(item.itemName)}</strong><small>${receiptHTML(hsn)}</small>${description ? `<small>Desc: ${receiptHTML(description)}</small>` : ""}${batch ? `<small>Batch: ${receiptHTML(batch)}</small>` : ""}</span>
+        <span class="thermal-col-right">${receiptNumber(item.mrp)}<small>${discount ? `${receiptNumber(discount, discount % 1 ? 2 : 0)}%` : "-"}</small></span>
+        <span class="thermal-col-center">${receiptQuantity(quantity)} ${receiptHTML(getReceiptItemUnit(item))}</span>
+        <span class="thermal-col-right">${receiptNumber(item.inclusivePrice)}</span>
+        <span class="thermal-col-right">${receiptNumber(taxableValue)}<small>${taxRate ? `${receiptNumber(taxRate, taxRate % 1 ? 2 : 0)}%` : "-"}</small></span>
+        <span class="thermal-col-right thermal-item-amount">${receiptNumber(item.lineTotal)}</span>
+      </div>`;
+    }).join("")}
+  </section>`;
+}
+
+function buildThermalReceiptMarkup(payload = {}) {
+  const receiptSettings = getPayloadReceiptSettings(payload);
+  const widthKey = getThermalReceiptWidthKey(payload.paperSize);
+  const summary = calculatePrintPayloadSummary(payload.items || [], payload.summary);
+  const taxRows = buildReceiptTaxRows(payload.items || [], summary);
+  const paymentRows = getReceiptPaymentRows(payload);
+  const policyRows = buildReceiptPolicyRows(receiptSettings, payload);
+  const discountTotal = Number(summary.discountTotal || 0);
+  const paidTotal = paymentRows.reduce((total, payment) => total + Number(payment.amount || 0), 0);
+  const balanceAmount = Math.max(0, Number(payload.unpaidAmount ?? (Number(summary.total || 0) - paidTotal)) || 0);
+  const displayDate = [formatDate(payload.date), getReceiptTime(payload)].filter(Boolean).join(", ");
+  const shippingDetails = cleanText(payload.shippingDetails || payload.shipTo || payload.shippingAddress);
+  const subTotalAmount = Number(summary.mrpTotal || 0) || Number(summary.total || 0);
+
+  return `<div class="thermal-receipt thermal-receipt--${widthKey === "58mm" ? "58" : "80"}">
+    <header class="thermal-header">
+      ${payload.logo ? `<img class="thermal-shop-logo" src="${escapeHTML(payload.logo)}" alt="">` : ""}
+      <h1 class="thermal-tax-title">TAX INVOICE</h1>
+      <h2 class="thermal-business-name">${receiptHTML(payload.businessName || "Store Name")}</h2>
+      ${payload.businessAddress ? `<p class="thermal-header-line">${receiptHTML(payload.businessAddress)}</p>` : ""}
+      ${payload.businessPhone ? `<p class="thermal-header-line">Phone No : ${receiptHTML(payload.businessPhone)}</p>` : ""}
+      ${receiptSettings.showGSTNumber && payload.gstin ? `<p class="thermal-header-line">GST : ${receiptHTML(payload.gstin)}</p>` : ""}
+    </header>
+    ${makeThermalSeparator()}
+    <section class="thermal-info-block">
+      ${makeReceiptInfoLine("Invoice No :", payload.invoiceNumber)}
+      ${makeReceiptInfoLine("Date :", displayDate)}
+      ${receiptSettings.showCustomerDetails ? makeReceiptInfoLine("Bill To :", payload.customerName) : ""}
+      ${receiptSettings.showCustomerDetails ? makeReceiptInfoLine("Address :", payload.customerAddress) : ""}
+      ${receiptSettings.showCustomerDetails ? makeReceiptInfoLine("Mobile :", payload.customerPhone) : ""}
+      ${receiptSettings.showCustomerDetails ? makeReceiptInfoLine("GSTIN :", payload.customerGstin) : ""}
+      ${makeReceiptInfoLine("Place Of Supply :", payload.placeOfSupply)}
+      ${makeReceiptInfoLine("Shipping Details :", shippingDetails)}
+    </section>
+    ${makeThermalSeparator()}
+    ${buildThermalItemsMarkup(payload)}
+    ${makeThermalSeparator()}
+    <section class="thermal-summary-block">
+      <div class="thermal-summary-row"><span>Sub Total</span><strong>${receiptMoney(subTotalAmount)}</strong></div>
+      <div class="thermal-summary-row"><span>Taxable Amount</span><strong>${receiptMoney(summary.subtotal)}</strong></div>
+      ${receiptSettings.showTaxBreakdown ? taxRows.map(([label, amount]) => `<div class="thermal-summary-row"><span>${escapeHTML(label)}</span><strong>${receiptMoney(amount)}</strong></div>`).join("") : ""}
+      ${discountTotal > 0 ? `<div class="thermal-summary-row"><span>Total Discount</span><strong>${receiptMoney(discountTotal)}</strong></div>` : ""}
+      ${Number(payload.roundOff || 0) ? `<div class="thermal-summary-row"><span>Round Off</span><strong>${receiptMoney(payload.roundOff)}</strong></div>` : ""}
+      <div class="thermal-summary-row thermal-grand-total"><span>Total Amount</span><strong>${receiptMoney(summary.total)}</strong></div>
+    </section>
+    ${receiptSettings.showPaymentDetails ? `<section class="thermal-payment-block">
+      <div class="thermal-payment-row"><span>Paid Amount</span><strong>${receiptMoney(Number(payload.paidAmount || paidTotal || 0))}</strong></div>
+      <div class="thermal-payment-row"><span>Balance Amount</span><strong>${receiptMoney(balanceAmount)}</strong></div>
+    </section>` : ""}
+    ${receiptSettings.showSavings && discountTotal > 0 ? `<section class="thermal-savings">*** YOU SAVED ${receiptMoney(discountTotal)} ***</section>` : ""}
+    ${policyRows.length ? makeThermalSeparator() : ""}
+    ${policyRows.length ? `<section class="thermal-policy-block">${policyRows.map(([label, value]) => `<div><strong>${escapeHTML(label)}</strong><p>${receiptHTML(value)}</p></div>`).join("")}</section>` : ""}
+    <footer class="thermal-footer">
+      ${receiptSettings.showFooterMessage && payload.printFooter ? `<strong>${receiptHTML(payload.printFooter)}</strong>` : ""}
+    </footer>
+  </div>`;
+}
+
+function getCalibrationForSettings(settingsLike = {}) {
+  const key = getPrintProfileKey(settingsLike.printPaperSize, settingsLike.printLayout);
+  return normalizePrintCalibration(settingsLike.printCalibrationProfiles?.[key]);
+}
+
+function buildSamplePrintPayload(settingsLike, businessName, ownerName, logo = "") {
+  const sampleItems = [
+    { serial: 1, itemName: "Samsung A30", barcode: "1234", description: "Samsung phone", batch: "A30-001", unit: "Pcs", quantity: 1, mrp: 12000, inclusivePrice: 10620, discountPercent: 11.5, taxableValue: 9000, gstRate: 18, gstAmount: 1620, lineTotal: 10620 },
+    { serial: 2, itemName: "Parle-G 200g", barcode: "40511209", description: "Best biscuit", batch: "PG-200", unit: "Box", quantity: 1, mrp: 400, inclusivePrice: 306, discountPercent: 23.5, taxableValue: 291.43, gstRate: 5, gstAmount: 14.57, lineTotal: 306 },
+    { serial: 3, itemName: "Puma Blue Round Neck T-Shirt", barcode: "2032", description: "Round neck T-shirt", batch: "PUMA-032", unit: "Pcs", quantity: 2, mrp: 1200, inclusivePrice: 945, discountPercent: 21.25, taxableValue: 900, gstRate: 5, gstAmount: 45, lineTotal: 1890 }
+  ];
+  const summary = calculatePrintPayloadSummary(sampleItems);
+  return {
+    businessName,
+    ownerName,
+    businessPhone: settingsLike.businessPhone || "+91 90389 56555",
+    businessEmail: settingsLike.businessEmail || "store@example.com",
+    businessAddress: settingsLike.businessAddress || "73/S/6, Rajkumar Mukherjee Road, Kolkata",
+    gstin: settingsLike.gstin || "GSTIN SAMPLE",
+    receiptSettings: buildReceiptSettings(settingsLike),
+    cashierName: settingsLike.printCashierName || defaultSettings.printCashierName,
+    counterName: settingsLike.printCounterName || defaultSettings.printCounterName,
+    orderType: settingsLike.printOrderType || defaultSettings.printOrderType,
+    logo: settingsLike.printShopLogoOnBill ? (settingsLike.storeLogo || settingsLike.storeLogoUrl || logo || "") : "",
+    paperSize: settingsLike.printPaperSize || defaultSettings.printPaperSize,
+    printLayout: settingsLike.printLayout || defaultSettings.printLayout,
+    printMargin: settingsLike.printMargin || defaultSettings.printMargin,
+    printFooter: settingsLike.printFooter || defaultSettings.printFooter,
+    printCalibration: getCalibrationForSettings(settingsLike),
+    invoiceNumber: "PREVIEW-0001",
+    date: todayISO(),
+    dueDate: todayISO(),
+    customerName: "Sample Party",
+    customerPhone: "7400417400",
+    customerEmail: "preview@example.com",
+    customerAddress: "No F2, Outer Circle, Connaught Circus, New Delhi, Delhi, 110001",
+    customerGstin: "07ABCCH2702H4ZZ",
+    placeOfSupply: "Karnataka",
+    shippingDetails: "Sample Shipping Company, Plot No. 123, Industrial Area, Andheri East, Mumbai, Maharashtra, 400001",
+    paymentMethod: "Cash",
+    paymentType: "Full Payment",
+    paidAmount: summary.total,
+    unpaidAmount: 0,
+    notes: "Sample Note",
+    paymentTerms: "Payment due on receipt.",
+    terms: settingsLike.printTermsAndConditions || settingsLike.printFooterTerms || "Please check MRP and expiry before leaving the counter.\nAll disputes are subject to Kolkata jurisdiction only.",
+    summary,
+    items: sampleItems
   };
 }
 
@@ -244,6 +796,349 @@ function isValidUPI(value) {
 
 function normalizeAccountNumber(value) {
   return cleanText(value).replace(/\D/g, "").slice(0, 24);
+}
+
+function makeInvoiceBuilderLine(overrides = {}) {
+  return {
+    id: overrides.id || `line-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    itemId: overrides.itemId || "",
+    itemName: overrides.itemName || "",
+    barcode: overrides.barcode || "",
+    quantity: overrides.quantity ?? 1,
+    mrp: overrides.mrp ?? 0,
+    inclusivePrice: overrides.inclusivePrice ?? 0,
+    discountPercent: overrides.discountPercent ?? 0,
+    gstRate: overrides.gstRate ?? 18
+  };
+}
+
+function makeInvoiceBuilderDraft(overrides = {}) {
+  return {
+    template: "gst",
+    layout: "standard",
+    customerId: "",
+    customerName: "",
+    customerPhone: "",
+    customerEmail: "",
+    customerAddress: "",
+    invoiceNumber: "",
+    issuedOn: todayISO(),
+    dueOn: todayISO(),
+    paymentTerms: "Payment due on receipt.",
+    notes: "",
+    terms: "Goods once sold will not be taken back unless required by law.",
+    paymentStatus: "pending",
+    paymentMethod: "Cash",
+    paymentAmount: "",
+    headerPlacement: "center",
+    logoPlacement: "top",
+    businessDetails: "full",
+    customerSection: "standard",
+    tableLayout: "detailed",
+    footerSection: "standard",
+    lines: [makeInvoiceBuilderLine()],
+    ...overrides
+  };
+}
+
+function buildInvoiceBuilderLineFromInventory(item = {}) {
+  const inclusivePrice = Number(item.inclusivePrice || item.inclusive_price || item.price || 0);
+  const mrp = Number(item.mrp || inclusivePrice || 0);
+  return makeInvoiceBuilderLine({
+    itemId: cleanText(item.id),
+    itemName: getInventoryItemName(item),
+    barcode: getInventoryBarcodeLabel(item),
+    quantity: 1,
+    mrp,
+    inclusivePrice,
+    discountPercent: calculateDiscountPercent(mrp, inclusivePrice),
+    gstRate: Number(item.gstRate || item.gst_rate || 18)
+  });
+}
+
+function calculateInvoiceBuilderSummary(lines = []) {
+  return lines.reduce((summary, line) => {
+    const quantity = Math.max(0, Number(line.quantity || 0));
+    const mrp = Math.max(0, Number(line.mrp || 0));
+    const inclusivePrice = Math.max(0, Number(line.inclusivePrice || 0));
+    const gstRate = Math.max(0, Number(line.gstRate || 0));
+    const breakup = getInventoryGSTBreakup(inclusivePrice, gstRate);
+    const lineTotal = inclusivePrice * quantity;
+    return {
+      quantity: summary.quantity + quantity,
+      subtotal: summary.subtotal + (Number(breakup.taxableValue || 0) * quantity),
+      cgst: summary.cgst + (Number(breakup.cgst || 0) * quantity),
+      sgst: summary.sgst + (Number(breakup.sgst || 0) * quantity),
+      gst: summary.gst + (Number(breakup.gstAmount || 0) * quantity),
+      mrpTotal: summary.mrpTotal + (mrp * quantity),
+      discountTotal: summary.discountTotal + Math.max(0, (mrp - inclusivePrice) * quantity),
+      total: summary.total + lineTotal
+    };
+  }, {
+    quantity: 0,
+    subtotal: 0,
+    cgst: 0,
+    sgst: 0,
+    gst: 0,
+    mrpTotal: 0,
+    discountTotal: 0,
+    total: 0
+  });
+}
+
+function calculateLineDiscountAmount(item = {}) {
+  const quantity = Math.max(0, Number(item.quantity || 0));
+  const mrp = Math.max(0, Number(item.mrp || item.inclusivePrice || 0));
+  const sale = Math.max(0, Number(item.inclusivePrice || item.price || 0));
+  return Math.max(0, (mrp - sale) * quantity);
+}
+
+function calculatePrintPayloadSummary(items = [], summary = {}) {
+  const calculated = (items || []).reduce((next, item) => {
+    const quantity = Math.max(0, Number(item.quantity || 0));
+    const mrp = Math.max(0, Number(item.mrp || item.inclusivePrice || 0));
+    const sale = Math.max(0, Number(item.inclusivePrice || item.price || 0));
+    const taxable = Math.max(0, Number(item.taxableValue || 0));
+    const gstAmount = Math.max(0, Number(item.gstAmount || 0));
+    return {
+      quantity: next.quantity + quantity,
+      mrpTotal: next.mrpTotal + (mrp * quantity),
+      discountTotal: next.discountTotal + Math.max(0, (mrp - sale) * quantity),
+      subtotal: next.subtotal + (taxable * quantity),
+      gst: next.gst + (gstAmount * quantity),
+      total: next.total + (sale * quantity)
+    };
+  }, { quantity: 0, mrpTotal: 0, discountTotal: 0, subtotal: 0, gst: 0, total: 0 });
+  const cgst = Number(summary.cgst ?? calculated.gst / 2);
+  const sgst = Number(summary.sgst ?? calculated.gst / 2);
+  return {
+    quantity: Number(summary.quantity ?? calculated.quantity),
+    mrpTotal: Number(summary.mrpTotal ?? calculated.mrpTotal),
+    discountTotal: Number(summary.discountTotal ?? calculated.discountTotal),
+    subtotal: Number(summary.subtotal ?? calculated.subtotal),
+    cgst,
+    sgst,
+    gst: Number(summary.gst ?? (cgst + sgst || calculated.gst)),
+    total: Number(summary.total ?? calculated.total)
+  };
+}
+
+function getInvoiceStorageKey(invoice = {}) {
+  return cleanText(invoice.id || invoice.invoice_id || invoice.invoiceNumber || invoice.invoice_number);
+}
+
+function makeDownloadFileName(value, fallback = "cinchpos-invoice") {
+  const cleaned = cleanText(value, fallback)
+    .replace(/[^a-z0-9._-]+/gi, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "")
+    .slice(0, 90);
+  return cleaned || fallback;
+}
+
+function buildInvoiceDownloadHTML(payload, detail = {}) {
+  const summary = calculatePrintPayloadSummary(payload.items, payload.summary);
+  const rows = (payload.items || []).map((item) => `
+    <tr>
+      <td>${item.serial}</td>
+      <td class="item-cell"><strong>${escapeHTML(item.itemName)}</strong><span>HSN ${escapeHTML(cleanText(item.hsn || item.hsnSac || item.hsn_sac || item.sac, "Not added"))}</span>${item.barcode ? `<span>Barcode ${escapeHTML(item.barcode)}</span>` : ""}</td>
+      <td class="numeric">${currency(item.mrp)}<span>Disc ${Number(item.discountPercent || 0).toFixed(2)}%</span></td>
+      <td class="numeric">${item.quantity}</td>
+      <td class="numeric">${currency(item.inclusivePrice)}</td>
+      <td class="numeric">${currency(item.taxableValue)}<span>Tax ${Number(item.gstRate || 0)}%</span></td>
+      <td class="numeric"><strong>${currency(item.lineTotal)}</strong></td>
+    </tr>
+  `).join("");
+  const logoMarkup = payload.logo ? `<img class="invoice-logo" src="${payload.logo}" alt="Store logo">` : "";
+  const businessContact = [payload.businessPhone, payload.businessEmail].filter(Boolean).map((value) => escapeHTML(value)).join(" | ");
+  const businessAddress = escapeHTML(payload.businessAddress || "").replace(/\n/g, "<br>");
+  const notes = escapeHTML(detail?.notes || "").replace(/\n/g, "<br>");
+  const paymentTerms = escapeHTML(detail?.paymentTerms || "").replace(/\n/g, "<br>");
+  const terms = escapeHTML(detail?.terms || "").replace(/\n/g, "<br>");
+  const safeInvoiceNumber = escapeHTML(payload.invoiceNumber || "CinchPOS Invoice");
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${safeInvoiceNumber}</title>
+  <style>
+    * { box-sizing: border-box; }
+    @page { size: A4; margin: 12mm; }
+    body { margin: 0; background: #f3f6f4; color: #111; font-family: Arial, sans-serif; font-size: 12px; }
+    .invoice-page { width: 210mm; min-height: 297mm; margin: 0 auto; padding: 14mm; background: #fff; }
+    .invoice-head { display: grid; grid-template-columns: auto 1fr auto; gap: 16px; align-items: start; border-bottom: 2px solid #111; padding-bottom: 14px; }
+    .invoice-logo { width: 72px; height: 72px; object-fit: contain; }
+    h1, h2, h3, p { margin: 0; }
+    h1 { font-size: 22px; }
+    .muted { color: #555; }
+    .invoice-title { text-align: right; }
+    .invoice-title h2 { font-size: 20px; text-transform: uppercase; }
+    .meta-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin: 16px 0; }
+    .box { border: 1px solid #ccc; padding: 10px; border-radius: 6px; }
+    table { width: 100%; border-collapse: collapse; margin-top: 12px; }
+    th, td { padding: 8px 6px; border-bottom: 1px solid #ddd; text-align: left; vertical-align: top; }
+    th { background: #f2f5f3; font-size: 10px; text-transform: uppercase; }
+    th span { display: block; line-height: 1.15; }
+    td span { display: block; color: #555; font-size: 10px; margin-top: 2px; }
+    .numeric { text-align: right; }
+    .item-cell strong { display: block; }
+    .totals { max-width: 280px; margin: 14px 0 0 auto; display: grid; gap: 6px; }
+    .totals div { display: flex; justify-content: space-between; gap: 16px; }
+    .grand { border-top: 2px solid #111; padding-top: 8px; font-size: 15px; font-weight: 700; }
+    .notes { display: grid; gap: 8px; margin-top: 18px; }
+    @media print {
+      body { background: #fff; }
+      .invoice-page { margin: 0; padding: 0; width: auto; min-height: auto; }
+    }
+  </style>
+</head>
+<body>
+  <main class="invoice-page">
+    <header class="invoice-head">
+      ${logoMarkup}
+      <section>
+        <h1>${escapeHTML(payload.businessName)}</h1>
+        ${payload.ownerName ? `<p>${escapeHTML(payload.ownerName)}</p>` : ""}
+        ${businessContact ? `<p>${businessContact}</p>` : ""}
+        ${payload.businessAddress ? `<p>${businessAddress}</p>` : ""}
+        ${payload.gstin ? `<p>GSTIN: ${escapeHTML(payload.gstin)}</p>` : ""}
+      </section>
+      <section class="invoice-title">
+        <h2>Invoice</h2>
+        <p>${safeInvoiceNumber}</p>
+        <p class="muted">${escapeHTML(formatDate(payload.date))}</p>
+      </section>
+    </header>
+    <section class="meta-grid">
+      <div class="box">
+        <h3>Bill To</h3>
+        <p>${escapeHTML(payload.customerName)}</p>
+        ${payload.customerPhone ? `<p>${escapeHTML(payload.customerPhone)}</p>` : ""}
+        ${detail?.customer?.email ? `<p>${escapeHTML(detail.customer.email)}</p>` : ""}
+        ${detail?.customer?.address ? `<p>${escapeHTML(detail.customer.address)}</p>` : ""}
+      </div>
+      <div class="box">
+        <h3>Payment</h3>
+        <p>Method: ${escapeHTML(payload.paymentMethod)}</p>
+        <p>Status: ${escapeHTML(payload.paymentType)}</p>
+        <p>Paid: ${currency(payload.paidAmount)}</p>
+        <p>Unpaid: ${currency(payload.unpaidAmount)}</p>
+      </div>
+    </section>
+    <table>
+      <thead><tr><th>#</th><th><span>Item Name</span><span>HSN</span></th><th><span>MRP</span><span>Disc</span></th><th>Qty</th><th>SP</th><th><span>Rate</span><span>Tax</span></th><th>Amt</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+    <section class="totals">
+      <div><span>Total Qty</span><span>${summary.quantity}</span></div>
+      <div><span>Total Rate</span><span>${currency(summary.subtotal)}</span></div>
+      <div><span>Total GST</span><span>${currency(summary.gst)}</span></div>
+      <div><span>Total Disc</span><span>${currency(summary.discountTotal)}</span></div>
+      <div class="grand"><span>Total Amount</span><span>${currency(summary.total)}</span></div>
+    </section>
+    <section class="notes">
+      ${notes ? `<div class="box"><h3>Notes</h3><p>${notes}</p></div>` : ""}
+      ${paymentTerms ? `<div class="box"><h3>Payment Terms</h3><p>${paymentTerms}</p></div>` : ""}
+      ${terms ? `<div class="box"><h3>Terms & Conditions</h3><p>${terms}</p></div>` : ""}
+    </section>
+  </main>
+</body>
+</html>`;
+}
+
+function PrintPreviewDocument({ payload }) {
+  const profile = getPrintProfile(payload.paperSize, payload.printLayout);
+  const calibration = normalizePrintCalibration(payload.printCalibration);
+  const isStandard = profile.layout === "invoice";
+  const previewPadding = getPrintPadding(profile, calibration, isStandard);
+  const rows = payload.items || [];
+  const summary = calculatePrintPayloadSummary(rows, payload.summary);
+  const thermalMarkup = !isStandard ? buildThermalReceiptMarkup(payload) : "";
+  return (
+    <div className={`print-preview-stage ${profile.layout}`}>
+      <div
+        className="print-preview-paper"
+        style={{
+          "--preview-paper-width": profile.layout === "invoice" ? "210mm" : profile.pageWidth,
+          "--preview-padding": previewPadding,
+          "--preview-scale": calibration.scale / 100
+        }}
+      >
+        <div className={`print-preview-content ${isStandard ? "" : "thermal-preview-content"}`}>
+          {isStandard ? (
+            <>
+              <div className="print-preview-head">
+                {payload.logo ? <img src={payload.logo} alt="Store logo preview" /> : null}
+                <h3>{payload.businessName}</h3>
+                {payload.ownerName ? <p>{payload.ownerName}</p> : null}
+                <p>{[payload.businessPhone, payload.businessEmail].filter(Boolean).join(" | ")}</p>
+                {payload.businessAddress ? <p>{payload.businessAddress}</p> : null}
+                {payload.gstin ? <p>GSTIN: {payload.gstin}</p> : null}
+              </div>
+              <div className="print-preview-meta">
+                <span><strong>Invoice:</strong> {payload.invoiceNumber}</span>
+                <span><strong>Date:</strong> {payload.date}</span>
+                {payload.dueDate ? <span>Due {payload.dueDate}</span> : null}
+                <span><strong>Customer:</strong> {payload.customerName} {payload.customerPhone ? `(${payload.customerPhone})` : ""}</span>
+                {payload.customerEmail ? <span>Email {payload.customerEmail}</span> : null}
+                {payload.customerAddress ? <span>Address {payload.customerAddress}</span> : null}
+                <span><strong>Payment:</strong> {payload.paymentMethod} | {payload.paymentType}</span>
+              </div>
+              <table className="print-preview-table standard grouped">
+                <thead>
+                  <tr>
+                    <th>#</th>
+                    <th><span>Item Name</span><span>HSN</span></th>
+                    <th><span>MRP</span><span>Disc</span></th>
+                    <th>Qty</th>
+                    <th>SP</th>
+                    <th><span>Rate</span><span>Tax</span></th>
+                    <th>Amt</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows.map((item) => (
+                    <tr key={`${item.serial}-${item.itemName}`}>
+                      <td>{item.serial}</td>
+                      <td>
+                        <strong>{item.itemName}</strong>
+                        <span>HSN {cleanText(item.hsn || item.hsnSac || item.hsn_sac || item.sac, "Not added")}</span>
+                        {item.barcode ? <span>Barcode {item.barcode}</span> : null}
+                      </td>
+                      <td>{currency(item.mrp)}<span>Disc {Number(item.discountPercent || 0).toFixed(2)}%</span></td>
+                      <td>{item.quantity}</td>
+                      <td>{currency(item.inclusivePrice)}</td>
+                      <td>{currency(item.taxableValue)}<span>Tax {Number(item.gstRate || 0)}%</span></td>
+                      <td><strong>{currency(item.lineTotal)}</strong></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              <div className="print-preview-totals">
+                <span>Total Qty <strong>{summary.quantity}</strong></span>
+                <span>Total Rate <strong>{currency(summary.subtotal)}</strong></span>
+                <span>Total GST <strong>{currency(summary.gst)}</strong></span>
+                <span>Total Disc <strong>{currency(summary.discountTotal)}</strong></span>
+                <span className="grand">Total Amount <strong>{currency(summary.total)}</strong></span>
+              </div>
+              {(payload.notes || payload.paymentTerms || payload.terms) ? (
+                <div className="print-preview-notes">
+                  {payload.notes ? <p><strong>Notes:</strong> {payload.notes}</p> : null}
+                  {(payload.paymentTerms || payload.terms) ? (
+                    <p><strong>Terms & Conditions:</strong> {[payload.paymentTerms, payload.terms].filter(Boolean).join(" ")}</p>
+                  ) : null}
+                </div>
+              ) : null}
+              {payload.printFooter ? <p className="print-preview-footer">{payload.printFooter}</p> : null}
+            </>
+          ) : (
+            <div dangerouslySetInnerHTML={{ __html: thermalMarkup }} />
+          )}
+        </div>
+      </div>
+    </div>
+  );
 }
 
 export default function CinchPOSApp({ initialView = "dashboard" }) {
@@ -280,6 +1175,10 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
   const [settings, setSettings] = useState(defaultSettings);
   const [workspaceLoaded, setWorkspaceLoaded] = useState(false);
   const [account, setAccount] = useState(defaultAccount);
+  const [authState, setAuthState] = useState(() => makeLocalOwnerAuthState({ reason: "local-default" }));
+  const [authBusy, setAuthBusy] = useState(false);
+  const [authRoles, setAuthRoles] = useState([]);
+  const [clerkClient, setClerkClient] = useState(null);
   const [posState, setPosState] = useState(makeInitialPOSState);
   const [posNavigationOpen, setPosNavigationOpen] = useState(false);
   const [dataTransferResult, setDataTransferResult] = useState(null);
@@ -289,6 +1188,30 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     return flags;
   }, {}));
   const [activeTransferGuide, setActiveTransferGuide] = useState("customers");
+  const [invoiceDetails, setInvoiceDetails] = useState({});
+  const [supportRequests, setSupportRequests] = useState([]);
+  const [supportDraft, setSupportDraft] = useState({
+    type: "Support Request",
+    name: "",
+    email: "",
+    phone: "",
+    subject: "",
+    message: ""
+  });
+  const [desktopUpdateState, setDesktopUpdateState] = useState({
+    currentVersion: "",
+    status: "idle",
+    message: "Update checks are available in the desktop app.",
+    updateInfo: null,
+    progress: null,
+    canInstall: false,
+    packaged: false,
+    source: ""
+  });
+  const [selectedInvoiceId, setSelectedInvoiceId] = useState("");
+  const [invoiceStatusMenu, setInvoiceStatusMenu] = useState(null);
+  const [invoiceBuilderDraft, setInvoiceBuilderDraft] = useState(() => makeInvoiceBuilderDraft());
+  const [invoiceBuilderSearch, setInvoiceBuilderSearch] = useState("");
   const messageTimer = useRef(null);
   const appWorkspaceRef = useRef(null);
   const posModuleContextRef = useRef(null);
@@ -298,6 +1221,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
   const dashboardRetryTimer = useRef(null);
   const settingsRestoreInputRef = useRef(null);
   const startupViewApplied = useRef(false);
+  const authInitStarted = useRef(false);
 
   const showMessage = useCallback((text) => {
     setMessage(text);
@@ -306,6 +1230,77 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     }
     messageTimer.current = window.setTimeout(() => setMessage(""), 3200);
   }, []);
+
+  useEffect(() => {
+    if (!invoiceStatusMenu) {
+      return undefined;
+    }
+    const closeMenu = () => setInvoiceStatusMenu(null);
+    const handleKeyDown = (event) => {
+      if (event.key === "Escape") {
+        closeMenu();
+      }
+    };
+    window.addEventListener("click", closeMenu);
+    window.addEventListener("scroll", closeMenu, true);
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.removeEventListener("click", closeMenu);
+      window.removeEventListener("scroll", closeMenu, true);
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [invoiceStatusMenu]);
+
+  useEffect(() => {
+    const updates = getDesktopUpdateBridge();
+    if (!updates) {
+      return undefined;
+    }
+
+    let mounted = true;
+    updates.getState()
+      .then((state) => {
+        if (mounted && state) {
+          setDesktopUpdateState(state);
+        }
+      })
+      .catch(() => {});
+
+    const unsubscribe = updates.onStatus((state) => {
+      if (mounted && state) {
+        setDesktopUpdateState(state);
+      }
+    });
+
+    return () => {
+      mounted = false;
+      if (typeof unsubscribe === "function") {
+        unsubscribe();
+      }
+    };
+  }, []);
+
+  const runDesktopUpdateAction = useCallback(async (action) => {
+    const updates = getDesktopUpdateBridge();
+    if (!updates || typeof updates[action] !== "function") {
+      showMessage("Desktop updates are available only in the packaged CinchPOS app.");
+      return;
+    }
+
+    try {
+      const nextState = await updates[action]();
+      if (nextState && nextState.status) {
+        setDesktopUpdateState(nextState);
+      }
+      if (nextState?.message) {
+        showMessage(nextState.message);
+      }
+    } catch (error) {
+      const detail = error?.message || String(error);
+      showMessage(`Update action failed. ${detail}`);
+      setDesktopUpdateState((current) => ({ ...current, status: "error", message: detail }));
+    }
+  }, [showMessage]);
 
   useEffect(() => () => {
     if (messageTimer.current) {
@@ -318,9 +1313,54 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
 
   const businessName = settings.businessName || defaultSettings.businessName;
   const ownerName = settings.ownerName || defaultSettings.ownerName;
+  const managedBusinesses = useMemo(() => {
+    const savedBusinesses = Array.isArray(settings.businesses) ? settings.businesses.filter(Boolean) : [];
+    const primaryBusiness = {
+      id: "primary",
+      name: businessName,
+      ownerName,
+      phone: settings.businessPhone || "",
+      email: settings.businessEmail || "",
+      address: settings.businessAddress || "",
+      gstin: settings.gstin || "",
+      logo: settings.storeLogo || settings.storeLogoUrl || "",
+      status: "Active"
+    };
+    const normalized = savedBusinesses.length ? savedBusinesses : [primaryBusiness];
+    return normalized.map((business, index) => ({
+      ...primaryBusiness,
+      ...business,
+      id: cleanText(business.id, index === 0 ? "primary" : `business-${index + 1}`),
+      name: cleanText(business.name, index === 0 ? businessName : `Business ${index + 1}`)
+    }));
+  }, [businessName, ownerName, settings]);
+  const activeBusinessId = settings.activeBusinessId || managedBusinesses[0]?.id || "primary";
+  const activeBusiness = managedBusinesses.find((business) => business.id === activeBusinessId) || managedBusinesses[0] || null;
+  const managedWarehouses = useMemo(() => {
+    const savedWarehouses = Array.isArray(settings.warehouses) ? settings.warehouses.filter(Boolean) : [];
+    const fallbackWarehouse = {
+      id: "main",
+      name: "Main Warehouse",
+      businessId: activeBusinessId,
+      location: settings.businessAddress || "",
+      status: "Active"
+    };
+    const normalized = savedWarehouses.length ? savedWarehouses : [fallbackWarehouse];
+    return normalized.map((warehouse, index) => ({
+      ...fallbackWarehouse,
+      ...warehouse,
+      id: cleanText(warehouse.id, index === 0 ? "main" : `warehouse-${index + 1}`),
+      name: cleanText(warehouse.name, index === 0 ? "Main Warehouse" : `Warehouse ${index + 1}`),
+      businessId: cleanText(warehouse.businessId || warehouse.business_id, activeBusinessId)
+    }));
+  }, [activeBusinessId, settings.businessAddress, settings.warehouses]);
+  const activeWarehouseId = settings.activeWarehouseId || managedWarehouses[0]?.id || "main";
+  const activeWarehouse = managedWarehouses.find((warehouse) => warehouse.id === activeWarehouseId) || managedWarehouses[0] || null;
   const fallbackInitials = businessName.split(/\s+/).map((word) => word.charAt(0)).join("").slice(0, 2).toUpperCase() || "CP";
   const currentTitle = appViews.find((view) => view.id === activeView)?.title || "Dashboard";
   const storeLogoSource = settings.storeLogo || settings.storeLogoUrl || "";
+  const can = useCallback((permission) => !authState.required || hasPermission(authState, permission), [authState]);
+  const canAccessView = useCallback((viewId) => !authState.required || hasPermission(authState, viewPermissionMap[viewId]), [authState]);
   const currentSummary = summary || {
     monthly_revenue: 0,
     outstanding_payments: 0,
@@ -329,8 +1369,16 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     net_balance: 0,
     net_balance_direction: "positive"
   };
+  const inventoryStockValue = useMemo(() => inventoryItems.reduce((total, item) => {
+    const stock = Math.max(0, Number(item.stock || 0));
+    const sellingPrice = Math.max(0, Number(item.inclusivePrice || item.inclusive_price || item.price || item.sellingPrice || 0));
+    return total + (stock * sellingPrice);
+  }, 0), [inventoryItems]);
+  const dashboardExpensesValue = Number(currentSummary.expenses_total || 0);
+  const dashboardNetBalance = inventoryStockValue - dashboardExpensesValue;
+  const dashboardNetBalanceDirection = dashboardNetBalance < 0 ? "negative" : "positive";
   const isWorkspaceEmpty = !customers.length && !allInvoices.length && Number(currentSummary.invoice_count || 0) === 0;
-  const outstandingInvoices = realInvoices.filter((invoice) => Number(invoice.outstanding || 0) > 0);
+  const outstandingInvoices = realInvoices.filter((invoice) => invoiceOutstandingAmount(invoice) > 0);
   const trendPeak = Math.max(...(trend.length ? trend : [{ value: 0 }]).map((point) => Number(point.value || 0)), 0);
   const trendCaption = {
     daily: "Collections in the last 7 days",
@@ -338,7 +1386,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     monthly: "Collections in the last 6 months",
     custom: trendStartDate && trendEndDate ? `Collections from ${trendStartDate} to ${trendEndDate}` : "Collections in the selected custom range"
   }[trendView] || "Collections by week over the last 8 weeks";
-  const navigationViews = appViews.filter((view) => !view.settingsOnly);
+  const navigationViews = appViews.filter((view) => !view.settingsOnly && canAccessView(view.id));
   const defaultDueDaysNumber = Math.max(0, Number(settings.defaultDueDays || defaultSettings.defaultDueDays || 0) || 0);
   const defaultDueDate = useMemo(() => {
     const [year, month, day] = todayISO().split("-").map(Number);
@@ -357,7 +1405,10 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     expenses: expenseRecords.length,
     employees: employees.length,
     documents: storeDocuments.length,
-    sellOnline: Object.values(sellOnlineCatalog || {}).filter(Boolean).length
+    sellOnline: Object.values(sellOnlineCatalog || {}).filter(Boolean).length,
+    businesses: managedBusinesses.length,
+    warehouses: managedWarehouses.length,
+    supportRequests: supportRequests.length
   }), [
     allInvoices.length,
     customers.length,
@@ -367,8 +1418,11 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     outstandingInvoices.length,
     purchaseBills.length,
     purchaseRecords.length,
+    managedBusinesses.length,
+    managedWarehouses.length,
     sellOnlineCatalog,
-    storeDocuments.length
+    storeDocuments.length,
+    supportRequests.length
   ]);
   const smartInventoryReview = useMemo(() => buildSmartInventoryReview(inventoryItems), [inventoryItems]);
   const sellOnlineProducts = useMemo(() => {
@@ -406,6 +1460,30 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       };
     }).filter(Boolean)
   ), [inventoryItems, sellOnlineCatalog]);
+  const invoiceBuilderMatches = useMemo(() => (
+    findInventoryMatches(inventoryItems, invoiceBuilderSearch).slice(0, 8)
+  ), [inventoryItems, invoiceBuilderSearch]);
+  const invoiceBuilderSummary = useMemo(() => (
+    calculateInvoiceBuilderSummary(invoiceBuilderDraft.lines || [])
+  ), [invoiceBuilderDraft.lines]);
+  const selectedInvoice = useMemo(() => (
+    selectedInvoiceId
+      ? allInvoices.find((invoice) => (
+          getInvoiceStorageKey(invoice) === selectedInvoiceId
+          || cleanText(invoice.invoice_number || invoice.invoiceNumber) === selectedInvoiceId
+        )) || null
+      : null
+  ), [allInvoices, selectedInvoiceId]);
+  const selectedInvoiceDetail = useMemo(() => (
+    selectedInvoice ? getInvoiceDetail(selectedInvoice) : null
+  ), [invoiceDetails, selectedInvoice]);
+  const isOwner = cleanText(authState.role).toLowerCase() === "owner" || authState.userId === "local-owner" || hasPermission(authState, "*");
+  const invoiceStatusMenuInvoice = useMemo(() => {
+    if (!invoiceStatusMenu?.invoiceId) {
+      return null;
+    }
+    return allInvoices.find((invoice) => getInvoiceStorageKey(invoice) === invoiceStatusMenu.invoiceId) || null;
+  }, [allInvoices, invoiceStatusMenu]);
   const appPlatform = useMemo(() => {
     if (typeof navigator === "undefined") {
       return "Unknown platform";
@@ -427,6 +1505,158 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     return candidate;
   }
 
+  function getInvoiceDetail(invoice) {
+    const key = getInvoiceStorageKey(invoice);
+    const invoiceNumberKey = cleanText(invoice?.invoice_number || invoice?.invoiceNumber);
+    return (key && invoiceDetails[key]) || (invoiceNumberKey && invoiceDetails[invoiceNumberKey]) || null;
+  }
+
+  function saveInvoiceDetail(invoice, detail) {
+    const key = getInvoiceStorageKey(invoice);
+    const numberKey = cleanText(invoice?.invoice_number || invoice?.invoiceNumber || detail?.invoiceNumber);
+    if (!key && !numberKey) {
+      return;
+    }
+    setInvoiceDetails((current) => ({
+      ...current,
+      ...(key ? { [key]: detail } : {}),
+      ...(numberKey ? { [numberKey]: detail } : {})
+    }));
+  }
+
+  function makePrintPayloadFromInvoice(invoice, detail = null) {
+    const invoiceDetail = detail || getInvoiceDetail(invoice);
+    const lines = Array.isArray(invoiceDetail?.items) ? invoiceDetail.items : [];
+    const summaryRows = invoiceDetail?.summary || calculateInvoiceBuilderSummary(lines.map((line) => ({
+      quantity: line.quantity,
+      mrp: line.mrp,
+      inclusivePrice: line.inclusivePrice || line.price || 0,
+      gstRate: line.gstRate || 0
+    })));
+    const customer = invoiceDetail?.customer || findCustomerForInvoice(invoice) || {};
+    const normalizedItems = lines.length ? lines.map((item, index) => {
+      const quantity = Math.max(1, Number(item.quantity || 1));
+      const inclusivePrice = Number(item.inclusivePrice || item.price || 0);
+      const gstRate = Number(item.gstRate || 0);
+      const breakup = getInventoryGSTBreakup(inclusivePrice, gstRate);
+      return {
+        serial: index + 1,
+        itemName: cleanText(item.itemName || item.name, `Item ${index + 1}`),
+        barcode: cleanText(item.barcode),
+        description: cleanText(item.description || item.itemDescription || item.desc || item.shortDescription),
+        batch: cleanText(item.batch || item.batchNo || item.batchNumber || item.batch_no || item.lot || item.lotNumber),
+        unit: cleanText(item.unit || item.uom || item.unitName, "Pcs"),
+        quantity,
+        mrp: Number(item.mrp || inclusivePrice || 0),
+        inclusivePrice,
+        discountPercent: Number(item.discountPercent || calculateDiscountPercent(item.mrp, inclusivePrice) || 0),
+        taxableValue: Number(item.taxableValue || breakup.taxableValue || 0),
+        gstRate,
+        gstAmount: Number(item.gstAmount || breakup.gstAmount || 0),
+        hsn: cleanText(item.hsn || item.hsnSac || item.hsn_sac || item.sac),
+        lineTotal: inclusivePrice * quantity
+      };
+    }) : [{
+      serial: 1,
+      itemName: "Invoice Amount",
+      barcode: "",
+      description: "",
+      batch: "",
+      unit: "Pcs",
+      quantity: 1,
+      mrp: Number(invoice?.amount || 0),
+      inclusivePrice: Number(invoice?.amount || 0),
+      discountPercent: 0,
+      taxableValue: Number(invoice?.amount || 0),
+      gstRate: 0,
+      gstAmount: 0,
+      lineTotal: Number(invoice?.amount || 0)
+    }];
+    const printableSummary = calculatePrintPayloadSummary(normalizedItems, {
+      ...summaryRows,
+      total: Number(invoice?.amount || invoiceDetail?.amount || summaryRows.total || 0)
+    });
+    return {
+      businessName,
+      ownerName,
+      businessPhone: settings.businessPhone || "",
+      businessEmail: settings.businessEmail || "",
+      businessAddress: settings.businessAddress || "",
+      gstin: settings.gstin || "",
+      receiptSettings: buildReceiptSettings(settings),
+      cashierName: settings.printCashierName || defaultSettings.printCashierName,
+      counterName: settings.printCounterName || defaultSettings.printCounterName,
+      orderType: settings.printOrderType || defaultSettings.printOrderType,
+      logo: settings.printShopLogoOnBill ? (settings.storeLogo || settings.storeLogoUrl || "") : "",
+      paperSize: settings.printPaperSize || defaultSettings.printPaperSize,
+      printLayout: settings.printLayout || defaultSettings.printLayout,
+      printMargin: settings.printMargin || defaultSettings.printMargin,
+      printFooter: settings.printFooter || "",
+      printCalibration: getCalibrationForSettings(settings),
+      invoiceNumber: invoice?.invoice_number || invoice?.invoiceNumber || invoiceDetail?.invoiceNumber || "",
+      date: invoice?.issued_on || invoice?.issuedOn || invoiceDetail?.issuedOn || todayISO(),
+      dueDate: invoice?.due_on || invoice?.dueOn || invoiceDetail?.dueOn || "",
+      customerName: cleanText(invoice?.customer_name || invoice?.customerName || customer.name, DEFAULT_WALK_IN_CUSTOMER_NAME),
+      customerPhone: cleanText(invoice?.customer_phone || invoice?.customerPhone || customer.phone),
+      customerEmail: cleanText(customer.email),
+      customerAddress: cleanText(customer.address),
+      paymentMethod: invoiceDetail?.paymentMethod || "Cash",
+      paymentType: invoiceOutstandingAmount(invoice) > 0 ? "Partial / Pending" : "Full Payment",
+      paidAmount: invoicePaidAmount(invoice),
+      unpaidAmount: invoiceOutstandingAmount(invoice),
+      notes: invoiceDetail?.notes || invoice?.notes || "",
+      paymentTerms: invoiceDetail?.paymentTerms || "",
+      terms: invoiceDetail?.terms || "",
+      summary: printableSummary,
+      items: normalizedItems
+    };
+  }
+
+  function openInvoiceViewer(invoice) {
+    const key = getInvoiceStorageKey(invoice);
+    setSelectedInvoiceId(key || cleanText(invoice?.invoice_number || invoice?.invoiceNumber));
+    setActiveModal("invoiceViewer");
+  }
+
+  function openInvoiceBuilder(overrides = {}) {
+    const nextDraft = makeInvoiceBuilderDraft({
+      invoiceNumber: buildClientInvoiceNumber(todayISO()),
+      dueOn: defaultDueDate,
+      notes: settings.invoiceNotes || "",
+      ...overrides
+    });
+    setInvoiceBuilderDraft(nextDraft);
+    setInvoiceBuilderSearch("");
+    setActiveModal("invoice");
+  }
+
+  function duplicateInvoiceToBuilder(invoice) {
+    const detail = getInvoiceDetail(invoice);
+    const customer = detail?.customer || findCustomerForInvoice(invoice) || {};
+    openInvoiceBuilder({
+      customerId: cleanText(customer.id || invoice.customer_id),
+      customerName: cleanText(customer.name || invoice.customer_name),
+      customerPhone: cleanText(customer.phone || getInvoicePhone(invoice)),
+      customerEmail: cleanText(customer.email),
+      customerAddress: cleanText(customer.address),
+      notes: cleanText(detail?.notes || invoice.notes || settings.invoiceNotes),
+      paymentStatus: "pending",
+      paymentAmount: "",
+      lines: detail?.items?.length
+        ? detail.items.map((line) => makeInvoiceBuilderLine({
+            itemId: line.itemId || "",
+            itemName: line.itemName || line.name || "",
+            barcode: line.barcode || "",
+            quantity: line.quantity || 1,
+            mrp: line.mrp || line.inclusivePrice || line.price || 0,
+            inclusivePrice: line.inclusivePrice || line.price || 0,
+            discountPercent: line.discountPercent || 0,
+            gstRate: line.gstRate || 0
+          }))
+        : [makeInvoiceBuilderLine({ itemName: `Duplicate of ${invoice.invoice_number || "invoice"}`, inclusivePrice: invoice.amount || 0, mrp: invoice.amount || 0, gstRate: 0 })]
+    });
+  }
+
   function findCustomerForInvoice(invoice) {
     const invoiceCustomerId = cleanText(invoice?.customer_id || invoice?.customerId);
     const invoiceCustomerName = cleanText(invoice?.customer_name || invoice?.customerName).toLowerCase();
@@ -438,6 +1668,121 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
 
   function getInvoicePhone(invoice) {
     return cleanText(invoice?.customer_phone || invoice?.customerPhone || findCustomerForInvoice(invoice)?.phone, "Not added");
+  }
+
+  function getInvoicePaymentStatus(invoice) {
+    const outstandingAmount = invoiceOutstandingAmount(invoice);
+    const amount = Number(invoice?.amount || 0);
+    if (amount > 0 && outstandingAmount <= 0) {
+      return "Paid";
+    }
+    const rawStatus = cleanText(invoice?.status);
+    const dueDate = cleanText(invoice?.due_on || invoice?.dueOn);
+    if (rawStatus.toLowerCase() === "overdue" || (dueDate && dueDate < todayISO())) {
+      return "Overdue";
+    }
+    return "Unpaid";
+  }
+
+  function openInvoicePaymentAction(invoice) {
+    if (invoiceOutstandingAmount(invoice) <= 0) {
+      showMessage("This invoice is already marked as paid.");
+      return;
+    }
+    openModal("payment", invoice?.id || invoice?.invoice_id || "");
+  }
+
+  function openInvoiceStatusMenu(event, invoice) {
+    event.preventDefault();
+    event.stopPropagation();
+    const invoiceId = getInvoiceStorageKey(invoice);
+    if (!invoiceId) {
+      showMessage("This invoice has no saved invoice id.");
+      return;
+    }
+    setInvoiceStatusMenu({
+      invoiceId,
+      x: Math.min(event.clientX, Math.max(8, window.innerWidth - 190)),
+      y: Math.min(event.clientY, Math.max(8, window.innerHeight - 146))
+    });
+  }
+
+  async function markInvoiceAsPaid(invoice) {
+    if (!invoice) {
+      setInvoiceStatusMenu(null);
+      return;
+    }
+    const outstandingAmount = invoiceOutstandingAmount(invoice);
+    if (outstandingAmount <= 0) {
+      setInvoiceStatusMenu(null);
+      showMessage("This invoice is already marked as paid.");
+      return;
+    }
+    const invoiceId = invoice.id || invoice.invoice_id;
+    if (!invoiceId) {
+      setInvoiceStatusMenu(null);
+      showMessage("This invoice cannot be updated because it has no saved invoice id.");
+      return;
+    }
+
+    try {
+      await recordPayment({
+        invoice_id: invoiceId,
+        amount: outstandingAmount,
+        paid_on: todayISO(),
+        method: "Cash",
+        notes: "Marked as paid from invoice status menu."
+      });
+      setInvoiceStatusMenu(null);
+      await loadDashboard();
+      showMessage("Invoice marked as paid.");
+    } catch (error) {
+      setInvoiceStatusMenu(null);
+      showMessage(error.message || "Could not mark this invoice as paid.");
+    }
+  }
+
+  async function deleteInvoiceRecord(invoice) {
+    if (!isOwner) {
+      showMessage("Only the owner can delete invoices.");
+      return;
+    }
+    const invoiceId = invoice?.id || invoice?.invoice_id;
+    if (!invoiceId) {
+      showMessage("This invoice cannot be deleted because it has no saved invoice id.");
+      return;
+    }
+    const invoiceNumber = cleanText(invoice.invoice_number || invoice.invoiceNumber, "this invoice");
+    if (!window.confirm(`Delete ${invoiceNumber}? This will also remove its payment records.`)) {
+      return;
+    }
+
+    try {
+      await deleteInvoice(invoiceId);
+      setInvoiceDetails((current) => {
+        const next = { ...current };
+        const storageKey = getInvoiceStorageKey(invoice);
+        const numberKey = cleanText(invoice.invoice_number || invoice.invoiceNumber);
+        if (storageKey) {
+          delete next[storageKey];
+        }
+        if (numberKey) {
+          delete next[numberKey];
+        }
+        return next;
+      });
+      if (selectedInvoiceId === getInvoiceStorageKey(invoice) || selectedInvoiceId === cleanText(invoice.invoice_number || invoice.invoiceNumber)) {
+        setSelectedInvoiceId("");
+      }
+      if (activeModal === "invoiceViewer") {
+        closeModal();
+      }
+      setInvoiceStatusMenu(null);
+      await loadDashboard();
+      showMessage("Invoice deleted.");
+    } catch (error) {
+      showMessage(error.message || "Could not delete this invoice.");
+    }
   }
 
   function getCustomerInvoiceStats(customer) {
@@ -471,6 +1816,8 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     setStoreDocuments(readStoredJSON(storageKeys.documents, []));
     setEmployees(readStoredJSON(storageKeys.employees, []));
     setSellOnlineCatalog(readStoredJSON(storageKeys.sellOnline, {}));
+    setInvoiceDetails(readStoredJSON(storageKeys.invoiceDetails, {}));
+    setSupportRequests(readStoredJSON(storageKeys.supportRequests, []));
     setPosState(readStoredJSON(storageKeys.pos, makeInitialPOSState()));
     setTrendView(readStoredValue(storageKeys.trendView, "weekly"));
     setTrendStartDate(readStoredValue(storageKeys.trendStart, ""));
@@ -557,6 +1904,18 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     if (!workspaceLoaded) {
       return;
     }
+    writeStoredJSON(storageKeys.invoiceDetails, invoiceDetails);
+  }, [invoiceDetails, workspaceLoaded]);
+  useEffect(() => {
+    if (!workspaceLoaded) {
+      return;
+    }
+    writeStoredJSON(storageKeys.supportRequests, supportRequests);
+  }, [supportRequests, workspaceLoaded]);
+  useEffect(() => {
+    if (!workspaceLoaded) {
+      return;
+    }
     writeStoredJSON(storageKeys.pos, posState);
   }, [posState, workspaceLoaded]);
   useEffect(() => {
@@ -588,6 +1947,133 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     }
   }, [activeModal, settings]);
 
+  useEffect(() => {
+    setAuthContextProvider(() => ({
+      businessId: activeBusinessId,
+      warehouseId: activeWarehouseId
+    }));
+    setAuthTokenProvider(async () => getClerkSessionToken(clerkClient));
+  }, [activeBusinessId, activeWarehouseId, clerkClient]);
+
+  const syncAuthContext = useCallback(async (client = clerkClient, options = {}) => {
+    setAuthBusy(true);
+    try {
+      const payload = await getAuthContext();
+      let nextAuthState = normalizeBackendAuthContext(payload);
+
+      if (client?.user) {
+        const primaryEmail = client.user.primaryEmailAddress?.emailAddress || "";
+        nextAuthState = {
+          ...nextAuthState,
+          authenticated: true,
+          userId: nextAuthState.userId || client.user.id || "",
+          name: nextAuthState.name || client.user.fullName || client.user.firstName || primaryEmail || "Operator",
+          email: nextAuthState.email || primaryEmail,
+          emailVerified: nextAuthState.emailVerified || Boolean(client.user.primaryEmailAddress?.verification?.status === "verified"),
+          sessionId: nextAuthState.sessionId || client.session?.id || ""
+        };
+      }
+
+      if (!nextAuthState.authenticated && !payload?.auth_required) {
+        nextAuthState = makeLocalOwnerAuthState({ reason: "auth-not-required" });
+      }
+
+      setAuthState(nextAuthState);
+      setAccount(accountFromAuthState(nextAuthState));
+
+      if (client?.session && nextAuthState.authenticated) {
+        try {
+          const grant = await createOfflineSession({ deviceInfo: navigator.userAgent || "CinchPOS Desktop" });
+          await writeOfflineAuthSession(nextAuthState, grant);
+        } catch {
+          await writeOfflineAuthSession(nextAuthState, { status: "local-cache-only" });
+        }
+      }
+
+      return nextAuthState;
+    } catch (error) {
+      const offlineSession = await readOfflineAuthSession();
+      if (offlineSession?.authState) {
+        const cachedAuthState = {
+          ...offlineSession.authState,
+          authenticated: true,
+          offline: true
+        };
+        setAuthState(cachedAuthState);
+        setAccount(accountFromAuthState(cachedAuthState));
+        if (!options.silent) {
+          showMessage("Using encrypted offline auth cache. New logins need internet.");
+        }
+        return cachedAuthState;
+      }
+
+      const fallbackState = makeLocalOwnerAuthState({ reason: "auth-context-unavailable" });
+      setAuthState(fallbackState);
+      setAccount(accountFromAuthState(fallbackState));
+      if (!options.silent) {
+        showMessage(error instanceof Error ? error.message : "Could not refresh auth context.");
+      }
+      return fallbackState;
+    } finally {
+      setAuthBusy(false);
+    }
+  }, [clerkClient, showMessage]);
+
+  useEffect(() => {
+    if (!workspaceLoaded || authInitStarted.current) {
+      return undefined;
+    }
+    authInitStarted.current = true;
+    let cancelled = false;
+    let removeListener = null;
+
+    async function initializeAuth() {
+      setAuthBusy(true);
+      const cachedSession = await readOfflineAuthSession();
+      if (cachedSession?.authState && !cancelled) {
+        const cachedAuthState = { ...cachedSession.authState, authenticated: true, offline: true };
+        setAuthState(cachedAuthState);
+        setAccount(accountFromAuthState(cachedAuthState));
+      }
+
+      const client = await loadClerkClient();
+      if (cancelled) {
+        return;
+      }
+      if (client) {
+        setClerkClient(client);
+        setAuthTokenProvider(async () => getClerkSessionToken(client));
+        if (typeof client.addListener === "function") {
+          removeListener = client.addListener(() => {
+            syncAuthContext(client, { silent: true });
+          });
+        }
+        await syncAuthContext(client, { silent: true });
+      } else if (!cachedSession?.authState) {
+        await syncAuthContext(null, { silent: true });
+      }
+      setAuthBusy(false);
+    }
+
+    initializeAuth().catch(() => setAuthBusy(false));
+
+    return () => {
+      cancelled = true;
+      if (typeof removeListener === "function") {
+        removeListener();
+      }
+    };
+  }, [syncAuthContext, workspaceLoaded]);
+
+  useEffect(() => {
+    if (!workspaceLoaded || !can("employees:read")) {
+      return;
+    }
+    getAuthRoles()
+      .then((rows) => setAuthRoles(Array.isArray(rows) ? rows : []))
+      .catch(() => setAuthRoles([]));
+  }, [can, workspaceLoaded]);
+
   const loadDashboard = useCallback(async () => {
     const [dashboard, invoices, customerRows, trendRows] = await Promise.all([
       getDashboard(),
@@ -616,6 +2102,14 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         await loadDashboard();
       } catch (error) {
         if (cancelled) {
+          return;
+        }
+        if (isApiNetworkError(error)) {
+          const retryDelay = Math.min(5000, 650 + attempt * 500);
+          dashboardRetryTimer.current = window.setTimeout(() => {
+            dashboardRetryTimer.current = null;
+            attemptLoad(attempt + 1);
+          }, retryDelay);
           return;
         }
         if (attempt < 6) {
@@ -654,6 +2148,10 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
 
   function openModal(name, invoiceId = "") {
     setPrefillInvoiceId(invoiceId || "");
+    if (name === "invoice") {
+      openInvoiceBuilder();
+      return;
+    }
     if (name === "settings") {
       setSettingsDraft(settings);
       setSettingsPanelSection("account");
@@ -664,6 +2162,53 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
   function closeModal() {
     setActiveModal("");
     setPrefillInvoiceId("");
+    setSelectedInvoiceId("");
+  }
+
+  async function openClerkFlow(flow = "signIn") {
+    setAuthBusy(true);
+    try {
+      const client = clerkClient || await loadClerkClient();
+      if (!client) {
+        showMessage("Add NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY to enable online login.");
+        return;
+      }
+      setClerkClient(client);
+      if (flow === "signUp" && typeof client.openSignUp === "function") {
+        client.openSignUp({});
+        return;
+      }
+      if (flow === "profile" && typeof client.openUserProfile === "function") {
+        client.openUserProfile({});
+        return;
+      }
+      if (typeof client.openSignIn === "function") {
+        client.openSignIn({});
+      }
+    } finally {
+      setAuthBusy(false);
+    }
+  }
+
+  async function signOutOfAuth() {
+    setAuthBusy(true);
+    try {
+      if (clerkClient?.signOut) {
+        await clerkClient.signOut();
+      }
+      await clearOfflineAuthSession();
+      const signedOutState = makeSignedOutAuthState({
+        configured: Boolean(clerkClient),
+        required: authState.required
+      });
+      setAuthState(signedOutState);
+      setAccount(defaultAccount);
+      showMessage("Signed out of this device.");
+    } catch (error) {
+      showMessage(error instanceof Error ? error.message : "Could not sign out.");
+    } finally {
+      setAuthBusy(false);
+    }
   }
 
   async function refreshTrend(nextView = trendView) {
@@ -927,22 +2472,34 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
   function printPOSBill(payload) {
     const printProfile = getPrintProfile(payload.paperSize, payload.printLayout);
     const printPageWidth = printProfile.pageWidth;
-    const printPageSize = printProfile.pageSize || printPageWidth;
+    const isInvoicePrint = printProfile.layout === "invoice";
+    const thermalPageHeight = `${getThermalReceiptHeightMm(payload.items?.length || 0, {
+      hasLogo: Boolean(payload.logo),
+      hasFooter: Boolean(payload.printFooter),
+      hasNotes: Boolean(payload.notes || payload.paymentTerms || payload.terms)
+    })}mm`;
+    const printPageSize = printProfile.pageSize || `${printPageWidth} ${thermalPageHeight}`;
     const printMargin = payload.printMargin === "none" ? "0" : printProfile.margin;
-    const printClass = printProfile.layout === "invoice" ? "invoice-print" : "thermal-print";
-    const rows = payload.items.map((item) => `
+    const printClass = isInvoicePrint ? "invoice-print" : "thermal-print";
+    const calibration = normalizePrintCalibration(payload.printCalibration);
+    const printPadding = getPrintPadding(printProfile, calibration, isInvoicePrint);
+    const printScale = calibration.scale / 100;
+    const printableSummary = calculatePrintPayloadSummary(payload.items, payload.summary);
+    const printRows = payload.items.map((item) => `
       <tr>
         <td>${item.serial}</td>
-        <td>${escapeHTML(item.itemName)}<span>${escapeHTML(item.barcode || "")}</span></td>
+        <td><strong>${escapeHTML(item.itemName)}</strong><span>HSN ${escapeHTML(cleanText(item.hsn || item.hsnSac || item.hsn_sac || item.sac, "Not added"))}</span>${item.barcode ? `<span>Barcode ${escapeHTML(item.barcode)}</span>` : ""}</td>
+        <td>${currency(item.mrp)}<span>Disc ${Number(item.discountPercent || 0).toFixed(2)}%</span></td>
         <td>${item.quantity}</td>
-        <td>${currency(item.mrp)}</td>
         <td>${currency(item.inclusivePrice)}</td>
-        <td class="print-hide-thermal">${item.discountPercent.toFixed(2)}%</td>
-        <td class="print-hide-thermal">${currency(item.taxableValue)}</td>
-        <td>${currency(item.gstAmount * item.quantity)}<span>${item.gstRate}%</span></td>
-        <td>${currency(item.lineTotal)}</td>
+        <td>${currency(item.taxableValue)}<span>Tax ${Number(item.gstRate || 0)}%</span></td>
+        <td><strong>${currency(item.lineTotal)}</strong></td>
       </tr>
     `).join("");
+    const itemsMarkup = isInvoicePrint ? `<table>
+      <thead><tr><th>#</th><th><span>Item Name</span><span>HSN</span></th><th><span>MRP</span><span>Disc</span></th><th>Qty</th><th>SP</th><th><span>Rate</span><span>Tax</span></th><th>Amt</th></tr></thead>
+      <tbody>${printRows}</tbody>
+    </table>` : buildThermalReceiptMarkup(payload);
     const logoMarkup = payload.logo ? `<img class="print-logo" src="${payload.logo}" alt="Store logo">` : "";
     const safeInvoiceNumber = escapeHTML(payload.invoiceNumber || "CinchPOS Bill");
     const safeBusinessName = escapeHTML(payload.businessName);
@@ -950,14 +2507,128 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     const safeBusinessPhone = escapeHTML(payload.businessPhone || "");
     const safeBusinessEmail = escapeHTML(payload.businessEmail || "");
     const safeBusinessAddress = escapeHTML(payload.businessAddress || "").replace(/\n/g, "<br>");
+    const safeCustomerEmail = escapeHTML(payload.customerEmail || "");
+    const safeCustomerAddress = escapeHTML(payload.customerAddress || "").replace(/\n/g, "<br>");
     const safeGstin = escapeHTML(payload.gstin || "");
     const safeFooter = escapeHTML(payload.printFooter || "").replace(/\n/g, "<br>");
     const safeDate = escapeHTML(payload.date);
+    const safeDueDate = escapeHTML(payload.dueDate || "");
     const safeCustomerName = escapeHTML(payload.customerName);
     const safeCustomerPhone = escapeHTML(payload.customerPhone || "");
     const safePaymentMethod = escapeHTML(payload.paymentMethod);
     const safePaymentType = escapeHTML(payload.paymentType);
+    const safeNotes = escapeHTML(payload.notes || "").replace(/\n/g, "<br>");
+    const safePaymentTerms = escapeHTML(payload.paymentTerms || "").replace(/\n/g, "<br>");
+    const safeTerms = escapeHTML(payload.terms || "").replace(/\n/g, "<br>");
     const businessContact = [payload.businessPhone ? safeBusinessPhone : "", payload.businessEmail ? safeBusinessEmail : ""].filter(Boolean).join(" | ");
+    const standardDetails = isInvoicePrint ? [
+      payload.dueDate ? `<p>Due: ${safeDueDate}</p>` : "",
+      payload.customerEmail ? `<p>Email: ${safeCustomerEmail}</p>` : "",
+      payload.customerAddress ? `<p>Address: ${safeCustomerAddress}</p>` : ""
+    ].filter(Boolean).join("") : "";
+    const safeTermsCombined = [safePaymentTerms, safeTerms].filter(Boolean).join("<br>");
+    const noteMarkup = (payload.notes || payload.paymentTerms || payload.terms) ? `
+      <div class="print-notes">
+        ${payload.notes ? `<p><strong>Notes:</strong> ${safeNotes}</p>` : ""}
+        ${safeTermsCombined ? `<p><strong>Terms & Conditions:</strong><br>${safeTermsCombined}</p>` : ""}
+      </div>
+    ` : "";
+    const invoiceBodyMarkup = `
+      <div class="print-head">${logoMarkup}<h1>${safeBusinessName}</h1>${payload.ownerName ? `<p>${safeOwnerName}</p>` : ""}${businessContact ? `<p>${businessContact}</p>` : ""}${payload.businessAddress ? `<p>${safeBusinessAddress}</p>` : ""}${payload.gstin ? `<p>GSTIN: ${safeGstin}</p>` : ""}</div>
+      <div class="print-meta">
+        <p>Bill: ${safeInvoiceNumber}</p>
+        <p>Date: ${safeDate}</p>
+        <p>Customer: ${safeCustomerName} ${payload.customerPhone ? `(${safeCustomerPhone})` : ""}</p>
+        ${standardDetails}
+        <p>Payment: ${safePaymentMethod} | ${safePaymentType}</p>
+      </div>
+      ${itemsMarkup}
+      <div class="totals">
+        <div><span>Total Qty</span><span>${printableSummary.quantity}</span></div>
+        <div><span>Total Rate</span><span>${currency(printableSummary.subtotal)}</span></div>
+        <div><span>Total GST</span><span>${currency(printableSummary.gst)}</span></div>
+        <div><span>Total Disc</span><span>${currency(printableSummary.discountTotal)}</span></div>
+        <div class="grand"><span>Total Amount</span><span>${currency(printableSummary.total)}</span></div>
+      </div>
+      ${noteMarkup}
+      ${payload.printFooter ? `<div class="print-footer">${safeFooter}</div>` : ""}
+    `;
+    const printBodyMarkup = isInvoicePrint ? invoiceBodyMarkup : itemsMarkup;
+
+    const markup = `
+      <!DOCTYPE html>
+      <html lang="en">
+      <head>
+        <meta charset="UTF-8">
+        <title>${safeInvoiceNumber}</title>
+        <style>
+          * { box-sizing: border-box; }
+          @page { size: ${printPageSize}; margin: ${printMargin}; }
+          html, body { width: ${printPageWidth}; min-height: 0; }
+          body { margin: 0 auto; padding: ${printPadding}; color: #111; font-family: Arial, sans-serif; font-size: ${isInvoicePrint ? "12px" : "9.2px"}; line-height: 1.22; }
+          .print-content { transform: scale(${printScale}); transform-origin: top left; width: ${printScale ? `${100 / printScale}%` : "100%"}; }
+          .print-head { display: grid; justify-items: center; gap: ${isInvoicePrint ? "4px" : "1px"}; margin-bottom: ${isInvoicePrint ? "10px" : "5px"}; text-align: center; }
+          .print-logo { width: ${isInvoicePrint ? "72px" : "28px"}; height: ${isInvoicePrint ? "72px" : "28px"}; object-fit: contain; }
+          h1 { margin: 0; font-size: ${isInvoicePrint ? "20px" : "12px"}; font-weight: 700; }
+          p { margin: 0; }
+          .print-meta { display: grid; gap: ${isInvoicePrint ? "3px" : "1px"}; margin: ${isInvoicePrint ? "8px 0" : "5px 0"}; padding: ${isInvoicePrint ? "8px 0" : "4px 0"}; border-top: 1px dashed #777; border-bottom: 1px dashed #777; }
+          table { width: 100%; border-collapse: collapse; }
+          th, td { padding: ${isInvoicePrint ? "6px 5px" : "3px 2px"}; border-bottom: 1px solid #ddd; text-align: left; vertical-align: top; }
+          th { font-size: ${isInvoicePrint ? "10px" : "8px"}; font-weight: 700; }
+          th span,
+          th small { display: block; line-height: 1.12; }
+          td strong { display: block; font-weight: 700; }
+          td span { display: block; color: #555; font-size: ${isInvoicePrint ? "10px" : "8px"}; }
+          .invoice-print table th:nth-child(1),
+          .invoice-print table td:nth-child(1) { width: 5%; }
+          .invoice-print table th:nth-child(2),
+          .invoice-print table td:nth-child(2) { width: 32%; }
+          .invoice-print table th:nth-child(3),
+          .invoice-print table td:nth-child(3) { width: 12%; text-align: right; }
+          .invoice-print table th:nth-child(4),
+          .invoice-print table td:nth-child(4) { width: 8%; text-align: center; }
+          .invoice-print table th:nth-child(5),
+          .invoice-print table td:nth-child(5),
+          .invoice-print table th:nth-child(6),
+          .invoice-print table td:nth-child(6),
+          .invoice-print table th:nth-child(7),
+          .invoice-print table td:nth-child(7) { width: 14%; text-align: right; }
+          .invoice-print .totals { max-width: 280px; margin-left: auto; }
+          .totals { display: grid; gap: ${isInvoicePrint ? "4px" : "2px"}; margin-top: ${isInvoicePrint ? "10px" : "5px"}; padding-top: ${isInvoicePrint ? "8px" : "5px"}; border-top: 1px dashed #777; }
+          .totals div { display: flex; justify-content: space-between; gap: 10px; }
+          .grand { margin-top: ${isInvoicePrint ? "2px" : "3px"}; padding-top: ${isInvoicePrint ? "0" : "3px"}; border-top: ${isInvoicePrint ? "0" : "1px dashed #999"}; font-size: ${isInvoicePrint ? "15px" : "11.5px"}; font-weight: 700; }
+          .print-notes { display: grid; gap: 4px; margin-top: 10px; padding-top: 8px; border-top: 1px dashed #777; color: #333; }
+          .print-footer { margin-top: ${isInvoicePrint ? "16px" : "14px"}; padding-top: ${isInvoicePrint ? "10px" : "9px"}; border-top: 1px dashed #777; text-align: center; color: #444; font-size: ${isInvoicePrint ? "10px" : "8.8px"}; }
+          ${isInvoicePrint ? "" : THERMAL_RECEIPT_CSS}
+          @media print { html, body { width: ${printPageWidth}; height: auto; } }
+        </style>
+      </head>
+      <body class="${printClass}">
+        <div class="print-content">
+        ${printBodyMarkup}
+        </div>
+      </body>
+      </html>
+    `;
+
+    const desktopPrinter = typeof window !== "undefined" ? window.cinchposDesktop?.printHTML : null;
+    if (typeof desktopPrinter === "function") {
+      desktopPrinter({
+        html: markup,
+        title: payload.invoiceNumber || "CinchPOS Bill",
+        pageSize: getElectronPrintPageSize(printProfile, payload)
+      })
+        .then((result) => {
+          if (result?.cancelled) {
+            showMessage("Print cancelled.");
+          }
+        })
+        .catch((error) => {
+          showMessage(error?.message || "The system print dialog could not open.");
+        });
+      return;
+    }
+
     const frame = document.createElement("iframe");
     frame.className = "print-frame";
     frame.setAttribute("aria-hidden", "true");
@@ -969,61 +2640,6 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     frame.style.border = "0";
     frame.style.visibility = "hidden";
     document.body.appendChild(frame);
-
-    const markup = `
-      <!DOCTYPE html>
-      <html lang="en">
-      <head>
-        <meta charset="UTF-8">
-        <title>${safeInvoiceNumber}</title>
-        <style>
-          * { box-sizing: border-box; }
-          @page { size: ${printPageSize}; margin: ${printMargin}; }
-          html, body { width: ${printPageWidth}; }
-          body { margin: 0 auto; padding: ${printProfile.layout === "invoice" ? "10mm" : "2mm"}; color: #111; font-family: Arial, sans-serif; font-size: ${printProfile.layout === "invoice" ? "12px" : "10px"}; }
-          .print-head { display: grid; justify-items: center; gap: 4px; margin-bottom: 10px; text-align: center; }
-          .print-logo { width: ${printProfile.layout === "invoice" ? "72px" : "52px"}; height: ${printProfile.layout === "invoice" ? "72px" : "52px"}; object-fit: contain; }
-          h1 { margin: 0; font-size: ${printProfile.layout === "invoice" ? "20px" : "15px"}; font-weight: 700; }
-          p { margin: 0; }
-          .print-meta { display: grid; gap: 3px; margin: 8px 0; padding: 8px 0; border-top: 1px dashed #777; border-bottom: 1px dashed #777; }
-          table { width: 100%; border-collapse: collapse; }
-          th, td { padding: ${printProfile.layout === "invoice" ? "6px 5px" : "3px 2px"}; border-bottom: 1px solid #ddd; text-align: left; vertical-align: top; }
-          th { font-size: ${printProfile.layout === "invoice" ? "10px" : "8px"}; font-weight: 700; }
-          td span { display: block; color: #555; font-size: ${printProfile.layout === "invoice" ? "10px" : "8px"}; }
-          .thermal-print .print-hide-thermal { display: none; }
-          .invoice-print .totals { max-width: 280px; margin-left: auto; }
-          .totals { display: grid; gap: 4px; margin-top: 10px; padding-top: 8px; border-top: 1px dashed #777; }
-          .totals div { display: flex; justify-content: space-between; gap: 10px; }
-          .grand { font-size: ${printProfile.layout === "invoice" ? "15px" : "13px"}; font-weight: 700; }
-          .print-footer { margin-top: 10px; padding-top: 8px; border-top: 1px dashed #777; text-align: center; color: #444; font-size: 10px; }
-          @media print { body { width: ${printPageWidth}; } }
-        </style>
-      </head>
-      <body class="${printClass}">
-        <div class="print-head">${logoMarkup}<h1>${safeBusinessName}</h1>${payload.ownerName ? `<p>${safeOwnerName}</p>` : ""}${businessContact ? `<p>${businessContact}</p>` : ""}${payload.businessAddress ? `<p>${safeBusinessAddress}</p>` : ""}${payload.gstin ? `<p>GSTIN: ${safeGstin}</p>` : ""}</div>
-        <div class="print-meta">
-          <p>Bill: ${safeInvoiceNumber}</p>
-          <p>Date: ${safeDate}</p>
-          <p>Customer: ${safeCustomerName} ${payload.customerPhone ? `(${safeCustomerPhone})` : ""}</p>
-          <p>Payment: ${safePaymentMethod} | ${safePaymentType}</p>
-        </div>
-        <table>
-          <thead><tr><th>No.</th><th>Item</th><th>Qty</th><th>MRP</th><th>SP</th><th class="print-hide-thermal">Disc</th><th class="print-hide-thermal">Rate</th><th>GST</th><th>Total</th></tr></thead>
-          <tbody>${rows}</tbody>
-        </table>
-        <div class="totals">
-          <div><span>Items</span><span>${payload.summary.quantity}</span></div>
-          <div><span>Taxable</span><span>${currency(payload.summary.subtotal)}</span></div>
-          <div><span>CGST</span><span>${currency(payload.summary.cgst)}</span></div>
-          <div><span>SGST</span><span>${currency(payload.summary.sgst)}</span></div>
-          <div><span>Paid</span><span>${currency(payload.paidAmount)}</span></div>
-          <div><span>Unpaid</span><span>${currency(payload.unpaidAmount)}</span></div>
-          <div class="grand"><span>Grand Total</span><span>${currency(payload.summary.total)}</span></div>
-        </div>
-        ${payload.printFooter ? `<div class="print-footer">${safeFooter}</div>` : ""}
-      </body>
-      </html>
-    `;
 
     const frameWindow = frame.contentWindow;
     const frameDocument = frame.contentDocument || frameWindow?.document;
@@ -1092,6 +2708,31 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     window.setTimeout(waitForAssetsAndPrint, 40);
   }
 
+  function downloadInvoice(invoice) {
+    if (!invoice || typeof document === "undefined") {
+      showMessage("Select an invoice before downloading.");
+      return;
+    }
+    const detail = getInvoiceDetail(invoice);
+    const payload = {
+      ...makePrintPayloadFromInvoice(invoice, detail),
+      paperSize: "A4",
+      printLayout: "invoice",
+      printCalibration: getCalibrationForSettings({ ...settings, printPaperSize: "A4", printLayout: "invoice" })
+    };
+    const markup = buildInvoiceDownloadHTML(payload, detail || {});
+    const blob = new Blob([markup], { type: "text/html;charset=utf-8" });
+    const url = window.URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `${makeDownloadFileName(payload.invoiceNumber, "cinchpos-invoice")}.html`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => window.URL.revokeObjectURL(url), 800);
+    showMessage("Invoice downloaded.");
+  }
+
   async function submitPOSBilling(formId, { printAfter = false, closePOSModal = false } = {}) {
     const bill = getActiveBill(formId);
     const items = bill.items || [];
@@ -1138,27 +2779,42 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         businessPhone: settings.businessPhone || "",
         businessEmail: settings.businessEmail || "",
         businessAddress: settings.businessAddress || "",
-        gstin: settings.gstin || "",
-        logo: settings.printShopLogoOnBill ? (settings.storeLogo || settings.storeLogoUrl || "") : "",
+      gstin: settings.gstin || "",
+      receiptSettings: buildReceiptSettings(settings),
+      cashierName: settings.printCashierName || defaultSettings.printCashierName,
+      counterName: settings.printCounterName || defaultSettings.printCounterName,
+      orderType: settings.printOrderType || defaultSettings.printOrderType,
+      logo: settings.printShopLogoOnBill ? (settings.storeLogo || settings.storeLogoUrl || "") : "",
         paperSize: settings.printPaperSize || defaultSettings.printPaperSize,
         printLayout: settings.printLayout || defaultSettings.printLayout,
         printMargin: settings.printMargin || defaultSettings.printMargin,
         printFooter: settings.printFooter || "",
+        printCalibration: getCalibrationForSettings(settings),
         invoiceNumber: invoice.invoice_number || "",
         date: issuedOn,
+        dueDate: defaultDueDate,
         customerName: cleanText(savedCustomer?.name || customer.name, DEFAULT_WALK_IN_CUSTOMER_NAME),
         customerPhone: savedCustomer?.phone
           ? formatIndianPhone(savedCustomer.phone)
           : (usedWalkInCustomer ? formatIndianPhone(DEFAULT_WALK_IN_CUSTOMER_PHONE) : ""),
+        customerEmail: cleanText(savedCustomer?.email || customer.email),
+        customerAddress: cleanText(savedCustomer?.address || customer.address),
         paymentMethod: customer.paymentMethod || "Cash",
         paymentType: paymentType === "partial" ? "Partial Payment" : "Full Payment",
         paidAmount,
         unpaidAmount,
+        notes: settings.invoiceNotes || "",
+        paymentTerms: "",
+        terms: "",
         summary: { ...summaryRows },
         items: items.map((item, index) => ({
           serial: index + 1,
           itemName: item.itemName,
           barcode: item.barcode,
+          hsn: cleanText(item.hsn || item.hsnSac || item.hsn_sac || item.sac),
+          description: cleanText(item.description || item.itemDescription || item.desc || item.shortDescription),
+          batch: cleanText(item.batch || item.batchNo || item.batchNumber || item.batch_no || item.lot || item.lotNumber),
+          unit: cleanText(item.unit || item.uom || item.unitName, "Pcs"),
           quantity: Number(item.quantity || 1),
           mrp: Number(item.mrp || 0),
           inclusivePrice: Number(item.inclusivePrice || 0),
@@ -1178,6 +2834,41 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
           notes: paymentType === "partial" ? `Partial payment from CinchPOS billing. Unpaid: ${currency(unpaidAmount)}.` : "Paid from CinchPOS billing."
         });
       }
+      saveInvoiceDetail(invoice, {
+        source: "pos",
+        invoiceNumber: invoice.invoice_number || "",
+        issuedOn,
+        dueOn: defaultDueDate,
+        customer: {
+          id: savedCustomer.id,
+          name: cleanText(savedCustomer.name, DEFAULT_WALK_IN_CUSTOMER_NAME),
+          phone: savedCustomer.phone || "",
+          email: savedCustomer.email || "",
+          address: savedCustomer.address || ""
+        },
+        paymentMethod: customer.paymentMethod || "Cash",
+        paymentType,
+        paidAmount,
+        unpaidAmount,
+        notes: settings.invoiceNotes || "",
+        summary: { ...summaryRows },
+        items: printPayload.items.map((item) => ({
+          itemName: item.itemName,
+          barcode: item.barcode,
+          hsn: item.hsn,
+          description: item.description,
+          batch: item.batch,
+          unit: item.unit,
+          quantity: item.quantity,
+          mrp: item.mrp,
+          inclusivePrice: item.inclusivePrice,
+          discountPercent: item.discountPercent,
+          taxableValue: item.taxableValue,
+          gstRate: item.gstRate,
+          gstAmount: item.gstAmount,
+          lineTotal: item.lineTotal
+        }))
+      });
       resetActivePOSBill(formId);
       await loadDashboard();
       if (closePOSModal) {
@@ -1203,6 +2894,47 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     } catch (error) {
       showMessage(error.message);
     }
+  }
+
+  function updateSupportDraft(field, value) {
+    setSupportDraft((current) => ({ ...current, [field]: value }));
+  }
+
+  function submitSupportRequest(event) {
+    event.preventDefault();
+    const name = cleanText(supportDraft.name);
+    const email = cleanText(supportDraft.email);
+    const phone = cleanText(supportDraft.phone);
+    const subject = cleanText(supportDraft.subject);
+    const requestMessage = cleanText(supportDraft.message);
+    if (!name || (!email && !phone) || !subject || !requestMessage) {
+      showMessage("Add name, email or phone, subject, and message before submitting support.");
+      return;
+    }
+    if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      showMessage("Enter a valid email address for support follow-up.");
+      return;
+    }
+    setSupportRequests((current) => [{
+      id: String(Date.now()),
+      type: cleanText(supportDraft.type, "Support Request"),
+      name,
+      email,
+      phone,
+      subject,
+      message: requestMessage,
+      status: "Submitted",
+      createdAt: new Date().toISOString()
+    }, ...current]);
+    setSupportDraft({
+      type: "Support Request",
+      name: "",
+      email: "",
+      phone: "",
+      subject: "",
+      message: ""
+    });
+    showMessage("Support request saved. The configured support contact is shown below.");
   }
 
   function toggleSellOnlineProduct(productId) {
@@ -1268,12 +3000,218 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
           notes: paymentType === "partial" ? "Partial payment recorded with invoice." : "Full payment recorded with invoice."
         });
       }
+      const selectedCustomer = customers.find((customer) => String(customer.id || "") === String(data.customer_id || ""));
+      saveInvoiceDetail(invoice, {
+        source: "quick-invoice",
+        invoiceNumber,
+        issuedOn,
+        dueOn,
+        customer: selectedCustomer || {},
+        paymentMethod: cleanText(data.payment_method, "Cash"),
+        paymentType,
+        paidAmount: paymentAmount,
+        unpaidAmount: Math.max(0, invoiceAmount - paymentAmount),
+        notes: invoiceNotes,
+        summary: {
+          quantity: 1,
+          subtotal: invoiceAmount,
+          cgst: 0,
+          sgst: 0,
+          gst: 0,
+          total: invoiceAmount
+        },
+        items: [{
+          itemName: "Invoice Amount",
+          barcode: "",
+          quantity: 1,
+          mrp: invoiceAmount,
+          inclusivePrice: invoiceAmount,
+          discountPercent: 0,
+          taxableValue: invoiceAmount,
+          gstRate: 0,
+          gstAmount: 0,
+          lineTotal: invoiceAmount
+        }]
+      });
       form.reset();
       await loadDashboard();
       closeModal();
       showMessage(paymentAmount > 0 ? "Invoice created and payment recorded." : "Invoice created.");
     } catch (error) {
       showMessage(error.message);
+    }
+  }
+
+  function updateInvoiceBuilderField(field, value) {
+    setInvoiceBuilderDraft((current) => ({ ...current, [field]: value }));
+  }
+
+  function updateInvoiceBuilderLine(lineId, field, value) {
+    setInvoiceBuilderDraft((current) => ({
+      ...current,
+      lines: (current.lines || []).map((line) => {
+        if (line.id !== lineId) {
+          return line;
+        }
+        const nextLine = { ...line, [field]: value };
+        const mrp = Number(nextLine.mrp || 0);
+        const inclusivePrice = Number(nextLine.inclusivePrice || 0);
+        return {
+          ...nextLine,
+          discountPercent: calculateDiscountPercent(mrp, inclusivePrice)
+        };
+      })
+    }));
+  }
+
+  function addInvoiceBuilderLine(line = makeInvoiceBuilderLine()) {
+    setInvoiceBuilderDraft((current) => ({
+      ...current,
+      lines: [...(current.lines || []), line]
+    }));
+    setInvoiceBuilderSearch("");
+  }
+
+  function removeInvoiceBuilderLine(lineId) {
+    setInvoiceBuilderDraft((current) => {
+      const nextLines = (current.lines || []).filter((line) => line.id !== lineId);
+      return { ...current, lines: nextLines.length ? nextLines : [makeInvoiceBuilderLine()] };
+    });
+  }
+
+  async function resolveInvoiceBuilderCustomer() {
+    const phone = normalizePhone(invoiceBuilderDraft.customerPhone).slice(-10);
+    const name = cleanText(invoiceBuilderDraft.customerName);
+    const email = cleanText(invoiceBuilderDraft.customerEmail);
+    const address = cleanText(invoiceBuilderDraft.customerAddress);
+    const selectedCustomer = invoiceBuilderDraft.customerId
+      ? customers.find((customer) => String(customer.id || "") === String(invoiceBuilderDraft.customerId))
+      : null;
+    if (selectedCustomer) {
+      return selectedCustomer;
+    }
+    const matchedCustomer = phone.length === 10 ? findCustomerByPhone(phone) : null;
+    if (matchedCustomer) {
+      const updatePayload = buildTransferCustomerUpdatePayload(matchedCustomer, {
+        name: name || matchedCustomer.name,
+        phone: `+91${phone}`,
+        email: email || matchedCustomer.email,
+        address: address || matchedCustomer.address
+      });
+      if (updatePayload) {
+        const updatedCustomer = await updateCustomer(matchedCustomer.id, updatePayload);
+        replaceCustomerInState(updatedCustomer);
+        return updatedCustomer;
+      }
+      return matchedCustomer;
+    }
+    if (!name && !phone && !email && !address) {
+      return ensureDefaultWalkInCustomer();
+    }
+    const newCustomer = await createCustomer({
+      name: name || DEFAULT_WALK_IN_CUSTOMER_NAME,
+      phone: phone.length === 10 ? `+91${phone}` : "",
+      email,
+      address
+    });
+    replaceCustomerInState(newCustomer);
+    return newCustomer;
+  }
+
+  async function submitStandardInvoice(event) {
+    event.preventDefault();
+    const lines = (invoiceBuilderDraft.lines || []).filter((line) => cleanText(line.itemName) && Number(line.quantity || 0) > 0 && Number(line.inclusivePrice || 0) > 0);
+    if (!lines.length) {
+      showMessage("Add at least one invoice item with name, quantity, and price.");
+      return;
+    }
+    const issuedOn = cleanText(invoiceBuilderDraft.issuedOn, todayISO());
+    const dueOn = cleanText(invoiceBuilderDraft.dueOn, defaultDueDate);
+    const summaryRows = calculateInvoiceBuilderSummary(lines);
+    const paymentStatus = cleanText(invoiceBuilderDraft.paymentStatus, "pending");
+    const requestedPaidAmount = paymentStatus === "full"
+      ? summaryRows.total
+      : (paymentStatus === "partial" ? Math.min(summaryRows.total, Math.max(0, Number(invoiceBuilderDraft.paymentAmount || 0))) : 0);
+    const invoiceNumber = cleanText(invoiceBuilderDraft.invoiceNumber) || buildClientInvoiceNumber(issuedOn);
+
+    try {
+      const savedCustomer = await resolveInvoiceBuilderCustomer();
+      const savedInvoice = await createInvoice({
+        customer_id: savedCustomer.id,
+        invoice_number: invoiceNumber,
+        amount: summaryRows.total,
+        issued_on: issuedOn,
+        due_on: dueOn,
+        notes: [
+          cleanText(invoiceBuilderDraft.notes),
+          cleanText(invoiceBuilderDraft.paymentTerms),
+          cleanText(invoiceBuilderDraft.terms)
+        ].filter(Boolean).join(" | ")
+      });
+      if (requestedPaidAmount > 0) {
+        await recordPayment({
+          invoice_id: savedInvoice.id,
+          amount: requestedPaidAmount,
+          paid_on: issuedOn,
+          method: cleanText(invoiceBuilderDraft.paymentMethod, "Cash"),
+          notes: paymentStatus === "partial" ? "Partial payment recorded from standard invoice." : "Full payment recorded from standard invoice."
+        });
+      }
+      const storedLines = lines.map((line) => {
+        const inclusivePrice = Number(line.inclusivePrice || 0);
+        const gstRate = Number(line.gstRate || 0);
+        const breakup = getInventoryGSTBreakup(inclusivePrice, gstRate);
+        return {
+          itemId: line.itemId || "",
+          itemName: cleanText(line.itemName),
+          barcode: cleanText(line.barcode),
+          quantity: Number(line.quantity || 0),
+          mrp: Number(line.mrp || inclusivePrice || 0),
+          inclusivePrice,
+          discountPercent: Number(line.discountPercent || calculateDiscountPercent(line.mrp, inclusivePrice)),
+          taxableValue: Number(breakup.taxableValue.toFixed(2)),
+          gstRate,
+          gstAmount: Number(breakup.gstAmount.toFixed(2)),
+          lineTotal: inclusivePrice * Number(line.quantity || 0)
+        };
+      });
+      saveInvoiceDetail(savedInvoice, {
+        source: "standard-invoice",
+        template: invoiceBuilderDraft.template,
+        layout: invoiceBuilderDraft.layout,
+        invoiceNumber,
+        issuedOn,
+        dueOn,
+        customer: {
+          id: savedCustomer.id,
+          name: savedCustomer.name,
+          phone: savedCustomer.phone,
+          email: savedCustomer.email,
+          address: savedCustomer.address
+        },
+        paymentMethod: cleanText(invoiceBuilderDraft.paymentMethod, "Cash"),
+        paymentType: paymentStatus,
+        paidAmount: requestedPaidAmount,
+        unpaidAmount: Math.max(0, summaryRows.total - requestedPaidAmount),
+        paymentTerms: invoiceBuilderDraft.paymentTerms,
+        notes: invoiceBuilderDraft.notes,
+        terms: invoiceBuilderDraft.terms,
+        layoutOptions: {
+          headerPlacement: invoiceBuilderDraft.headerPlacement,
+          logoPlacement: invoiceBuilderDraft.logoPlacement,
+          businessDetails: invoiceBuilderDraft.businessDetails,
+          customerSection: invoiceBuilderDraft.customerSection,
+          tableLayout: invoiceBuilderDraft.tableLayout,
+          footerSection: invoiceBuilderDraft.footerSection
+        },
+        summary: summaryRows,
+        items: storedLines
+      });
+      await loadDashboard();
+      closeModal();
+      showMessage(requestedPaidAmount > 0 ? "Standard invoice created and payment recorded." : "Standard invoice created.");
+    } catch (error) {
+      showMessage(error.message || "Could not create the standard invoice.");
     }
   }
 
@@ -1461,12 +3399,30 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         readFileAsDataURL(aadharFile),
         readFileAsDataURL(panFile)
       ]);
+      const employeeEmail = cleanText(data.email).toLowerCase();
+      const roleKey = cleanText(data.role_key, "cashier").toLowerCase().replace(/\s+/g, "_");
+      let inviteResult = null;
+      if (employeeEmail && can("employees:write")) {
+        inviteResult = await inviteEmployeeAccount({
+          email: employeeEmail,
+          name: cleanText(data.name),
+          role: roleKey,
+          permissions: permissionsForRole(roleKey)
+        }).catch((error) => ({ status: "failed", error: error.message }));
+      }
       setEmployees((current) => [{
         id: String(Date.now()),
         name: cleanText(data.name),
         role: cleanText(data.role, "Counter Staff"),
+        roleKey,
+        email: employeeEmail,
         phone: cleanText(data.phone),
         address: cleanText(data.address),
+        salary: Number(data.salary || 0),
+        permissions: cleanText(data.permissions, "Billing"),
+        permissionSet: permissionsForRole(roleKey),
+        authStatus: inviteResult?.status || (employeeEmail ? "Pending invite" : "Local record"),
+        invitationId: inviteResult?.id || "",
         aadharFileName: aadharFile ? aadharFile.name : "",
         aadharFileData,
         panFileName: panFile ? panFile.name : "",
@@ -1475,7 +3431,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         createdAt: new Date().toISOString()
       }, ...current]);
       form.reset();
-      showMessage("Employee saved.");
+      showMessage(employeeEmail ? "Employee saved and auth invitation prepared." : "Employee saved.");
     } catch (error) {
       showMessage(error.message || "Could not save employee documents.");
     }
@@ -2172,6 +4128,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     updatePOSQuantity,
     updatePOSPrice,
     removePOSItem,
+    showMessage,
     inventoryItems
   };
 
@@ -2189,7 +4146,9 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     visibleInventory,
     hasMoreInventory,
     smartInventoryReview,
-    showMessage
+    showMessage,
+    managedWarehouses,
+    activeWarehouseId
   };
 
   const POSModule = useMemo(() => function POSModule({ formId, modal = false }) {
@@ -2211,6 +4170,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       updatePOSQuantity,
       updatePOSPrice,
       removePOSItem,
+      showMessage,
       inventoryItems
     } = posModuleContextRef.current;
     const [keyboardMode, setKeyboardMode] = useState("letters");
@@ -2276,6 +4236,21 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       if (keyboardShift && !keyboardCaps) {
         setKeyboardShift(false);
       }
+    }
+
+    function editLinePrice(item) {
+      const currentPrice = Number(item.inclusivePrice || 0);
+      const value = window.prompt(`Enter selling price for ${item.itemName}`, currentPrice.toFixed(2));
+      if (value === null) {
+        return;
+      }
+      const nextPrice = Number(value);
+      if (!Number.isFinite(nextPrice) || nextPrice < 0) {
+        showMessage("Enter a valid selling price.");
+        return;
+      }
+      updatePOSPrice(formId, item.id, "inclusivePrice", nextPrice.toFixed(2));
+      showMessage("Item price updated.");
     }
 
     const form = (
@@ -2427,40 +4402,55 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                   <table className="bill-preview-table">
                     <thead>
                       <tr>
-                        <th>S.No.</th>
-                        <th>Item</th>
+                        <th>#</th>
+                        <th><span>Item Name</span><span>HSN</span></th>
+                        <th><span>MRP</span><span>Disc</span></th>
                         <th>Qty</th>
-                        <th>MRP</th>
-                        <th>Sale</th>
-                        <th>Disc</th>
-                        <th>Taxable</th>
-                        <th>GST</th>
-                        <th>Total</th>
+                        <th>SP</th>
+                        <th><span>Rate</span><span>Tax</span></th>
+                        <th>Amt</th>
                         <th className="line-action-col" aria-label="Actions"></th>
                       </tr>
                     </thead>
                     <tbody>
                       {items.length ? items.map((item, index) => {
                         const quantity = Number(item.quantity || 1);
-                        const gstTotal = Number(item.gstAmount || 0) * quantity;
                         const lineTotal = Number(item.inclusivePrice || 0) * quantity;
+                        const hsnLabel = cleanText(item.hsn || item.hsnSac || item.hsn_sac || item.sac, "Not added");
                         return (
                           <tr key={item.id}>
                             <td>{index + 1}</td>
-                            <td><strong>{item.itemName}</strong><span>{item.barcode || "No barcode"}</span></td>
-                            <td><input className="line-edit-input qty-input" type="number" min="1" step="1" value={quantity} onChange={(event) => updatePOSQuantity(formId, item.id, event.target.value)} aria-label={`Quantity for ${item.itemName}`} /></td>
-                            <td><input className="line-edit-input price-input" type="number" min="0" step="0.01" value={Number(item.mrp || 0)} onChange={(event) => updatePOSPrice(formId, item.id, "mrp", event.target.value)} aria-label={`MRP for ${item.itemName}`} /></td>
-                            <td><input className="line-edit-input price-input" type="number" min="0" step="0.01" value={Number(item.inclusivePrice || 0)} onChange={(event) => updatePOSPrice(formId, item.id, "inclusivePrice", event.target.value)} aria-label={`Selling price for ${item.itemName}`} /></td>
-                            <td>{Number(item.discountPercent || 0).toFixed(2)}%</td>
-                            <td>{currency(item.taxableValue)}</td>
-                            <td>{currency(gstTotal)}<span>{Number(item.gstRate || 0)}%</span></td>
-                            <td><strong>{currency(lineTotal)}</strong></td>
+                            <td className="bill-item-cell">
+                              <strong>{item.itemName}</strong>
+                              <span>HSN {hsnLabel}</span>
+                              {item.barcode ? <span>Barcode {item.barcode}</span> : null}
+                            </td>
+                            <td className="bill-mrp-cell">
+                              <input className="line-edit-input price-input" type="number" min="0" step="0.01" value={Number(item.mrp || 0)} onChange={(event) => updatePOSPrice(formId, item.id, "mrp", event.target.value)} aria-label={`MRP for ${item.itemName}`} />
+                              <span>Disc {Number(item.discountPercent || 0).toFixed(2)}%</span>
+                            </td>
+                            <td className="bill-qty-cell">
+                              <input className="line-edit-input qty-input" type="number" min="1" step="1" value={quantity} onChange={(event) => updatePOSQuantity(formId, item.id, event.target.value)} aria-label={`Quantity for ${item.itemName}`} />
+                            </td>
+                            <td className="bill-sp-cell">
+                              <strong className="bill-sp-value">{currency(item.inclusivePrice)}</strong>
+                              <button type="button" className="line-price-edit" onClick={() => editLinePrice(item)} aria-label={`Edit price for ${item.itemName}`}>Edit price</button>
+                            </td>
+                            <td className="bill-rate-cell">
+                              <input className="line-edit-input price-input" type="number" min="0" step="0.01" value={Number(item.taxableValue || 0)} onChange={(event) => {
+                                const taxableRate = Math.max(0, Number(event.target.value || 0));
+                                const inclusiveRate = taxableRate * (1 + (Number(item.gstRate || 0) / 100));
+                                updatePOSPrice(formId, item.id, "inclusivePrice", inclusiveRate.toFixed(2));
+                              }} aria-label={`Rate without GST for ${item.itemName}`} />
+                              <span>Tax {Number(item.gstRate || 0)}%</span>
+                            </td>
+                            <td className="bill-amount-cell"><strong>{currency(lineTotal)}</strong></td>
                             <td><button type="button" className="line-remove" onClick={() => removePOSItem(formId, item.id)} aria-label={`Remove ${item.itemName}`}>&times;</button></td>
                           </tr>
                         );
                       }) : (
                         <tr>
-                          <td colSpan="10" className="bill-empty">
+                          <td colSpan="8" className="bill-empty">
                             <div className="bill-empty-state">
                               <img className="bill-empty-logo" src="/brand/cinchpos-logo.png" alt="" aria-hidden="true" />
                               <span>Scan a barcode or search an inventory item to start billing.</span>
@@ -2471,10 +4461,11 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                     </tbody>
                   </table>
                   <div className="bill-summary-row">
-                    <span>Items {posSummary.quantity}</span>
-                    <span>Taxable {currency(posSummary.subtotal)}</span>
-                    <span>GST {currency(posSummary.gst)}</span>
-                    <strong>Grand Total {currency(posSummary.total)}</strong>
+                    <span>Total Qty {posSummary.quantity}</span>
+                    <span>Total Rate {currency(posSummary.subtotal)}</span>
+                    <span>Total GST {currency(posSummary.gst)}</span>
+                    <span>Total Disc {currency(posSummary.discountTotal)}</span>
+                    <strong>Total Amount {currency(posSummary.total)}</strong>
                   </div>
                 </div>
               </section>
@@ -2533,19 +4524,19 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                   <h2>Counter-ready billing tools</h2>
                 </div>
                 <div className="action-group">
-                  <button className="button button-primary pos-launch" type="button" onClick={() => openModal("pos")}>CinchPOS</button>
-                  <button className="button button-secondary" type="button" onClick={() => openModal("invoice")}>Create Invoice</button>
+                  <button className="button button-primary pos-launch" type="button" onClick={() => setActiveView("cinchPOSView")}>CinchPOS</button>
+                  <button className="button button-secondary" type="button" onClick={() => openModal("invoice")}>Create Standard Invoice</button>
                   <button className="button button-secondary" type="button" onClick={() => openModal("customer")}>Add Customer</button>
                 </div>
               </section>
               <section id="summaryGrid" className="summary-grid" aria-label="Billing summary">
                 {[
-                  ["revenue", "Revenue (Current Month)", currency(currentSummary.monthly_revenue), "Collections captured from the start of the current month."],
-                  ["outstanding", "Outstanding Payments", currency(currentSummary.outstanding_payments), "Unpaid balances that still need follow-up."],
+                  ["revenue", "Revenue (Stock Value)", compactCurrency(inventoryStockValue), "Total selling value of current inventory stock."],
+                  ["outstanding", "Outstanding Payments", compactCurrency(currentSummary.outstanding_payments), "Unpaid balances that still need follow-up."],
                   ["invoices", "Total Invoices", Number(currentSummary.invoice_count || 0), "Overall invoice count currently tracked in billing."],
-                  ["balance", "Net Balance", currency(currentSummary.net_balance), "Revenue - Expenses"]
+                  ["balance", "Net Balance", compactCurrency(dashboardNetBalance), "Stock value - Expenses"]
                 ].map(([key, label, value, note]) => (
-                  <article key={key} className={`summary-card ${key === "balance" ? `balance-${currentSummary.net_balance_direction}` : ""}`}>
+                  <article key={key} className={`summary-card ${key === "balance" ? `balance-${dashboardNetBalanceDirection}` : ""}`}>
                     <div className="summary-top">
                       <span className="summary-label">{label}</span>
                       <SummaryIcon type={key} />
@@ -2553,10 +4544,10 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                     <strong className="summary-value">{value}</strong>
                     <p className="summary-note">{note}</p>
                     {key === "balance" ? (
-                      <div className={`balance-helper ${currentSummary.net_balance_direction === "negative" ? "negative" : ""}`}>
-                        <span>{currentSummary.net_balance_direction === "negative" ? "Down" : "Up"}</span>
-                        <span>{currentSummary.net_balance_direction === "negative" ? "Below zero" : "Above zero"}</span>
-                        <span className="summary-tooltip" data-tooltip={`Revenue: ${currency(currentSummary.monthly_revenue)}\nExpenses: ${currency(currentSummary.expenses_total || currentSummary.outstanding_payments)}`}>i</span>
+                      <div className={`balance-helper ${dashboardNetBalanceDirection === "negative" ? "negative" : ""}`}>
+                        <span>{dashboardNetBalanceDirection === "negative" ? "Down" : "Up"}</span>
+                        <span>{dashboardNetBalanceDirection === "negative" ? "Below zero" : "Above zero"}</span>
+                        <span className="summary-tooltip" data-tooltip={`Stock value: ${currency(inventoryStockValue)}\nExpenses: ${currency(dashboardExpensesValue)}`}>i</span>
                       </div>
                     ) : null}
                   </article>
@@ -2645,7 +4636,9 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
               <section className="panel">
                 <div className="panel-header">
                   <div><h2>Invoices</h2><div className="panel-subtitle">Full invoice list with status and payment health.</div></div>
-                  <button className="button button-primary" type="button" onClick={() => openModal("invoice")}>Create Invoice</button>
+                  <div className="panel-actions">
+                    <button className="button button-primary" type="button" onClick={() => openModal("invoice")}>Create Standard Invoice</button>
+                  </div>
                 </div>
                 <div id="invoicesWorkspaceList" className="data-table-shell">
                   {allInvoices.length ? (
@@ -2661,22 +4654,42 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                           <th>Paid</th>
                           <th>Outstanding</th>
                           <th>Payment Status</th>
+                          <th>Actions</th>
                         </tr>
                       </thead>
                       <tbody>
-                        {allInvoices.map((invoice, index) => (
-                          <tr key={invoice.id || invoice.invoice_number || index}>
-                            <td>{index + 1}</td>
-                            <td>{cleanText(invoice.customer_name, "Walk-in Customer")}</td>
-                            <td>{getInvoicePhone(invoice)}</td>
-                            <td>{formatDate(invoice.issued_on)}</td>
-                            <td>{invoice.invoice_number || "Auto"}</td>
-                            <td>{currency(invoice.amount)}</td>
-                            <td>{currency(invoicePaidAmount(invoice))}</td>
-                            <td>{currency(invoiceOutstandingAmount(invoice))}</td>
-                            <td><span className={`status-badge ${statusClass(invoice.status)}`}>{invoice.status}</span></td>
-                          </tr>
-                        ))}
+                        {allInvoices.map((invoice, index) => {
+                          const paymentStatus = getInvoicePaymentStatus(invoice);
+                          return (
+                            <tr key={invoice.id || invoice.invoice_number || index}>
+                              <td>{index + 1}</td>
+                              <td>{cleanText(invoice.customer_name, "Walk-in Customer")}</td>
+                              <td>{getInvoicePhone(invoice)}</td>
+                              <td>{formatDate(invoice.issued_on)}</td>
+                              <td>{invoice.invoice_number || "Auto"}</td>
+                              <td>{currency(invoice.amount)}</td>
+                              <td>{currency(invoicePaidAmount(invoice))}</td>
+                              <td>{currency(invoiceOutstandingAmount(invoice))}</td>
+                              <td>
+                                <button
+                                  type="button"
+                                  className={`status-badge status-button ${statusClass(paymentStatus)}`}
+                                  title="Left click to record payment. Right click for status options."
+                                  onClick={() => openInvoicePaymentAction(invoice)}
+                                  onContextMenu={(event) => openInvoiceStatusMenu(event, invoice)}
+                                >
+                                  {paymentStatus}
+                                </button>
+                              </td>
+                              <td>
+                                <div className="table-actions">
+                                  <button type="button" className="button button-secondary file-action" onClick={() => openInvoiceViewer(invoice)}>View</button>
+                                  {isOwner ? <button type="button" className="button button-secondary file-action danger-action" onClick={() => deleteInvoiceRecord(invoice)}>Delete</button> : null}
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })}
                       </tbody>
                     </table>
                   ) : <Empty>No invoice history available yet.</Empty>}
@@ -2755,6 +4768,32 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         </aside>
       </main>
 
+      {invoiceStatusMenu && invoiceStatusMenuInvoice ? (
+        <div
+          className="context-menu invoice-status-menu"
+          style={{ left: invoiceStatusMenu.x, top: invoiceStatusMenu.y }}
+          role="menu"
+          aria-label="Invoice status actions"
+          onClick={(event) => event.stopPropagation()}
+        >
+          <button type="button" role="menuitem" disabled={invoiceOutstandingAmount(invoiceStatusMenuInvoice) <= 0} onClick={() => markInvoiceAsPaid(invoiceStatusMenuInvoice)}>
+            Mark as paid
+          </button>
+          <button type="button" role="menuitem" onClick={() => {
+            setInvoiceStatusMenu(null);
+            openInvoicePaymentAction(invoiceStatusMenuInvoice);
+          }}>
+            Record payment
+          </button>
+          <button type="button" role="menuitem" onClick={() => {
+            setInvoiceStatusMenu(null);
+            openInvoiceViewer(invoiceStatusMenuInvoice);
+          }}>
+            View invoice
+          </button>
+        </div>
+      ) : null}
+
       <Modal open={activeModal === "customer"} title="Add Customer" subtitle="Create a customer record for invoices and future payment activity." onClose={closeModal}>
         <form onSubmit={submitCustomer}>
           <label>Customer Name<input name="name" type="text" placeholder="Northwind Labs" required /></label>
@@ -2767,35 +4806,13 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         </form>
       </Modal>
 
-      <Modal open={activeModal === "invoice"} title="Create Invoice" subtitle="Capture a customer, amount, and dates with a minimal billing form." onClose={closeModal}>
-        <form onSubmit={submitInvoice}>
-          <label>Customer<select name="customer_id" required disabled={!customers.length}>{customers.length ? customers.map((customer) => <option key={customer.id} value={customer.id}>{customer.name}</option>) : <option value="">Add a customer first</option>}</select></label>
-          <div className="form-grid settings-form-grid">
-            <label>Amount<input name="amount" type="number" min="0.01" step="0.01" placeholder="0.00" required /></label>
-            <label>Invoice Number<input name="invoice_number" type="text" placeholder={`Auto generated as ${buildClientInvoiceNumber(todayISO())}`} /></label>
-          </div>
-          <div className="form-grid settings-form-grid">
-            <label>Issued On<input name="issued_on" type="date" defaultValue={todayISO()} required /></label>
-            <label>Due On<input name="due_on" type="date" defaultValue={defaultDueDate} required /></label>
-          </div>
-          <label>Notes<textarea name="notes" placeholder="Optional note for the invoice" defaultValue={settings.invoiceNotes || ""}></textarea></label>
-          <p className="settings-inline-copy">If the invoice number is left blank, CinchPOS uses {buildClientInvoiceNumber(todayISO())}. The due date follows the current invoicing setting.</p>
-          <div className="form-grid settings-form-grid">
-            <label>Payment Status<select name="payment_type" defaultValue="pending"><option value="pending">Pending</option><option value="full">Full Payment</option><option value="partial">Partial Payment</option></select></label>
-            <label>Payment Method<select name="payment_method"><option>Cash</option><option>UPI</option><option>Card</option><option>Bank Transfer</option></select></label>
-            <label className="settings-span-2">Paid Amount<input name="payment_amount" type="number" min="0" step="0.01" placeholder="Only for partial payment" /></label>
-          </div>
-          <div className="modal-actions"><button type="button" className="button button-secondary" onClick={closeModal}>Cancel</button><button type="submit" className="button button-primary" disabled={!customers.length}>Create Invoice</button></div>
-        </form>
-      </Modal>
-
       <Modal open={activeModal === "pos"} title="CinchPOS" large onClose={closeModal}>
         <POSModule formId="posForm" modal />
       </Modal>
 
       <Modal open={activeModal === "payment"} title="Record Payment" subtitle="Apply a payment to an outstanding invoice and update totals immediately." onClose={closeModal}>
         <form onSubmit={submitPayment}>
-          <label>Invoice<select key={prefillInvoiceId || outstandingInvoices[0]?.id || "none"} name="invoice_id" required disabled={!outstandingInvoices.length} defaultValue={prefillInvoiceId || outstandingInvoices[0]?.id || ""}>{outstandingInvoices.length ? outstandingInvoices.map((invoice) => <option key={invoice.id} value={invoice.id}>{invoice.invoice_number} | {invoice.customer_name} | {currency(invoice.outstanding)}</option>) : <option value="">Create an invoice before recording a payment</option>}</select></label>
+          <label>Invoice<select key={prefillInvoiceId || outstandingInvoices[0]?.id || "none"} name="invoice_id" required disabled={!outstandingInvoices.length} defaultValue={prefillInvoiceId || outstandingInvoices[0]?.id || ""}>{outstandingInvoices.length ? outstandingInvoices.map((invoice) => <option key={invoice.id} value={invoice.id}>{invoice.invoice_number} | {invoice.customer_name} | {currency(invoiceOutstandingAmount(invoice))}</option>) : <option value="">Create an invoice before recording a payment</option>}</select></label>
           <div className="form-grid">
             <label>Payment Amount<input name="amount" type="number" min="0.01" step="0.01" placeholder="0.00" required /></label>
             <label>Paid On<input name="paid_on" type="date" defaultValue={todayISO()} required /></label>
@@ -2823,46 +4840,277 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                   <th>Paid</th>
                   <th>Outstanding</th>
                   <th>Payment Status</th>
+                  <th>Actions</th>
                 </tr>
               </thead>
               <tbody>
-                {allInvoices.map((invoice, index) => (
-                  <tr key={invoice.id || invoice.invoice_number || index}>
-                    <td>{index + 1}</td>
-                    <td>{cleanText(invoice.customer_name, "Walk-in Customer")}</td>
-                    <td>{getInvoicePhone(invoice)}</td>
-                    <td>{formatDate(invoice.issued_on)}</td>
-                    <td>{invoice.invoice_number || "Auto"}</td>
-                    <td>{currency(invoice.amount)}</td>
-                    <td>{currency(invoicePaidAmount(invoice))}</td>
-                    <td>{currency(invoiceOutstandingAmount(invoice))}</td>
-                    <td><span className={`status-badge ${statusClass(invoice.status)}`}>{invoice.status}</span></td>
-                  </tr>
-                ))}
+                {allInvoices.map((invoice, index) => {
+                  const paymentStatus = getInvoicePaymentStatus(invoice);
+                  return (
+                    <tr key={invoice.id || invoice.invoice_number || index}>
+                      <td>{index + 1}</td>
+                      <td>{cleanText(invoice.customer_name, "Walk-in Customer")}</td>
+                      <td>{getInvoicePhone(invoice)}</td>
+                      <td>{formatDate(invoice.issued_on)}</td>
+                      <td>{invoice.invoice_number || "Auto"}</td>
+                      <td>{currency(invoice.amount)}</td>
+	                      <td>{currency(invoicePaidAmount(invoice))}</td>
+	                      <td>{currency(invoiceOutstandingAmount(invoice))}</td>
+	                      <td>
+	                        <button
+	                          type="button"
+	                          className={`status-badge status-button ${statusClass(paymentStatus)}`}
+	                          title="Left click to record payment. Right click for status options."
+	                          onClick={() => openInvoicePaymentAction(invoice)}
+	                          onContextMenu={(event) => openInvoiceStatusMenu(event, invoice)}
+	                        >
+	                          {paymentStatus}
+	                        </button>
+	                      </td>
+	                      <td>
+	                        <div className="table-actions">
+	                          <button type="button" className="button button-secondary file-action" onClick={() => openInvoiceViewer(invoice)}>View</button>
+	                          {isOwner ? <button type="button" className="button button-secondary file-action danger-action" onClick={() => deleteInvoiceRecord(invoice)}>Delete</button> : null}
+	                        </div>
+	                      </td>
+	                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           ) : <Empty>No invoice history available yet.</Empty>}
         </div>
       </Modal>
 
+      <Modal open={activeModal === "invoiceViewer"} title="Invoice View" subtitle="Complete invoice details, items, taxes, payments, and actions." large onClose={closeModal}>
+        {selectedInvoice ? (
+          <div className="invoice-viewer">
+            <div className="invoice-viewer-head">
+              <div>
+                <h3>{selectedInvoice.invoice_number || selectedInvoice.invoiceNumber || "Invoice"}</h3>
+                <p>{cleanText(selectedInvoice.customer_name || selectedInvoice.customerName, selectedInvoiceDetail?.customer?.name || DEFAULT_WALK_IN_CUSTOMER_NAME)} | {getInvoicePhone(selectedInvoice)}</p>
+              </div>
+              <div className="invoice-viewer-actions">
+                <button type="button" className="button button-secondary" onClick={() => printPOSBill(makePrintPayloadFromInvoice(selectedInvoice, selectedInvoiceDetail))}>Print Invoice</button>
+	                <button type="button" className="button button-secondary" onClick={() => downloadInvoice(selectedInvoice)}>Download Invoice</button>
+	                <button type="button" className="button button-secondary" onClick={() => duplicateInvoiceToBuilder(selectedInvoice)}>Duplicate Invoice</button>
+	                {isOwner ? <button type="button" className="button button-secondary danger-action" onClick={() => deleteInvoiceRecord(selectedInvoice)}>Delete Invoice</button> : null}
+	                <button type="button" className="button button-secondary" disabled title="Existing API invoices are locked from direct editing in this build.">Edit Locked</button>
+	              </div>
+            </div>
+            <div className="invoice-viewer-grid">
+              <article className="record-card">
+                <h3>Customer Details</h3>
+                <div className="record-meta-grid">
+                  <span>Name {cleanText(selectedInvoice.customer_name || selectedInvoiceDetail?.customer?.name, DEFAULT_WALK_IN_CUSTOMER_NAME)}</span>
+                  <span>Phone {getInvoicePhone(selectedInvoice)}</span>
+                  <span>Email {selectedInvoiceDetail?.customer?.email || "Not added"}</span>
+                  <span>Address {selectedInvoiceDetail?.customer?.address || "Not added"}</span>
+                </div>
+              </article>
+              <article className="record-card">
+                <h3>Payment Information</h3>
+                <div className="record-meta-grid">
+                  <span>Date {formatDate(selectedInvoice.issued_on || selectedInvoice.issuedOn)}</span>
+                  <span>Due {formatDate(selectedInvoice.due_on || selectedInvoice.dueOn)}</span>
+                  <span>Paid {currency(invoicePaidAmount(selectedInvoice))}</span>
+                  <span>Outstanding {currency(invoiceOutstandingAmount(selectedInvoice))}</span>
+                  <span>Status {selectedInvoice.status}</span>
+                  <span>Method {selectedInvoiceDetail?.paymentMethod || "Not added"}</span>
+                </div>
+              </article>
+            </div>
+            <div className="data-table-shell invoice-line-shell">
+              {(selectedInvoiceDetail?.items || []).length ? (
+                <table className="data-table invoice-line-table">
+                  <thead>
+                    <tr><th>S.No.</th><th>Item</th><th>Barcode</th><th>Qty</th><th>MRP</th><th>Sale</th><th>Taxable</th><th>GST</th><th>Total</th></tr>
+                  </thead>
+                  <tbody>
+                    {selectedInvoiceDetail.items.map((item, index) => (
+                      <tr key={`${item.itemName}-${index}`}>
+                        <td>{index + 1}</td>
+                        <td>{item.itemName}</td>
+                        <td>{item.barcode || "Not added"}</td>
+                        <td>{item.quantity}</td>
+                        <td>{currency(item.mrp)}</td>
+                        <td>{currency(item.inclusivePrice)}</td>
+                        <td>{currency(item.taxableValue)}</td>
+                        <td>{currency(Number(item.gstAmount || 0) * Number(item.quantity || 1))} ({Number(item.gstRate || 0)}%)</td>
+                        <td>{currency(item.lineTotal)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              ) : <Empty>Detailed item lines were not saved for this older invoice. The invoice total and payment details are still available.</Empty>}
+            </div>
+            <div className="invoice-viewer-totals">
+              <span>Taxable {currency(selectedInvoiceDetail?.summary?.subtotal || 0)}</span>
+              <span>CGST {currency(selectedInvoiceDetail?.summary?.cgst || 0)}</span>
+              <span>SGST {currency(selectedInvoiceDetail?.summary?.sgst || 0)}</span>
+              <strong>Grand Total {currency(selectedInvoice.amount || selectedInvoiceDetail?.summary?.total || 0)}</strong>
+            </div>
+            <div className="record-card">
+              <h3>Notes & Terms</h3>
+              <p className="record-meta">{selectedInvoiceDetail?.notes || selectedInvoice.notes || "No notes added."}</p>
+              {selectedInvoiceDetail?.paymentTerms ? <p className="record-meta">Payment terms: {selectedInvoiceDetail.paymentTerms}</p> : null}
+              {selectedInvoiceDetail?.terms ? <p className="record-meta">Terms: {selectedInvoiceDetail.terms}</p> : null}
+            </div>
+          </div>
+        ) : <Empty>Select an invoice to view complete details.</Empty>}
+      </Modal>
+
+      <Modal open={activeModal === "invoice"} title="Create Standard Invoice" subtitle="Create a standard bill with items, customer details, taxes, discounts, terms, and a live print-ready preview." large cardClass="invoice-builder-modal" onClose={closeModal}>
+        <form className="invoice-builder" onSubmit={submitStandardInvoice}>
+          <section className="invoice-builder-editor">
+            <div className="invoice-builder-toolbar">
+              <label>Template<select value={invoiceBuilderDraft.template} onChange={(event) => updateInvoiceBuilderField("template", event.target.value)}><option value="standard">Standard Invoice</option><option value="gst">GST Invoice</option><option value="proforma">Proforma Invoice</option><option value="custom">Custom Invoice</option></select></label>
+              <label>Invoice Number<input type="text" value={invoiceBuilderDraft.invoiceNumber} onChange={(event) => updateInvoiceBuilderField("invoiceNumber", event.target.value)} placeholder={buildClientInvoiceNumber(todayISO())} /></label>
+              <label>Issued On<input type="date" value={invoiceBuilderDraft.issuedOn} onChange={(event) => updateInvoiceBuilderField("issuedOn", event.target.value)} /></label>
+              <label>Due On<input type="date" value={invoiceBuilderDraft.dueOn} onChange={(event) => updateInvoiceBuilderField("dueOn", event.target.value)} /></label>
+            </div>
+            <section className="invoice-builder-section">
+              <h3>Customer Details</h3>
+              <div className="form-grid settings-form-grid">
+                <label>Saved Customer<select value={invoiceBuilderDraft.customerId} onChange={(event) => {
+                  const customer = customers.find((entry) => String(entry.id) === String(event.target.value));
+                  setInvoiceBuilderDraft((current) => ({
+                    ...current,
+                    customerId: event.target.value,
+                    customerName: customer?.name || current.customerName,
+                    customerPhone: normalizePhone(customer?.phone || current.customerPhone).slice(-10),
+                    customerEmail: customer?.email || current.customerEmail,
+                    customerAddress: customer?.address || current.customerAddress
+                  }));
+                }}><option value="">New / Walk-in customer</option>{customers.map((customer) => <option key={customer.id} value={customer.id}>{customer.name}</option>)}</select></label>
+                <label>Name<input type="text" value={invoiceBuilderDraft.customerName} onChange={(event) => updateInvoiceBuilderField("customerName", event.target.value)} placeholder="Optional customer name" /></label>
+                <label>Phone<input type="tel" value={invoiceBuilderDraft.customerPhone} onChange={(event) => updateInvoiceBuilderField("customerPhone", event.target.value)} placeholder="10 digit phone" /></label>
+                <label>Email<input type="email" value={invoiceBuilderDraft.customerEmail} onChange={(event) => updateInvoiceBuilderField("customerEmail", event.target.value)} placeholder="Optional" /></label>
+                <label className="settings-span-2">Address<textarea rows="2" value={invoiceBuilderDraft.customerAddress} onChange={(event) => updateInvoiceBuilderField("customerAddress", event.target.value)} placeholder="Optional address"></textarea></label>
+              </div>
+            </section>
+            <section className="invoice-builder-section">
+              <h3>Items</h3>
+              <div className="invoice-builder-search">
+                <label>Search Inventory<input type="search" value={invoiceBuilderSearch} onChange={(event) => setInvoiceBuilderSearch(event.target.value)} placeholder="Search and add inventory items" /></label>
+                <button type="button" className="button button-secondary" onClick={() => addInvoiceBuilderLine()}>Add Manual Item</button>
+              </div>
+              {invoiceBuilderMatches.length ? (
+                <div className="invoice-builder-matches">
+                  {invoiceBuilderMatches.map((item, index) => (
+                    <button type="button" key={getInventoryItemKey(item, index)} onClick={() => addInvoiceBuilderLine(buildInvoiceBuilderLineFromInventory(item))}>
+                      <span>{getInventoryItemName(item)}</span>
+                      <small>{getInventoryBarcodeLabel(item)} | {currency(item.inclusivePrice || item.inclusive_price || 0)}</small>
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+              <div className="invoice-builder-lines">
+                {(invoiceBuilderDraft.lines || []).map((line, index) => (
+                  <article className="invoice-builder-line" key={line.id}>
+                    <span className="line-index">{index + 1}</span>
+                    <input type="text" value={line.itemName} onChange={(event) => updateInvoiceBuilderLine(line.id, "itemName", event.target.value)} placeholder="Item name" required />
+                    <input type="text" value={line.barcode} onChange={(event) => updateInvoiceBuilderLine(line.id, "barcode", event.target.value)} placeholder="Barcode" />
+                    <input type="number" min="1" step="1" value={line.quantity} onChange={(event) => updateInvoiceBuilderLine(line.id, "quantity", event.target.value)} aria-label="Quantity" required />
+                    <input type="number" min="0" step="0.01" value={line.mrp} onChange={(event) => updateInvoiceBuilderLine(line.id, "mrp", event.target.value)} aria-label="MRP" />
+                    <input type="number" min="0.01" step="0.01" value={line.inclusivePrice} onChange={(event) => updateInvoiceBuilderLine(line.id, "inclusivePrice", event.target.value)} aria-label="Selling price" required />
+                    <input type="number" min="0" max="100" step="0.01" value={Number(line.discountPercent || 0).toFixed(2)} onChange={(event) => updateInvoiceBuilderLine(line.id, "discountPercent", event.target.value)} aria-label="Discount" />
+                    <select value={line.gstRate} onChange={(event) => updateInvoiceBuilderLine(line.id, "gstRate", event.target.value)} aria-label="GST Rate"><option value="0">0%</option><option value="5">5%</option><option value="12">12%</option><option value="18">18%</option><option value="28">28%</option></select>
+                    <strong>{currency(Number(line.inclusivePrice || 0) * Number(line.quantity || 0))}</strong>
+                    <button type="button" className="line-remove" onClick={() => removeInvoiceBuilderLine(line.id)}>&times;</button>
+                  </article>
+                ))}
+              </div>
+            </section>
+            <section className="invoice-builder-section">
+              <h3>Terms, Payment & Layout</h3>
+              <div className="form-grid settings-form-grid">
+                <label>Payment Status<select value={invoiceBuilderDraft.paymentStatus} onChange={(event) => updateInvoiceBuilderField("paymentStatus", event.target.value)}><option value="pending">Pending</option><option value="full">Full Payment</option><option value="partial">Partial Payment</option></select></label>
+                <label>Payment Method<select value={invoiceBuilderDraft.paymentMethod} onChange={(event) => updateInvoiceBuilderField("paymentMethod", event.target.value)}><option>Cash</option><option>UPI</option><option>Card</option><option>Bank Transfer</option></select></label>
+                <label>Paid Amount<input type="number" min="0" step="0.01" value={invoiceBuilderDraft.paymentAmount} onChange={(event) => updateInvoiceBuilderField("paymentAmount", event.target.value)} placeholder="For partial payment" /></label>
+                <label>Header Placement<select value={invoiceBuilderDraft.headerPlacement} onChange={(event) => updateInvoiceBuilderField("headerPlacement", event.target.value)}><option value="center">Centered</option><option value="left">Left aligned</option><option value="split">Logo left, details right</option></select></label>
+                <label>Logo Placement<select value={invoiceBuilderDraft.logoPlacement} onChange={(event) => updateInvoiceBuilderField("logoPlacement", event.target.value)}><option value="top">Top</option><option value="left">Left</option><option value="hidden">Hidden</option></select></label>
+                <label>Table Layout<select value={invoiceBuilderDraft.tableLayout} onChange={(event) => updateInvoiceBuilderField("tableLayout", event.target.value)}><option value="detailed">Detailed GST Table</option><option value="compact">Compact Table</option></select></label>
+                <label className="settings-span-2">Payment Terms<textarea rows="2" value={invoiceBuilderDraft.paymentTerms} onChange={(event) => updateInvoiceBuilderField("paymentTerms", event.target.value)}></textarea></label>
+                <label className="settings-span-2">Notes<textarea rows="2" value={invoiceBuilderDraft.notes} onChange={(event) => updateInvoiceBuilderField("notes", event.target.value)} placeholder="Optional invoice notes"></textarea></label>
+                <label className="settings-span-2">Terms & Conditions<textarea rows="2" value={invoiceBuilderDraft.terms} onChange={(event) => updateInvoiceBuilderField("terms", event.target.value)}></textarea></label>
+              </div>
+            </section>
+          </section>
+          <aside className="invoice-builder-preview-panel">
+            <div className={`a4-preview ${invoiceBuilderDraft.headerPlacement} logo-${invoiceBuilderDraft.logoPlacement}`}>
+              <header>
+                {invoiceBuilderDraft.logoPlacement !== "hidden" ? <StoreLogo source={storeLogoSource} fallback={fallbackInitials} className="a4-preview-logo" /> : null}
+                <div>
+                  <h3>{businessName}</h3>
+                  <p>{ownerName}</p>
+                  <p>{settings.businessPhone || settings.businessEmail || "Business contact not added"}</p>
+                  <p>{settings.gstin ? `GSTIN ${settings.gstin}` : "GSTIN not added"}</p>
+                </div>
+              </header>
+              <section className="a4-preview-meta">
+                <div><strong>Invoice</strong><span>{invoiceBuilderDraft.invoiceNumber || buildClientInvoiceNumber(todayISO())}</span></div>
+                <div><strong>Date</strong><span>{invoiceBuilderDraft.issuedOn}</span></div>
+                <div><strong>Customer</strong><span>{invoiceBuilderDraft.customerName || DEFAULT_WALK_IN_CUSTOMER_NAME}</span></div>
+              </section>
+              <table>
+                <thead><tr><th>Item</th><th>Qty</th><th>Rate</th><th>GST</th><th>Total</th></tr></thead>
+                <tbody>
+                  {(invoiceBuilderDraft.lines || []).filter((line) => cleanText(line.itemName)).slice(0, 8).map((line) => (
+                    <tr key={`preview-${line.id}`}><td>{line.itemName}</td><td>{line.quantity}</td><td>{currency(line.inclusivePrice)}</td><td>{line.gstRate}%</td><td>{currency(Number(line.inclusivePrice || 0) * Number(line.quantity || 0))}</td></tr>
+                  ))}
+                </tbody>
+              </table>
+              <div className="a4-preview-totals">
+                <span>Taxable {currency(invoiceBuilderSummary.subtotal)}</span>
+                <span>GST {currency(invoiceBuilderSummary.gst)}</span>
+                <strong>Grand Total {currency(invoiceBuilderSummary.total)}</strong>
+              </div>
+              <p>{invoiceBuilderDraft.terms}</p>
+            </div>
+            <div className="modal-actions invoice-builder-actions">
+              <button type="button" className="button button-secondary" onClick={closeModal}>Cancel</button>
+              <button type="submit" className="button button-primary">Create Standard Invoice</button>
+            </div>
+          </aside>
+        </form>
+      </Modal>
+
       <Modal open={activeModal === "settings"} title="Settings" subtitle="Change appearance and personalize this billing workspace." large cardClass="settings-modal-card" onClose={closeModal}>
         {SettingsForm()}
       </Modal>
 
-      <Modal open={activeModal === "login"} title="Login or Sign Up" subtitle="Login to an existing account or create one for this billing counter." onClose={closeModal}>
-        <form onSubmit={(event) => {
-          event.preventDefault();
-          const data = Object.fromEntries(new FormData(event.currentTarget).entries());
-          setAccount({ loggedIn: true, name: data.name.trim(), contact: data.contact.trim() });
-          event.currentTarget.reset();
-          closeModal();
-          showMessage("Logged in.");
-        }}>
-          <label>Operator Name<input name="name" type="text" placeholder="Shopkeeper name" required /></label>
-          <label>Phone or Email<input name="contact" type="text" placeholder="Phone or email" required /></label>
-          <label>PIN<input name="pin" type="password" inputMode="numeric" placeholder="Counter PIN" required /></label>
-          <div className="modal-actions"><button type="button" className="button button-secondary" onClick={closeModal}>Cancel</button><button type="submit" className="button button-primary">Login or Sign Up</button></div>
-        </form>
+      <Modal open={activeModal === "login"} title="Login or Sign Up" subtitle="Secure account access for owners, admins, and employees." onClose={closeModal}>
+        <div className="auth-panel">
+          <div className="auth-status-card">
+            <span className={`record-chip ${authState.authenticated ? "success" : ""}`}>{authState.authenticated ? "Session Active" : "Signed Out"}</span>
+            <h3>{authState.authenticated ? cleanText(authState.name, "Operator") : "CinchPOS Account"}</h3>
+            <p>{authState.email || "Email/password login is handled by Clerk. CinchPOS never stores passwords locally."}</p>
+            <div className="auth-meta-grid">
+              <span>Role <strong>{authState.role}</strong></span>
+              <span>Email <strong>{authState.emailVerified ? "Verified" : "Pending"}</strong></span>
+              <span>MFA <strong>{authState.mfaRequired ? (authState.mfaVerified ? "Ready" : "Required") : "Optional"}</strong></span>
+              <span>Mode <strong>{authState.offline ? "Offline cache" : "Online session"}</strong></span>
+            </div>
+          </div>
+          <div className="auth-action-grid">
+            <button type="button" className="button button-primary" disabled={authBusy} onClick={() => openClerkFlow("signIn")}>Email / Password Login</button>
+            <button type="button" className="button button-secondary" disabled={authBusy} onClick={() => openClerkFlow("signUp")}>Register Business</button>
+            <button type="button" className="button button-secondary" disabled={authBusy} onClick={() => openClerkFlow("signIn")}>Forgot Password</button>
+            <button type="button" className="button button-secondary" disabled={authBusy} onClick={() => openClerkFlow("profile")}>MFA & Sessions</button>
+          </div>
+          <div className="auth-checklist">
+            <article><strong>Email verification</strong><span>New accounts must verify email in Clerk.</span></article>
+            <article><strong>Google sign-in</strong><span>Enable as an optional provider in the Clerk dashboard.</span></article>
+            <article><strong>Employee invitation</strong><span>Employees receive a secure invite and set their own password.</span></article>
+            <article><strong>Offline POS</strong><span>Existing sessions can keep billing from encrypted desktop storage.</span></article>
+          </div>
+          <div className="modal-actions">
+            <button type="button" className="button button-secondary" onClick={() => syncAuthContext(clerkClient)}>Refresh Session</button>
+            <button type="button" className="button button-secondary" onClick={signOutOfAuth} disabled={!authState.authenticated || authBusy}>Logout</button>
+            <button type="button" className="button button-primary" onClick={closeModal}>Done</button>
+          </div>
+        </div>
       </Modal>
     </>
   );
@@ -2882,7 +5130,9 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       visibleInventory,
       hasMoreInventory,
       smartInventoryReview,
-      showMessage
+      showMessage,
+      managedWarehouses,
+      activeWarehouseId
     } = inventoryViewContextRef.current;
     const inventorySortOptions = [
       ["nameAsc", "Alphabetically"],
@@ -2904,7 +5154,10 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         gst_rate: "18",
         stock: "1",
         stock_adjustment: "1",
-        unit: "pcs"
+        unit: "pcs",
+        reorder_level: "5",
+        max_stock_level: "25",
+        warehouse_id: activeWarehouseId || "main"
       };
     }
     function buildInventoryDraft(item) {
@@ -2926,7 +5179,14 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
           : (item.gst_rate !== undefined && item.gst_rate !== null ? String(item.gst_rate) : "18"),
         stock: item.stock !== undefined && item.stock !== null ? String(item.stock) : "1",
         stock_adjustment: "1",
-        unit: cleanText(item.unit, "pcs")
+        unit: cleanText(item.unit, "pcs"),
+        reorder_level: item.reorderLevel !== undefined && item.reorderLevel !== null
+          ? String(item.reorderLevel)
+          : (item.reorder_level !== undefined && item.reorder_level !== null ? String(item.reorder_level) : "5"),
+        max_stock_level: item.maxStockLevel !== undefined && item.maxStockLevel !== null
+          ? String(item.maxStockLevel)
+          : (item.max_stock_level !== undefined && item.max_stock_level !== null ? String(item.max_stock_level) : "25"),
+        warehouse_id: cleanText(item.warehouseId || item.warehouse_id, activeWarehouseId || "main")
       };
     }
     const [draft, setDraft] = useState(makeEmptyInventoryDraft);
@@ -2952,7 +5212,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     }
     const selectedInventoryItem = useMemo(() => (
       selectedInventoryItemId
-        ? inventoryItems.find((item) => String(item.id || "") === selectedInventoryItemId) || null
+        ? inventoryItems.find((item, index) => getInventoryItemKey(item, index) === selectedInventoryItemId || String(item.id || "") === selectedInventoryItemId) || null
         : null
     ), [inventoryItems, selectedInventoryItemId]);
     function resetInventoryEditor() {
@@ -2962,15 +5222,28 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     }
     function selectInventoryItem(item) {
       const nextBarcodes = getInventoryItemBarcodes(item);
-      setSelectedInventoryItemId(String(item?.id || ""));
+      const itemIndex = inventoryItems.findIndex((entry) => entry === item || String(entry.id || "") === String(item?.id || ""));
+      setSelectedInventoryItemId(getInventoryItemKey(item, Math.max(0, itemIndex)));
       setBarcodeInputs(nextBarcodes.length ? nextBarcodes : [""]);
       setDraft(buildInventoryDraft(item));
     }
     useEffect(() => {
-      if (selectedInventoryItemId && !inventoryItems.some((item) => String(item.id || "") === selectedInventoryItemId)) {
+      if (selectedInventoryItemId && !inventoryItems.some((item, index) => getInventoryItemKey(item, index) === selectedInventoryItemId || String(item.id || "") === selectedInventoryItemId)) {
         resetInventoryEditor();
       }
     }, [inventoryItems, selectedInventoryItemId]);
+    function openSmartInventorySuggestion(suggestion) {
+      const affectedIds = new Set(suggestion.itemIds || []);
+      const matchedItem = inventoryItems.find((item, index) => affectedIds.has(getInventoryItemKey(item, index)) || affectedIds.has(String(item.id || "")));
+      if (!matchedItem) {
+        showMessage("The affected inventory item could not be found.");
+        return;
+      }
+      selectInventoryItem(matchedItem);
+      setInventorySearch(getInventoryItemName(matchedItem));
+      setSmartInventoryOpen(false);
+      showMessage("Affected item opened in Inventory Details.");
+    }
     function handleSubmitInventory(event) {
       event.preventDefault();
       const itemName = cleanText(draft.item_name);
@@ -2978,6 +5251,8 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       const nextInclusivePrice = Number(draft.inclusive_price || 0);
       const nextGstRate = Number(draft.gst_rate || 0);
       const nextStock = Number(draft.stock || 0);
+      const nextReorderLevel = Math.max(0, Number(draft.reorder_level || 0));
+      const nextMaxStockLevel = Math.max(nextReorderLevel + 1, Number(draft.max_stock_level || 0) || (nextReorderLevel + 1));
       const nextBarcodes = normalizeInventoryBarcodes(barcodeInputs);
       if (!itemName || !nextBarcodes.length || nextMrp <= 0 || nextInclusivePrice <= 0) {
         showMessage("Add item name, barcode, MRP, and selling price greater than zero.");
@@ -3000,6 +5275,9 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         expiryDate: draft.expiry_date || "",
         stock: nextStock,
         unit: cleanText(draft.unit, "pcs"),
+        reorderLevel: nextReorderLevel,
+        maxStockLevel: nextMaxStockLevel,
+        warehouseId: cleanText(draft.warehouse_id, activeWarehouseId || "main"),
         mrp: nextMrp,
         inclusivePrice: nextInclusivePrice,
         discountPercent: calculateDiscountPercent(nextMrp, nextInclusivePrice),
@@ -3069,6 +5347,11 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                   <label className="stock-adjustment-field">Adjust By
                     <input name="stock_adjustment" type="number" min="1" step="1" value={draft.stock_adjustment} onChange={(event) => updateDraftField("stock_adjustment", event.target.value)} />
                   </label>
+                  <label>Reorder Level<input name="reorder_level" type="number" min="0" step="1" value={draft.reorder_level} onChange={(event) => updateDraftField("reorder_level", event.target.value)} /></label>
+                  <label>Max Stock<input name="max_stock_level" type="number" min="1" step="1" value={draft.max_stock_level} onChange={(event) => updateDraftField("max_stock_level", event.target.value)} /></label>
+                  <label>Warehouse<select name="warehouse_id" value={draft.warehouse_id} onChange={(event) => updateDraftField("warehouse_id", event.target.value)}>
+                    {managedWarehouses.map((warehouse) => <option key={warehouse.id} value={warehouse.id}>{warehouse.name}</option>)}
+                  </select></label>
                   <div className="stock-current-display" aria-live="polite">
                     <span>Current stock</span>
                     <strong>{Number(draft.stock || 0)} {draft.unit || "pcs"}</strong>
@@ -3132,8 +5415,12 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                 <div className="inventory-smart-panel" role="region" aria-label="Smart inventory suggestions">
                   {smartInventoryReview.suggestions.length ? smartInventoryReview.suggestions.map((suggestion, suggestionIndex) => (
                     <article className={`inventory-smart-item ${suggestion.type}`} key={`${suggestion.title}-${suggestionIndex}`}>
-                      <strong>{suggestion.title}</strong>
-                      <span>{suggestion.detail}</span>
+                      <div>
+                        <strong>{suggestion.title}</strong>
+                        <span>{suggestion.problem}</span>
+                        <small>{suggestion.recommendedAction}</small>
+                      </div>
+                      <button type="button" className="button button-secondary" onClick={() => openSmartInventorySuggestion(suggestion)}>Open Items</button>
                     </article>
                   )) : <p>No inventory suggestions right now.</p>}
                 </div>
@@ -3148,7 +5435,8 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                 const inclusivePrice = Number(item.inclusivePrice || item.inclusive_price || 0);
                 const barcode = getInventoryBarcodeLabel(item);
                 const quantityLabel = `${Number(item.stock || 0)} ${item.unit || "pcs"}`;
-                const isSelected = selectedInventoryItemId === String(item.id || "");
+                const warehouseName = managedWarehouses.find((warehouse) => warehouse.id === (item.warehouseId || item.warehouse_id))?.name;
+                const isSelected = selectedInventoryItemId === itemKey || selectedInventoryItemId === String(item.id || "");
                 return (
                   <article
                     className={`inventory-item inventory-item-compact ${isSelected ? "selected" : ""}`}
@@ -3165,9 +5453,9 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                     }}
                   >
                       <div className="inventory-item-compact-top">
-                        <div className="inventory-item-copy">
-                          <h3>{itemName}</h3>
-                          <p className="inventory-compact-meta">Barcode {barcode}</p>
+                          <div className="inventory-item-copy">
+                            <h3>{itemName}</h3>
+                          <p className="inventory-compact-meta">Barcode {barcode}{warehouseName ? ` | ${warehouseName}` : ""}</p>
                         </div>
                         <div className="inventory-item-qty">
                           <span>Qty</span>
@@ -3343,17 +5631,69 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
   }
 
   function SalesReportView({ active }) {
-    const paidInvoices = allInvoices.filter((invoice) => invoice.status === "Paid").length;
-    const pendingInvoices = allInvoices.filter((invoice) => invoice.status === "Pending").length;
-    const overdueInvoices = allInvoices.filter((invoice) => invoice.status === "Overdue").length;
+    const paidInvoices = allInvoices.filter((invoice) => getInvoicePaymentStatus(invoice) === "Paid").length;
+    const pendingInvoices = allInvoices.filter((invoice) => getInvoicePaymentStatus(invoice) === "Unpaid").length;
+    const overdueInvoices = allInvoices.filter((invoice) => getInvoicePaymentStatus(invoice) === "Overdue").length;
+    const totalCollections = allInvoices.reduce((total, invoice) => total + invoicePaidAmount(invoice), 0);
+    const totalOutstanding = allInvoices.reduce((total, invoice) => total + invoiceOutstandingAmount(invoice), 0);
+    const averageInvoiceValue = allInvoices.length ? allInvoices.reduce((total, invoice) => total + Number(invoice.amount || 0), 0) / allInvoices.length : 0;
     return (
       <section id="salesReportView" className={`app-view ${active ? "active" : ""}`} data-title="Sales Report">
-        <section className="panel">
-          <div className="panel-header"><div><h2>Sales Report</h2><div className="panel-subtitle">Sales performance, collections, and invoice status reporting.</div></div></div>
-          <div className="record-list">
-            <article className="record-card"><div className="record-top"><div><h3>Collections</h3><p className="record-meta">Current month payment revenue</p></div><strong className="record-amount">{currency(currentSummary.monthly_revenue)}</strong></div></article>
-            <article className="record-card"><div className="record-top"><div><h3>Outstanding</h3><p className="record-meta">Pending balances across invoices</p></div><strong className="record-amount">{currency(currentSummary.outstanding_payments)}</strong></div></article>
-            <article className="record-card"><div className="record-top"><div><h3>Invoice Health</h3><p className="record-meta">Paid, pending, and overdue invoice counts</p></div><strong className="record-amount">{allInvoices.length}</strong></div><div className="record-meta-grid"><span>Paid {paidInvoices}</span><span>Pending {pendingInvoices}</span><span>Overdue {overdueInvoices}</span></div></article>
+        <section className="panel sales-report-panel">
+          <div className="panel-header">
+            <div>
+              <h2>Sales Report</h2>
+              <div className="panel-subtitle">Sales performance, collections, outstanding invoices, and billing health.</div>
+            </div>
+            <button className="button button-secondary" type="button" onClick={() => setActiveView("invoicesView")}>Open Invoices</button>
+          </div>
+	          <div className="sales-report-grid">
+	            <article className="sales-report-card">
+	              <span>Stock Value</span>
+	              <strong>{compactCurrency(inventoryStockValue)}</strong>
+	              <small>Current inventory quantity x selling price</small>
+	            </article>
+            <article className="sales-report-card">
+              <span>Total Collected</span>
+              <strong>{compactCurrency(totalCollections)}</strong>
+              <small>Across all saved invoices</small>
+            </article>
+            <article className="sales-report-card warning">
+              <span>Outstanding</span>
+              <strong>{compactCurrency(totalOutstanding || currentSummary.outstanding_payments)}</strong>
+              <small>Pending customer balances</small>
+            </article>
+            <article className="sales-report-card">
+              <span>Average Invoice</span>
+              <strong>{compactCurrency(averageInvoiceValue)}</strong>
+              <small>{allInvoices.length} invoice(s) tracked</small>
+            </article>
+          </div>
+          <div className="sales-report-lower">
+            <section className="sales-health-card">
+              <div className="sales-health-top">
+                <div>
+                  <h3>Invoice Health</h3>
+                  <p className="record-meta">Click a status to review invoices and collect pending payments.</p>
+                </div>
+                <strong>{allInvoices.length}</strong>
+              </div>
+              <div className="sales-status-actions">
+                <button type="button" className="status-badge status-button status-paid" onClick={() => setActiveView("invoicesView")}>Paid {paidInvoices}</button>
+                <button type="button" className="status-badge status-button status-pending" onClick={() => setActiveView("invoicesView")}>Unpaid {pendingInvoices}</button>
+                <button type="button" className="status-badge status-button status-overdue" onClick={() => setActiveView("invoicesView")}>Overdue {overdueInvoices}</button>
+              </div>
+            </section>
+            <section className="sales-trend-mini">
+              <div className="sales-health-top">
+                <div>
+                  <h3>Collection Trend</h3>
+                  <p className="record-meta">{trendCaption}</p>
+                </div>
+                <span>Peak {currency(trendPeak)}</span>
+              </div>
+              <TrendChart points={trend} />
+            </section>
           </div>
         </section>
       </section>
@@ -3361,58 +5701,84 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
   }
 
   function EmployeeView({ active }) {
+    const activeEmployees = employees.filter((employee) => cleanText(employee.status, "Active") === "Active").length;
+    const attendanceMarked = employees.filter((employee) => (employee.attendance || []).some((entry) => entry.date === todayISO())).length;
+    const employeeRoleOptions = authRoles.length
+      ? authRoles
+      : [
+          { role_key: "cashier", name: "Cashier" },
+          { role_key: "manager", name: "Manager" },
+          { role_key: "warehouse_staff", name: "Warehouse Staff" },
+          { role_key: "accountant", name: "Accountant" },
+          { role_key: "employee", name: "Employee" }
+        ];
     return (
       <section id="employeeView" className={`app-view ${active ? "active" : ""}`} data-title="Manage Employee">
-        <section className="panel">
-          <div className="panel-header"><div><h2>Manage Employee</h2><div className="panel-subtitle">Employee roles, access, and counter responsibilities.</div></div></div>
-          <form className="workspace-form" onSubmit={submitEmployee}>
-            <div className="module-grid">
-              <label>Employee Name<input name="name" type="text" placeholder="Employee name" required /></label>
-              <label>Role<input name="role" type="text" placeholder="Counter Staff" required /></label>
-              <label>Phone<input name="phone" type="tel" placeholder="Phone number" /></label>
-              <label>Status<select name="status"><option>Active</option><option>Inactive</option></select></label>
-              <label className="module-span-2">Address<textarea name="address" rows="2" placeholder="Employee address"></textarea></label>
-              <label>Aadhaar Card<input name="aadhar_file" type="file" accept="image/*,.pdf" /></label>
-              <label>PAN Card<input name="pan_file" type="file" accept="image/*,.pdf" /></label>
+        <div className="employee-dashboard">
+          <section className="panel employee-editor-panel">
+            <div className="panel-header"><div><h2>Manage Employee</h2><div className="panel-subtitle">Employee roles, permissions, attendance, salary, and documents.</div></div></div>
+            <div className="employee-metrics">
+              <article><strong>{employees.length}</strong><span>Total staff</span></article>
+              <article><strong>{activeEmployees}</strong><span>Active</span></article>
+              <article><strong>{attendanceMarked}</strong><span>Attendance today</span></article>
             </div>
-            <div className="modal-actions"><button type="submit" className="button button-primary">Save Employee</button></div>
-          </form>
-        </section>
-        <section className="panel">
-          <div className="panel-header"><div><h2>Employee Records</h2><div className="panel-subtitle">Staff saved in this workspace.</div></div></div>
-          <div className="record-list">{employees.length ? employees.map((employee) => {
-            const attendanceToday = (employee.attendance || []).find((entry) => entry.date === todayISO());
-            return (
-              <article className="record-card" key={employee.id}>
-                <div className="record-top">
-                  <div><h3>{employee.name}</h3><p className="record-meta">{employee.role} | {employee.phone || "No phone"} | {employee.address || "No address"}</p></div>
-                  <div className="employee-card-actions">
-                    <span className="record-chip">{employee.status}</span>
-                    <button type="button" className="button button-danger file-action" onClick={() => deleteEmployee(employee.id)}>Delete</button>
-                  </div>
-                </div>
-                <div className="record-meta-grid">
-                  <span>Aadhaar {employee.aadharFileName || "Not uploaded"}</span>
-                  <span>PAN {employee.panFileName || "Not uploaded"}</span>
-                </div>
-                {(employee.aadharFileData || employee.panFileData) ? (
-                  <div className="record-actions">
-                    {employee.aadharFileData ? <FileAction record={{ fileData: employee.aadharFileData, fileName: employee.aadharFileName }} label="Download Aadhaar" /> : null}
-                    {employee.panFileData ? <FileAction record={{ fileData: employee.panFileData, fileName: employee.panFileName }} label="Download PAN" /> : null}
-                  </div>
-                ) : null}
-                <div className="attendance-row">
-                  <span className="attendance-status">Today: {attendanceToday?.status || "Not marked"}</span>
-                  <div className="attendance-actions">
-                    {["Present", "Absent", "Half Day"].map((status) => (
-                      <button key={status} className="button button-secondary file-action" type="button" onClick={() => markEmployeeAttendance(employee.id, status)}>{status}</button>
-                    ))}
-                  </div>
-                </div>
-              </article>
-            );
-          }) : <Empty>No employees saved yet.</Empty>}</div>
-        </section>
+            <form className="workspace-form employee-form" onSubmit={submitEmployee}>
+              <div className="module-grid employee-form-grid">
+                <label>Employee Name<input name="name" type="text" placeholder="Employee name" required /></label>
+                <label>Role<input name="role" type="text" placeholder="Counter Staff" required /></label>
+                <label>Email<input name="email" type="email" placeholder="employee@example.com" /></label>
+                <label>Access Role<select name="role_key">{employeeRoleOptions.map((role) => <option key={role.role_key} value={role.role_key}>{role.name || role.role_key}</option>)}</select></label>
+                <label>Phone<input name="phone" type="tel" placeholder="Phone number" /></label>
+                <label>Status<select name="status"><option>Active</option><option>Inactive</option></select></label>
+                <label>Monthly Salary<input name="salary" type="number" min="0" step="0.01" placeholder="0.00" /></label>
+                <label>Permissions<select name="permissions"><option>Billing</option><option>Billing + Inventory</option><option>Manager</option><option>Accounts</option></select></label>
+                <label>Aadhaar Card<input name="aadhar_file" type="file" accept="image/*,.pdf" /></label>
+                <label>PAN Card<input name="pan_file" type="file" accept="image/*,.pdf" /></label>
+                <label className="module-span-2">Address<textarea name="address" rows="2" placeholder="Employee address"></textarea></label>
+              </div>
+              <div className="modal-actions"><button type="submit" className="button button-primary">Save Employee</button></div>
+            </form>
+          </section>
+          <section className="panel employee-list-panel">
+            <div className="panel-header"><div><h2>Employee Records</h2><div className="panel-subtitle">Compact staff list with daily attendance controls.</div></div></div>
+            <div className="employee-table-shell">{employees.length ? (
+              <table className="data-table employee-table">
+                <thead>
+                  <tr><th>Name</th><th>Role</th><th>Contact</th><th>Salary</th><th>Status</th><th>Attendance</th><th>Docs</th><th>Actions</th></tr>
+                </thead>
+                <tbody>
+                  {employees.map((employee) => {
+                    const attendanceToday = (employee.attendance || []).find((entry) => entry.date === todayISO());
+                    return (
+                      <tr key={employee.id}>
+                        <td><strong>{employee.name}</strong><span>{employee.address || "Address not added"}</span></td>
+                        <td>{employee.role}<span>{employee.roleKey || employee.permissions || "Billing"}</span></td>
+                        <td>{employee.phone || "No phone"}<span>{employee.email || "No email"} | {employee.authStatus || "Local record"}</span></td>
+                        <td>{currency(employee.salary || 0)}</td>
+                        <td><span className="record-chip">{employee.status}</span></td>
+                        <td>
+                          <div className="attendance-actions compact">
+                            <span>{attendanceToday?.status || "Not marked"}</span>
+                            {["Present", "Absent", "Half Day"].map((status) => (
+                              <button key={status} className="button button-secondary file-action" type="button" onClick={() => markEmployeeAttendance(employee.id, status)}>{status}</button>
+                            ))}
+                          </div>
+                        </td>
+                        <td>
+                          <div className="employee-doc-actions">
+                            {employee.aadharFileData ? <FileAction record={{ fileData: employee.aadharFileData, fileName: employee.aadharFileName }} label="Aadhaar" /> : <span>Aadhaar missing</span>}
+                            {employee.panFileData ? <FileAction record={{ fileData: employee.panFileData, fileName: employee.panFileName }} label="PAN" /> : <span>PAN missing</span>}
+                          </div>
+                        </td>
+                        <td><button type="button" className="button button-danger file-action" onClick={() => deleteEmployee(employee.id)}>Delete</button></td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            ) : <Empty>No employees saved yet.</Empty>}</div>
+          </section>
+        </div>
       </section>
     );
   }
@@ -3805,11 +6171,243 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     ];
     const workspaceRecordTotal = backupModuleSummary.reduce((total, [, value]) => total + Number(value || 0), 0) + workspaceStats.customers + workspaceStats.invoices;
 
+    function getDraftBusinesses(currentDraft = draft) {
+      const activeId = cleanText(currentDraft.activeBusinessId, "primary");
+      const primary = {
+        id: "primary",
+        name: cleanText(currentDraft.businessName, defaultSettings.businessName),
+        ownerName: cleanText(currentDraft.ownerName, defaultSettings.ownerName),
+        phone: cleanText(currentDraft.businessPhone),
+        email: cleanText(currentDraft.businessEmail),
+        address: cleanText(currentDraft.businessAddress),
+        gstin: cleanText(currentDraft.gstin).toUpperCase(),
+        logo: currentDraft.storeLogo || currentDraft.storeLogoUrl || "",
+        status: "Active"
+      };
+      const list = Array.isArray(currentDraft.businesses) && currentDraft.businesses.length
+        ? currentDraft.businesses
+        : [primary];
+      const normalized = list.map((business, index) => ({
+        ...primary,
+        ...business,
+        id: cleanText(business.id, index === 0 ? "primary" : `business-${index + 1}`),
+        name: cleanText(business.name, index === 0 ? primary.name : `Business ${index + 1}`)
+      }));
+      if (!normalized.some((business) => business.id === activeId)) {
+        normalized.unshift({ ...primary, id: activeId || "primary" });
+      }
+      return normalized.map((business) => (
+        business.id === activeId
+          ? {
+              ...business,
+              name: primary.name,
+              ownerName: primary.ownerName,
+              phone: primary.phone,
+              email: primary.email,
+              address: primary.address,
+              gstin: primary.gstin,
+              logo: primary.logo
+            }
+          : business
+      ));
+    }
+
+    function getDraftWarehouses(currentDraft = draft) {
+      const activeBusiness = cleanText(currentDraft.activeBusinessId, "primary");
+      const fallback = {
+        id: "main",
+        name: "Main Warehouse",
+        businessId: activeBusiness,
+        location: cleanText(currentDraft.businessAddress),
+        status: "Active"
+      };
+      const list = Array.isArray(currentDraft.warehouses) && currentDraft.warehouses.length
+        ? currentDraft.warehouses
+        : [fallback];
+      return list.map((warehouse, index) => ({
+        ...fallback,
+        ...warehouse,
+        id: cleanText(warehouse.id, index === 0 ? "main" : `warehouse-${index + 1}`),
+        name: cleanText(warehouse.name, index === 0 ? "Main Warehouse" : `Warehouse ${index + 1}`),
+        businessId: cleanText(warehouse.businessId || warehouse.business_id, activeBusiness),
+        status: cleanText(warehouse.status, "Active")
+      }));
+    }
+
+    function switchDraftBusiness(businessId) {
+      setDraft((current) => {
+        const businesses = getDraftBusinesses(current);
+        const selectedBusiness = businesses.find((business) => business.id === businessId) || businesses[0];
+        return {
+          ...current,
+          businesses,
+          activeBusinessId: selectedBusiness.id,
+          businessName: selectedBusiness.name,
+          ownerName: selectedBusiness.ownerName,
+          businessPhone: selectedBusiness.phone,
+          businessEmail: selectedBusiness.email,
+          businessAddress: selectedBusiness.address,
+          gstin: selectedBusiness.gstin,
+          storeLogo: selectedBusiness.logo || "",
+          storeLogoUrl: "",
+          logoName: selectedBusiness.logo ? `${selectedBusiness.name} logo` : current.logoName
+        };
+      });
+    }
+
+    function createDraftBusiness() {
+      const id = `business-${Date.now()}`;
+      const nextBusiness = {
+        id,
+        name: `New Business ${getDraftBusinesses().length + 1}`,
+        ownerName: "Billing Workspace",
+        phone: "",
+        email: "",
+        address: "",
+        gstin: "",
+        logo: "",
+        status: "Active"
+      };
+      setDraft((current) => ({
+        ...current,
+        businesses: [...getDraftBusinesses(current), nextBusiness],
+        activeBusinessId: id,
+        businessName: nextBusiness.name,
+        ownerName: nextBusiness.ownerName,
+        businessPhone: "",
+        businessEmail: "",
+        businessAddress: "",
+        gstin: "",
+        storeLogo: "",
+        storeLogoUrl: "",
+        logoName: ""
+      }));
+    }
+
+    function updateDraftBusiness(businessId, patch) {
+      setDraft((current) => {
+        const nextBusinesses = getDraftBusinesses(current).map((business) => (
+          business.id === businessId ? { ...business, ...patch } : business
+        ));
+        const selectedBusiness = nextBusinesses.find((business) => business.id === (current.activeBusinessId || "primary"));
+        return {
+          ...current,
+          businesses: nextBusinesses,
+          ...(selectedBusiness ? {
+            businessName: selectedBusiness.name,
+            ownerName: selectedBusiness.ownerName,
+            businessPhone: selectedBusiness.phone,
+            businessEmail: selectedBusiness.email,
+            businessAddress: selectedBusiness.address,
+            gstin: selectedBusiness.gstin,
+            storeLogo: selectedBusiness.logo || current.storeLogo
+          } : {})
+        };
+      });
+    }
+
+    function deleteDraftBusiness(businessId) {
+      const businesses = getDraftBusinesses();
+      if (businesses.length <= 1) {
+        showMessage("Keep at least one business in the workspace.");
+        return;
+      }
+      const business = businesses.find((entry) => entry.id === businessId);
+      if (!window.confirm(`Delete ${business?.name || "this business"} from this workspace? Inventory records stay saved, but this business profile will be removed.`)) {
+        return;
+      }
+      setDraft((current) => {
+        const nextBusinesses = getDraftBusinesses(current).filter((entry) => entry.id !== businessId);
+        const nextActive = nextBusinesses[0];
+        return {
+          ...current,
+          businesses: nextBusinesses,
+          warehouses: getDraftWarehouses(current).filter((warehouse) => warehouse.businessId !== businessId),
+          activeBusinessId: nextActive.id,
+          businessName: nextActive.name,
+          ownerName: nextActive.ownerName,
+          businessPhone: nextActive.phone,
+          businessEmail: nextActive.email,
+          businessAddress: nextActive.address,
+          gstin: nextActive.gstin,
+          storeLogo: nextActive.logo || "",
+          storeLogoUrl: ""
+        };
+      });
+    }
+
+    function createDraftWarehouse() {
+      const id = `warehouse-${Date.now()}`;
+      setDraft((current) => ({
+        ...current,
+        warehouses: [
+          ...getDraftWarehouses(current),
+          {
+            id,
+            name: `Warehouse ${getDraftWarehouses(current).length + 1}`,
+            businessId: cleanText(current.activeBusinessId, "primary"),
+            location: "",
+            status: "Active"
+          }
+        ],
+        activeWarehouseId: id
+      }));
+    }
+
+    function updateDraftWarehouse(warehouseId, patch) {
+      setDraft((current) => ({
+        ...current,
+        warehouses: getDraftWarehouses(current).map((warehouse) => (
+          warehouse.id === warehouseId ? { ...warehouse, ...patch } : warehouse
+        ))
+      }));
+    }
+
+    function setDraftPrintProfile(paperSize, layout) {
+      setDraft((current) => ({
+        ...current,
+        printPaperSize: paperSize,
+        printLayout: layout
+      }));
+    }
+
+    function updateDraftPrintCalibration(field, value) {
+      setDraft((current) => {
+        const key = getPrintProfileKey(current.printPaperSize, current.printLayout);
+        const currentCalibration = normalizePrintCalibration(current.printCalibrationProfiles?.[key]);
+        return {
+          ...current,
+          printCalibrationProfiles: {
+            ...(current.printCalibrationProfiles || {}),
+            [key]: normalizePrintCalibration({
+              ...currentCalibration,
+              [field]: value
+            })
+          }
+        };
+      });
+    }
+
+    function resetDraftPrintCalibration() {
+      setDraft((current) => {
+        const key = getPrintProfileKey(current.printPaperSize, current.printLayout);
+        return {
+          ...current,
+          printCalibrationProfiles: {
+            ...(current.printCalibrationProfiles || {}),
+            [key]: { ...DEFAULT_PRINT_CALIBRATION }
+          }
+        };
+      });
+    }
+
     function saveSettings(event) {
       event?.preventDefault();
       const sanitizedStartupView = navigationViews.some((view) => view.id === draft.startupView)
         ? draft.startupView
         : defaultSettings.startupView;
+      const sanitizedBusinesses = getDraftBusinesses();
+      const sanitizedWarehouses = getDraftWarehouses();
       setSettings({
         ...draft,
         businessName: cleanText(draft.businessName, defaultSettings.businessName),
@@ -3826,10 +6424,43 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         printPaperSize: cleanText(draft.printPaperSize, defaultSettings.printPaperSize),
         printLayout: cleanText(draft.printLayout, defaultSettings.printLayout),
         printMargin: cleanText(draft.printMargin, defaultSettings.printMargin),
+        printCalibrationProfiles: draft.printCalibrationProfiles && typeof draft.printCalibrationProfiles === "object" ? draft.printCalibrationProfiles : {},
         printFooter: cleanText(draft.printFooter),
         printShopLogoOnBill: Boolean(draft.printShopLogoOnBill),
+        printReceiptTemplate: cleanText(draft.printReceiptTemplate, defaultSettings.printReceiptTemplate),
+        printShowGSTNumber: draft.printShowGSTNumber !== false,
+        printShowCustomerDetails: draft.printShowCustomerDetails !== false,
+        printShowTaxBreakdown: draft.printShowTaxBreakdown !== false,
+        printShowHSN: Boolean(draft.printShowHSN),
+        printShowSavings: draft.printShowSavings !== false,
+        printShowPaymentDetails: draft.printShowPaymentDetails !== false,
+        printShowQRCode: Boolean(draft.printShowQRCode),
+        printShowFooterMessage: draft.printShowFooterMessage !== false,
+        printShowTerms: draft.printShowTerms !== false,
+        printShowCashierName: draft.printShowCashierName !== false,
+        printShowCounterName: draft.printShowCounterName !== false,
+        printFssai: cleanText(draft.printFssai),
+        printWebsite: cleanText(draft.printWebsite),
+        printCashierName: cleanText(draft.printCashierName, defaultSettings.printCashierName),
+        printCounterName: cleanText(draft.printCounterName, defaultSettings.printCounterName),
+        printOrderType: cleanText(draft.printOrderType, defaultSettings.printOrderType),
+        printTermsAndConditions: cleanText(draft.printTermsAndConditions || draft.printFooterTerms),
+        printFooterTerms: cleanText(draft.printFooterTerms),
+        printRefundPolicy: cleanText(draft.printRefundPolicy),
+        printReturnPolicy: cleanText(draft.printReturnPolicy),
+        printExchangePolicy: cleanText(draft.printExchangePolicy),
+        printWarrantyInfo: cleanText(draft.printWarrantyInfo),
+        printVisitAgainMessage: cleanText(draft.printVisitAgainMessage),
+        printSocialMedia: cleanText(draft.printSocialMedia),
+        printLoyaltyMessage: cleanText(draft.printLoyaltyMessage),
         autoPrintAfterBilling: Boolean(draft.autoPrintAfterBilling),
-        showPreviewWatermark: draft.showPreviewWatermark !== false
+        showPreviewWatermark: draft.showPreviewWatermark !== false,
+        businesses: sanitizedBusinesses,
+        activeBusinessId: cleanText(draft.activeBusinessId, "primary"),
+        warehouses: sanitizedWarehouses,
+        activeWarehouseId: cleanText(draft.activeWarehouseId, "main"),
+        supportEmail: cleanText(draft.supportEmail, SUPPORT_EMAIL),
+        supportPhone: cleanText(draft.supportPhone, SUPPORT_PHONE)
       });
       showMessage("Settings saved.");
     }
@@ -3852,6 +6483,8 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
           storeDocuments,
           employees,
           sellOnlineCatalog,
+          invoiceDetails,
+          supportRequests,
           posState
         }
       };
@@ -3889,6 +6522,8 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         setStoreDocuments(Array.isArray(snapshot.storeDocuments) ? snapshot.storeDocuments : []);
         setEmployees(Array.isArray(snapshot.employees) ? snapshot.employees : []);
         setSellOnlineCatalog(snapshot.sellOnlineCatalog && typeof snapshot.sellOnlineCatalog === "object" ? snapshot.sellOnlineCatalog : {});
+        setInvoiceDetails(snapshot.invoiceDetails && typeof snapshot.invoiceDetails === "object" ? snapshot.invoiceDetails : {});
+        setSupportRequests(Array.isArray(snapshot.supportRequests) ? snapshot.supportRequests : []);
         setPosState(snapshot.posState ? { ...makeInitialPOSState(), ...snapshot.posState } : makeInitialPOSState());
         setDataTransferResult(null);
         setTransferDrafts(makeTransferDraftState());
@@ -3928,13 +6563,20 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                 <span className="account-avatar">{account.loggedIn ? cleanText(account.name, "Operator").charAt(0).toUpperCase() : "?"}</span>
                 <div>
                   <strong>{account.loggedIn ? cleanText(account.name, "Operator") : "Not logged in"}</strong>
-                  <span>{account.loggedIn ? (account.contact || "Signed in on this counter") : "Login or Sign Up to save account info for this device."}</span>
+                  <span>{account.loggedIn ? (account.contact || `${authState.role} access`) : "Login or Sign Up to sync account access securely."}</span>
                 </div>
               </div>
               <div className="account-actions">
                 <button className="button button-primary" type="button" hidden={account.loggedIn} onClick={() => openModal("login")}>Login or Sign Up</button>
-                <button className="button button-secondary" type="button" hidden={!account.loggedIn} onClick={() => { setAccount(defaultAccount); showMessage("Logged out."); }}>Logout</button>
+                <button className="button button-secondary" type="button" hidden={!account.loggedIn} onClick={() => openClerkFlow("profile")}>MFA & Sessions</button>
+                <button className="button button-secondary" type="button" hidden={!account.loggedIn} onClick={signOutOfAuth}>Logout</button>
               </div>
+            </div>
+            <div className="settings-metric-grid">
+              <article className="settings-metric"><strong>{authState.role}</strong><span>Role</span></article>
+              <article className="settings-metric"><strong>{authState.businessId}</strong><span>Business</span></article>
+              <article className="settings-metric"><strong>{authState.warehouseId}</strong><span>Warehouse</span></article>
+              <article className="settings-metric"><strong>{authState.offline ? "Offline" : "Online"}</strong><span>Session Mode</span></article>
             </div>
             <div className="settings-metric-grid">
               {apiModuleSummary.map(([label, value]) => (
@@ -3944,13 +6586,15 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                 </article>
               ))}
             </div>
-            <p className="settings-help">Account login is local to this counter right now. Billing data continues to stay in the Flask billing API, while device modules stay inside the workspace storage.</p>
+            <p className="settings-help">Clerk handles email/password, verification, password reset, Google sign-in, MFA, and device sessions. CinchPOS stores only an encrypted offline access cache for already authenticated POS operators.</p>
           </section>
         );
       }
 
       if (activeSettingsSection === "business") {
         const businessStatus = draft.gstin ? "GST Ready" : "Basic Setup";
+        const draftBusinesses = getDraftBusinesses();
+        const draftWarehouses = getDraftWarehouses();
         return (
           <section className="settings-section">
             <h4>Business Management</h4>
@@ -4005,21 +6649,58 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
               </div>
               <button className="button button-secondary" type="button" onClick={() => setDraft((current) => ({ ...current, storeLogo: "", storeLogoUrl: "", logoName: "" }))}>Remove Logo</button>
             </div>
-            <div className="record-list">
-              <article className="record-card">
+            <div className="management-dashboard">
+              <article className="record-card management-card">
                 <div className="record-top">
                   <div>
-                    <h3>Additional Business & Logo</h3>
-                    <p className="record-meta">Another logo can be added only when another business is created under this account.</p>
+                    <h3>Businesses</h3>
+                    <p className="record-meta">Create, edit, delete, and switch business profiles. Each business can keep its own logo once selected.</p>
                   </div>
-                  <span className="record-chip">Chargeable</span>
+                  <button type="button" className="button button-primary" onClick={createDraftBusiness}>Create New Business</button>
                 </div>
-                <div className="record-meta-grid">
-                  <span>Multi-business management is not included in the standard build.</span>
-                  <span>Each added business can keep its own logo after the add-on is enabled.</span>
+                <div className="management-list">
+                  {draftBusinesses.map((business) => (
+                    <article className={`management-row ${business.id === (draft.activeBusinessId || "primary") ? "active" : ""}`} key={business.id}>
+                      <div className="management-grid">
+                        <label>Business Name<input type="text" value={business.name} onChange={(event) => updateDraftBusiness(business.id, { name: event.target.value })} /></label>
+                        <label>Phone<input type="tel" value={business.phone || ""} onChange={(event) => updateDraftBusiness(business.id, { phone: event.target.value })} /></label>
+                        <label>Email<input type="email" value={business.email || ""} onChange={(event) => updateDraftBusiness(business.id, { email: event.target.value })} /></label>
+                        <label>GSTIN<input type="text" value={business.gstin || ""} onChange={(event) => updateDraftBusiness(business.id, { gstin: event.target.value.toUpperCase() })} /></label>
+                      </div>
+                      <label>Address<textarea rows="2" value={business.address || ""} onChange={(event) => updateDraftBusiness(business.id, { address: event.target.value })}></textarea></label>
+                      <div className="management-actions">
+                        <span className="record-chip">{business.id === (draft.activeBusinessId || "primary") ? "Current business" : "Available"}</span>
+                        <button type="button" className="button button-secondary" onClick={() => switchDraftBusiness(business.id)}>Switch</button>
+                        <button type="button" className="button button-secondary" onClick={() => deleteDraftBusiness(business.id)} disabled={draftBusinesses.length <= 1}>Delete</button>
+                      </div>
+                    </article>
+                  ))}
                 </div>
-                <div className="record-actions">
-                  <button className="button button-secondary" type="button" disabled>Paid Add-on Required</button>
+              </article>
+              <article className="record-card management-card">
+                <div className="record-top">
+                  <div>
+                    <h3>Warehouses</h3>
+                    <p className="record-meta">Create warehouse locations and assign inventory to the active warehouse from Inventory.</p>
+                  </div>
+                  <button type="button" className="button button-primary" onClick={createDraftWarehouse}>Create Warehouse</button>
+                </div>
+                <div className="management-list">
+                  {draftWarehouses.map((warehouse) => (
+                    <article className={`management-row ${warehouse.id === (draft.activeWarehouseId || "main") ? "active" : ""}`} key={warehouse.id}>
+                      <div className="management-grid">
+                        <label>Warehouse Name<input type="text" value={warehouse.name} onChange={(event) => updateDraftWarehouse(warehouse.id, { name: event.target.value })} /></label>
+                        <label>Business<select value={warehouse.businessId} onChange={(event) => updateDraftWarehouse(warehouse.id, { businessId: event.target.value })}>{draftBusinesses.map((business) => <option key={business.id} value={business.id}>{business.name}</option>)}</select></label>
+                        <label>Status<select value={warehouse.status} onChange={(event) => updateDraftWarehouse(warehouse.id, { status: event.target.value })}><option>Active</option><option>Inactive</option></select></label>
+                        <label>Location<input type="text" value={warehouse.location || ""} onChange={(event) => updateDraftWarehouse(warehouse.id, { location: event.target.value })} /></label>
+                      </div>
+                      <div className="management-actions">
+                        <span className="record-chip">{warehouse.status}</span>
+                        <button type="button" className="button button-secondary" onClick={() => setDraft((current) => ({ ...current, activeWarehouseId: warehouse.id }))}>Switch</button>
+                        <button type="button" className="button button-secondary" onClick={() => updateDraftWarehouse(warehouse.id, { status: "Inactive" })}>Deactivate</button>
+                      </div>
+                    </article>
+                  ))}
                 </div>
               </article>
             </div>
@@ -4081,55 +6762,150 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       }
 
       if (activeSettingsSection === "printing") {
+        const activePrintProfile = getPrintProfile(draft.printPaperSize, draft.printLayout);
+        const activePrintCalibration = getCalibrationForSettings(draft);
+        const previewPayload = buildSamplePrintPayload(draft, cleanText(draft.businessName, businessName), cleanText(draft.ownerName, ownerName), storeLogoSource);
+        const printLayoutValue = draft.printLayout || getPrintProfile(draft.printPaperSize).layout;
+        const receiptToggleOptions = [
+          ["printShowGSTNumber", "GST number", "Show GSTIN/FSSAI in the header.", true],
+          ["printShowCustomerDetails", "Customer details", "Show customer name, mobile, and GST when available.", true],
+          ["printShowTaxBreakdown", "Tax summary", "Show rate-wise GST totals after item rows.", true],
+          ["printShowSavings", "Savings line", "Show total savings when discounts are applied.", true],
+          ["printShowFooterMessage", "Footer message", "Show the saved thank-you footer.", true],
+          ["printShowTerms", "Notes and terms", "Show invoice notes and Terms & Conditions below the totals.", true]
+        ];
+        const receiptTextFields = [];
+        const receiptPolicyFields = [
+          ["printTermsAndConditions", "Terms & Conditions", "Goods once sold cannot be returned.", "printFooterTerms"]
+        ];
         return (
           <section className="settings-section">
             <h4>Printing</h4>
-            <div className="form-grid settings-form-grid">
-              <label>Paper Size<select name="printPaperSize" value={draft.printPaperSize || "80mm"} onChange={(event) => {
-                const nextPaperSize = event.target.value;
-                const profile = getPrintProfile(nextPaperSize);
-                setDraft((current) => ({ ...current, printPaperSize: nextPaperSize, printLayout: profile.layout }));
-              }}><option value="58mm">58mm Thermal Receipt</option><option value="76mm">76mm Thermal Receipt</option><option value="80mm">80mm Thermal Receipt</option><option value="A5">A5 Invoice</option><option value="A4">A4 Invoice</option><option value="Letter">Letter Invoice</option></select></label>
-              <label>Print Layout<select name="printLayout" value={draft.printLayout || getPrintProfile(draft.printPaperSize).layout} onChange={(event) => setDraft((current) => ({ ...current, printLayout: event.target.value }))}><option value="thermal">Thermal Compact</option><option value="invoice">Invoice Page</option></select></label>
-              <label>Print Margin<select name="printMargin" value={draft.printMargin || "default"} onChange={(event) => setDraft((current) => ({ ...current, printMargin: event.target.value }))}><option value="default">Recommended Margin</option><option value="none">No App Margin</option></select></label>
-              <label>Print Footer<input name="printFooter" type="text" value={draft.printFooter || ""} onChange={(event) => setDraft((current) => ({ ...current, printFooter: event.target.value }))} /></label>
+            <div className="print-preview-section">
+              <div className="panel-header">
+                <div>
+                  <h3>Print Preview & Calibration</h3>
+                  <p className="record-meta">{activePrintProfile.layout === "thermal" ? "Thermal receipt preview uses real 58mm/80mm proportions." : "Standard bill preview uses full invoice columns."} Margin and scale changes update instantly.</p>
+                </div>
+                <div className="segmented-control print-preview-switch">
+                  <button type="button" className={activePrintProfile.layout === "thermal" ? "active" : ""} onClick={() => setDraftPrintProfile("80mm", "thermal")}>Thermal Printing</button>
+                  <button type="button" className={activePrintProfile.layout === "invoice" ? "active" : ""} onClick={() => setDraftPrintProfile("A4", "invoice")}>Standard Printing</button>
+                </div>
+              </div>
+              <div className="print-settings-card">
+                <div className="settings-inline-heading">
+                  <h5>Printer Profile</h5>
+                  <span>{activePrintProfile.label}</span>
+                </div>
+                <div className="print-profile-grid">
+                  <label>Paper Size<select name="printPaperSize" value={draft.printPaperSize || "80mm"} onChange={(event) => {
+                    const nextPaperSize = event.target.value;
+                    const profile = getPrintProfile(nextPaperSize);
+                    setDraft((current) => ({ ...current, printPaperSize: nextPaperSize, printLayout: profile.layout }));
+                  }}><option value="58mm">58mm Thermal Bill</option><option value="80mm">80mm Thermal Bill</option><option value="A5">A5 Standard Bill</option><option value="A4">A4 Standard Bill</option><option value="Letter">Letter Standard Bill</option></select></label>
+                  <label>Print Layout<select name="printLayout" value={printLayoutValue} onChange={(event) => setDraft((current) => ({ ...current, printLayout: event.target.value }))}><option value="thermal">Thermal Receipt</option><option value="invoice">Standard Invoice</option></select></label>
+                  <label>Receipt Format<input type="text" value={printLayoutValue === "invoice" ? "Standard Invoice" : "Thermal Tax Invoice"} readOnly /></label>
+                  <label>Print Margin<select name="printMargin" value={draft.printMargin || "default"} onChange={(event) => setDraft((current) => ({ ...current, printMargin: event.target.value }))}><option value="default">Recommended Margin</option><option value="none">No App Margin</option></select></label>
+                </div>
+              </div>
+              <div className="print-settings-card">
+                <div className="settings-inline-heading">
+                  <h5>Calibration</h5>
+                  <span>Saved separately for each printer profile</span>
+                </div>
+                <div className="print-calibration-grid">
+                  {[
+                    ["top", "Top"],
+                    ["bottom", "Bottom"],
+                    ["left", "Left"],
+                    ["right", "Right"]
+                  ].map(([field, label]) => (
+                    <label key={field}>{label}<input type="number" min="-20" max="40" step="1" value={activePrintCalibration[field]} onChange={(event) => updateDraftPrintCalibration(field, event.target.value)} /></label>
+                  ))}
+                  <label>Scale<input type="number" min="70" max="130" step="1" value={activePrintCalibration.scale} onChange={(event) => updateDraftPrintCalibration("scale", event.target.value)} /></label>
+                  <button type="button" className="button button-secondary" onClick={resetDraftPrintCalibration}>Reset</button>
+                </div>
+              </div>
+              <div className="print-settings-card">
+                <div className="settings-inline-heading">
+                  <h5>Receipt Content</h5>
+                  <span>Controls thermal and standard bill data</span>
+                </div>
+                <div className="receipt-text-grid">
+                  {receiptTextFields.map(([key, label, placeholder]) => (
+                    <label key={key}>{label}<input name={key} type="text" value={draft[key] || ""} placeholder={placeholder} onChange={(event) => setDraft((current) => ({ ...current, [key]: event.target.value }))} /></label>
+                  ))}
+                  <label className="settings-span-2">Footer Message<input name="printFooter" type="text" value={draft.printFooter || ""} placeholder="Thank you for shopping with us." onChange={(event) => setDraft((current) => ({ ...current, printFooter: event.target.value }))} /></label>
+                </div>
+                <div className="receipt-toggle-grid">
+                  {receiptToggleOptions.map(([key, title, description, defaultOn]) => (
+                    <label className="settings-check receipt-toggle" key={key}>
+                      <input
+                        name={key}
+                        type="checkbox"
+                        checked={defaultOn ? draft[key] !== false : Boolean(draft[key])}
+                        onChange={(event) => setDraft((current) => ({ ...current, [key]: event.target.checked }))}
+                      />
+                      <span>
+                        <strong>{title}</strong>
+                        <small>{description}</small>
+                      </span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+              <div className="print-settings-card">
+                <div className="settings-inline-heading">
+                  <h5>Notes & Terms</h5>
+                  <span>Printed only when Notes and policies is enabled</span>
+                </div>
+                <div className="receipt-policy-grid">
+                  {receiptPolicyFields.map(([key, label, placeholder, fallbackKey]) => (
+                    <label key={key}>{label}<textarea name={key} rows="3" value={draft[key] || (fallbackKey ? draft[fallbackKey] : "") || ""} placeholder={placeholder} onChange={(event) => setDraft((current) => ({ ...current, [key]: event.target.value, ...(fallbackKey ? { [fallbackKey]: event.target.value } : {}) }))}></textarea></label>
+                  ))}
+                </div>
+              </div>
+              <PrintPreviewDocument payload={previewPayload} />
+              <p className="settings-help">Calibration is saved per printer profile, for example 80mm Thermal Bill and A4 Standard Bill keep separate margin and scale values.</p>
             </div>
-            <label className="settings-check">
-              <input
-                name="printShopLogoOnBill"
-                type="checkbox"
-                checked={Boolean(draft.printShopLogoOnBill)}
-                onChange={(event) => setDraft((current) => ({ ...current, printShopLogoOnBill: event.target.checked }))}
-              />
-              <span>
-                <strong>Print shop logo on bill</strong>
-                <small>Uses the current business logo at the top of thermal receipts and invoice pages.</small>
-              </span>
-            </label>
-            <label className="settings-check">
-              <input
-                name="autoPrintAfterBilling"
-                type="checkbox"
-                checked={Boolean(draft.autoPrintAfterBilling)}
-                onChange={(event) => setDraft((current) => ({ ...current, autoPrintAfterBilling: event.target.checked }))}
-              />
-              <span>
-                <strong>Auto print after complete billing</strong>
-                <small>The regular Complete Billing action will also open the print window when this is enabled.</small>
-              </span>
-            </label>
-            <label className="settings-check">
-              <input
-                name="showPreviewWatermark"
-                type="checkbox"
-                checked={draft.showPreviewWatermark !== false}
-                onChange={(event) => setDraft((current) => ({ ...current, showPreviewWatermark: event.target.checked }))}
-              />
-              <span>
-                <strong>Show watermark in bill preview</strong>
-                <small>This affects only the on-screen CinchPOS bill preview. It does not print on the receipt.</small>
-              </span>
-            </label>
+            <div className="printing-option-grid">
+              <label className="settings-check">
+                <input
+                  name="printShopLogoOnBill"
+                  type="checkbox"
+                  checked={Boolean(draft.printShopLogoOnBill)}
+                  onChange={(event) => setDraft((current) => ({ ...current, printShopLogoOnBill: event.target.checked }))}
+                />
+                <span>
+                  <strong>Print shop logo on bill</strong>
+                  <small>Uses the current business logo at the top of thermal receipts and invoice pages.</small>
+                </span>
+              </label>
+              <label className="settings-check">
+                <input
+                  name="autoPrintAfterBilling"
+                  type="checkbox"
+                  checked={Boolean(draft.autoPrintAfterBilling)}
+                  onChange={(event) => setDraft((current) => ({ ...current, autoPrintAfterBilling: event.target.checked }))}
+                />
+                <span>
+                  <strong>Auto print after complete billing</strong>
+                  <small>The regular Complete Billing action will also open the print window when this is enabled.</small>
+                </span>
+              </label>
+              <label className="settings-check">
+                <input
+                  name="showPreviewWatermark"
+                  type="checkbox"
+                  checked={draft.showPreviewWatermark !== false}
+                  onChange={(event) => setDraft((current) => ({ ...current, showPreviewWatermark: event.target.checked }))}
+                />
+                <span>
+                  <strong>Show watermark in bill preview</strong>
+                  <small>This affects only the on-screen CinchPOS bill preview. It does not print on the receipt.</small>
+                </span>
+              </label>
+            </div>
             <div className="settings-metric-grid">
               <article className="settings-metric"><strong>{getPrintProfile(draft.printPaperSize).label}</strong><span>Paper profile</span></article>
               <article className="settings-metric"><strong>{(draft.printLayout || getPrintProfile(draft.printPaperSize).layout) === "invoice" ? "Invoice" : "Thermal"}</strong><span>Layout mode</span></article>
@@ -4242,25 +7018,82 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         return (
           <section className="settings-section">
             <h4>Support</h4>
+            <div className="support-center-grid">
+              <form className="support-request-form" onSubmit={submitSupportRequest}>
+                <div className="panel-header">
+                  <div>
+                    <h3>Contact Us</h3>
+                    <p className="record-meta">Send support requests, bug reports, and feature requests from this workspace.</p>
+                  </div>
+                </div>
+                <div className="form-grid settings-form-grid">
+                  <label>Request Type<select value={supportDraft.type} onChange={(event) => updateSupportDraft("type", event.target.value)}>
+                    <option>Support Request</option>
+                    <option>Bug Report</option>
+                    <option>Feature Request</option>
+                    <option>Data Migration Help</option>
+                  </select></label>
+                  <label>Name<input type="text" value={supportDraft.name} onChange={(event) => updateSupportDraft("name", event.target.value)} placeholder="Your name" required /></label>
+                  <label>Email<input type="email" value={supportDraft.email} onChange={(event) => updateSupportDraft("email", event.target.value)} placeholder="Optional if phone is added" /></label>
+                  <label>Phone<input type="tel" value={supportDraft.phone} onChange={(event) => updateSupportDraft("phone", event.target.value)} placeholder="Optional if email is added" /></label>
+                  <label className="settings-span-2">Subject<input type="text" value={supportDraft.subject} onChange={(event) => updateSupportDraft("subject", event.target.value)} placeholder="Short title" required /></label>
+                  <label className="settings-span-2">Message<textarea rows="4" value={supportDraft.message} onChange={(event) => updateSupportDraft("message", event.target.value)} placeholder="Explain what happened or what you need." required></textarea></label>
+                </div>
+                <div className="modal-actions">
+                  <button className="button button-primary" type="submit">Submit Request</button>
+                </div>
+              </form>
+              <aside className="support-side-panel">
+                <article className="record-card">
+                  <h3>Support Contacts</h3>
+                  <div className="record-meta-grid">
+                    <span>Phone {cleanText(draft.supportPhone, SUPPORT_PHONE)}</span>
+                    <span>Email {cleanText(draft.supportEmail, SUPPORT_EMAIL)}</span>
+                  </div>
+                </article>
+                <article className="record-card">
+                  <h3>Support Configuration</h3>
+                  <div className="form-grid settings-form-grid">
+                    <label>Email<input type="email" value={draft.supportEmail || ""} onChange={(event) => setDraft((current) => ({ ...current, supportEmail: event.target.value }))} /></label>
+                    <label>Phone<input type="tel" value={draft.supportPhone || ""} onChange={(event) => setDraft((current) => ({ ...current, supportPhone: event.target.value }))} /></label>
+                  </div>
+                </article>
+                <article className="record-card">
+                  <h3>FAQ</h3>
+                  <details open><summary>How do I get help for importing old data?</summary><p className="record-meta">Open Retrieve Data, choose the old software, upload the export file, review the detected rows, then import only ready records.</p></details>
+                  <details><summary>What should I send for a print issue?</summary><p className="record-meta">Send printer model, paper size, a photo of the bill, and the calibration values from Print Settings.</p></details>
+                  <details><summary>Where is customer and invoice data kept?</summary><p className="record-meta">Customers and invoices are API-backed. Device modules like inventory, support requests, employees, documents, and settings stay in the local workspace backup.</p></details>
+                </article>
+              </aside>
+            </div>
             <div className="record-list settings-card-stack">
               <article className="record-card">
-                <h3>Contact Us</h3>
-                <p className="record-meta">For setup, data import, branding, printing, and billing workflow help.</p>
-                <div className="record-meta-grid"><span>Phone {SUPPORT_PHONE}</span><span>Email {SUPPORT_EMAIL}</span></div>
+                <div className="record-top">
+                  <div>
+                    <h3>Request History</h3>
+                    <p className="record-meta">Local record of support, bug, and feature requests submitted from this device.</p>
+                  </div>
+                  <span className="record-chip">{supportRequests.length} saved</span>
+                </div>
+                {supportRequests.length ? (
+                  <div className="support-request-list">
+                    {supportRequests.slice(0, 8).map((request) => (
+                      <article className="support-request-row" key={request.id}>
+                        <div>
+                          <strong>{request.subject}</strong>
+                          <span>{request.type} | {request.name} | {request.email || request.phone}</span>
+                          <p>{request.message}</p>
+                        </div>
+                        <span className="record-chip">{request.status}</span>
+                      </article>
+                    ))}
+                  </div>
+                ) : <Empty>No support requests saved yet.</Empty>}
               </article>
               <article className="record-card">
-                <h3>Migration Support</h3>
-                <p className="record-meta">Use this when moving from myBillBook, Tally, Vyapar, or a CSV-based billing system.</p>
-                <div className="record-meta-grid"><span>Retrieve Data wizard</span><span>Review-first import flow</span></div>
-              </article>
-              <article className="record-card">
-                <h3>Help Center</h3>
-                <p className="record-meta">Best practice: export a local backup before bulk imports, branding updates, or restoring a migrated workspace.</p>
-                <div className="record-meta-grid"><span>Backup before import</span><span>Verify dashboard after import</span></div>
-              </article>
-              <article className="record-card">
-                <h3>Data Safety</h3>
-                <p className="record-meta">Customer and invoice records are API-backed. Inventory, purchases, expenses, documents, employees, and settings stay in this workspace unless moved explicitly.</p>
+                <h3>Company Information</h3>
+                <p className="record-meta">{APP_NAME} by {APP_COMPANY}</p>
+                <div className="record-meta-grid"><span>Billing Support</span><span>Data Migration</span><span>Printer Calibration</span><span>Feature Requests</span></div>
               </article>
             </div>
           </section>
@@ -4268,6 +7101,12 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       }
 
       if (activeSettingsSection === "app") {
+        const updateStatus = desktopUpdateState.status || "idle";
+        const latestVersion = desktopUpdateState.updateInfo?.version || "";
+        const updateProgress = Math.round(Number(desktopUpdateState.progress?.percent || 0));
+        const updateBusy = updateStatus === "checking" || updateStatus === "downloading";
+        const canDownloadUpdate = updateStatus === "available";
+        const canInstallUpdate = Boolean(desktopUpdateState.canInstall || updateStatus === "downloaded");
         return (
           <section className="settings-section">
             <h4>App Info</h4>
@@ -4284,6 +7123,40 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                   <span className="record-chip">Desktop Ready</span>
                 </div>
                 <div className="record-meta-grid"><span>Next.js Frontend</span><span>Flask Billing API</span><span>Local Workspace Storage</span><span>{appPlatform}</span></div>
+              </article>
+              <article className="record-card">
+                <div className="record-top">
+                  <div>
+                    <h3>App Updates</h3>
+                    <p className="record-meta">{desktopUpdateState.message || "Check for the latest CinchPOS desktop release."}</p>
+                  </div>
+                  <span className={`record-chip ${updateStatus === "available" || updateStatus === "downloaded" ? "warning" : ""}`}>
+                    {updateStatus === "no-update" ? "Up to date" : updateStatus.replace(/-/g, " ")}
+                  </span>
+                </div>
+                <div className="record-meta-grid">
+                  <span>Current {desktopUpdateState.currentVersion || "development"}</span>
+                  <span>Latest {latestVersion || "Not checked"}</span>
+                  <span>{desktopUpdateState.packaged ? "Packaged desktop app" : "Development mode"}</span>
+                  <span>Source {desktopUpdateState.source || "desktop"}</span>
+                </div>
+                {updateStatus === "downloading" ? (
+                  <div className="settings-progress-row">
+                    <progress value={updateProgress} max="100">{updateProgress}%</progress>
+                    <span>{updateProgress}%</span>
+                  </div>
+                ) : null}
+                {Array.isArray(desktopUpdateState.updateInfo?.notes) && desktopUpdateState.updateInfo.notes.length ? (
+                  <ul className="settings-compact-list">
+                    {desktopUpdateState.updateInfo.notes.slice(0, 4).map((note) => <li key={note}>{note}</li>)}
+                  </ul>
+                ) : null}
+                <div className="settings-action-row">
+                  <button type="button" className="button button-secondary" disabled={updateBusy} onClick={() => runDesktopUpdateAction("check")}>Check for Updates</button>
+                  {canDownloadUpdate ? <button type="button" className="button button-primary" onClick={() => runDesktopUpdateAction("download")}>Download Update</button> : null}
+                  {canInstallUpdate ? <button type="button" className="button button-primary" onClick={() => runDesktopUpdateAction("install")}>Install Update</button> : null}
+                  {updateStatus === "downloading" ? <button type="button" className="button button-secondary" onClick={() => runDesktopUpdateAction("cancelDownload")}>Cancel</button> : null}
+                </div>
               </article>
               <article className="record-card">
                 <div className="record-top">
@@ -4311,18 +7184,18 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       return (
         <section className="settings-section">
           <h4>Logout</h4>
-          <p className="settings-help">End the current local operator session for this counter.</p>
+          <p className="settings-help">End the current Clerk session for this counter and clear the encrypted offline access cache.</p>
           <div className="record-list">
             <article className="record-card">
               <div className="record-top">
                 <div>
                   <h3>{account.loggedIn ? cleanText(account.name, "Operator") : "No active operator"}</h3>
-                  <p className="record-meta">{account.loggedIn ? (account.contact || "Signed in on this device") : "Login is currently inactive for this counter."}</p>
+                  <p className="record-meta">{account.loggedIn ? (account.contact || `${authState.role} on ${authState.businessId}`) : "Login is currently inactive for this counter."}</p>
                 </div>
-                <span className="record-chip">{account.loggedIn ? "Active" : "Offline"}</span>
+                <span className="record-chip">{account.loggedIn ? (authState.offline ? "Offline Cache" : "Active") : "Signed Out"}</span>
               </div>
               <div className="record-actions settings-data-actions">
-                <button className="button button-secondary" type="button" disabled={!account.loggedIn} onClick={() => { setAccount(defaultAccount); showMessage("Logged out."); }}>Logout</button>
+                <button className="button button-secondary" type="button" disabled={!account.loggedIn || authBusy} onClick={signOutOfAuth}>Logout</button>
               </div>
             </article>
           </div>

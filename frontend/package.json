@@ -1,6 +1,6 @@
 {
   "name": "cinchpos-frontend",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "description": "CinchPOS desktop billing and ERP app.",
   "author": "CinchLive Technologies Pvt. Ltd.",
   "private": true,
@@ -26,6 +26,8 @@
     "desktop:dist:all": "npm run desktop:dist:mac && npm run desktop:dist:win && npm run desktop:dist:linux"
   },
   "dependencies": {
+    "@clerk/clerk-js": "^6.14.0",
+    "electron-updater": "^6.8.9",
     "xlsx": "^0.18.5"
   },
   "devDependencies": {
@@ -97,6 +99,10 @@
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true
+    },
+    "publish": {
+      "provider": "generic",
+      "url": "https://7aakdg0aolddhlmb.public.blob.vercel-storage.com/updates"
     }
   }
 }

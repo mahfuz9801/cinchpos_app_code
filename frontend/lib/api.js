@@ -1,6 +1,8 @@
 const DEFAULT_API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000";
 const RUNTIME_CONFIG_PATH = "/__cinchpos_runtime.json";
 let runtimeApiBaseUrlPromise = null;
+let authTokenProvider = null;
+let authContextProvider = null;
 
 function wait(delayMs) {
   return new Promise((resolve) => setTimeout(resolve, delayMs));
@@ -9,6 +11,23 @@ function wait(delayMs) {
 function isReadRequest(method) {
   const normalizedMethod = String(method || "GET").toUpperCase();
   return normalizedMethod === "GET" || normalizedMethod === "HEAD";
+}
+
+function isFetchNetworkError(error) {
+  const message = error instanceof Error ? error.message : String(error || "");
+  return error instanceof TypeError || /failed to fetch|network|load failed/i.test(message);
+}
+
+function makeServiceUnavailableError(error) {
+  const serviceError = new Error("Billing service is starting. CinchPOS will reconnect automatically.");
+  serviceError.name = "CinchPOSServiceUnavailableError";
+  serviceError.isNetworkError = true;
+  serviceError.cause = error;
+  return serviceError;
+}
+
+export function isApiNetworkError(error) {
+  return Boolean(error?.isNetworkError) || isFetchNetworkError(error);
 }
 
 async function parseJSON(response) {
@@ -34,12 +53,29 @@ async function resolveApiBaseUrl() {
   }
 
   if (!runtimeApiBaseUrlPromise) {
-    runtimeApiBaseUrlPromise = fetch(RUNTIME_CONFIG_PATH, { cache: "no-store" })
+    runtimeApiBaseUrlPromise = Promise.resolve()
+      .then(async () => {
+        const desktopRuntimeConfig = window.cinchposDesktop?.getRuntimeConfig;
+        if (typeof desktopRuntimeConfig !== "function") {
+          return null;
+        }
+        const payload = await desktopRuntimeConfig();
+        return typeof payload?.apiBaseUrl === "string" && payload.apiBaseUrl
+          ? payload
+          : null;
+      })
+      .catch(() => null)
+      .then((desktopPayload) => {
+        if (desktopPayload?.apiBaseUrl) {
+          return desktopPayload;
+        }
+        return fetch(RUNTIME_CONFIG_PATH, { cache: "no-store" })
       .then(async (response) => {
         if (!response.ok) {
           return null;
         }
         return parseJSON(response);
+          });
       })
       .then((payload) => {
         const apiBaseUrl = typeof payload?.apiBaseUrl === "string" && payload.apiBaseUrl
@@ -54,13 +90,26 @@ async function resolveApiBaseUrl() {
   return runtimeApiBaseUrlPromise;
 }
 
+export function setAuthTokenProvider(provider) {
+  authTokenProvider = typeof provider === "function" ? provider : null;
+}
+
+export function setAuthContextProvider(provider) {
+  authContextProvider = typeof provider === "function" ? provider : null;
+}
+
 export async function fetchJSON(path, options = {}) {
   const apiBaseUrl = await resolveApiBaseUrl();
   const requestUrl = `${apiBaseUrl}${path}`;
+  const token = authTokenProvider ? await authTokenProvider() : "";
+  const authContext = authContextProvider ? authContextProvider() : {};
   const requestOptions = {
     ...options,
     headers: {
       "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(authContext?.businessId ? { "X-CinchPOS-Business-Id": authContext.businessId } : {}),
+      ...(authContext?.warehouseId ? { "X-CinchPOS-Warehouse-Id": authContext.warehouseId } : {}),
       ...(options.headers || {})
     },
     cache: "no-store"
@@ -83,6 +132,9 @@ export async function fetchJSON(path, options = {}) {
       return payload;
     } catch (error) {
       if (!isReadRequest(requestOptions.method) || attempt >= maxAttempts) {
+        if (isFetchNetworkError(error)) {
+          throw makeServiceUnavailableError(error);
+        }
         throw error instanceof Error ? error : new Error("Request failed.");
       }
       await wait(Math.min(1800, 180 + attempt * 140));
@@ -105,6 +157,54 @@ export function getTrend({ view = "weekly", startDate, endDate } = {}) {
     params.set("end_date", endDate);
   }
   return fetchJSON(`/api/dashboard/trend?${params.toString()}`);
+}
+
+export function getAuthContext() {
+  return fetchJSON("/api/auth/context");
+}
+
+export function getAuthBusinesses() {
+  return fetchJSON("/api/auth/businesses");
+}
+
+export function createAuthBusiness(payload) {
+  return fetchJSON("/api/auth/businesses", {
+    method: "POST",
+    body: JSON.stringify(payload)
+  });
+}
+
+export function getAuthWarehouses() {
+  return fetchJSON("/api/auth/warehouses");
+}
+
+export function getAuthRoles() {
+  return fetchJSON("/api/auth/roles");
+}
+
+export function createAuthRole(payload) {
+  return fetchJSON("/api/auth/roles", {
+    method: "POST",
+    body: JSON.stringify(payload)
+  });
+}
+
+export function inviteEmployeeAccount(payload) {
+  return fetchJSON("/api/auth/invitations", {
+    method: "POST",
+    body: JSON.stringify(payload)
+  });
+}
+
+export function createOfflineSession(payload = {}) {
+  return fetchJSON("/api/auth/offline-session", {
+    method: "POST",
+    body: JSON.stringify(payload)
+  });
+}
+
+export function getAuthAuditLogs({ limit = 50 } = {}) {
+  return fetchJSON(`/api/auth/audit?limit=${encodeURIComponent(limit)}`);
 }
 
 export function getCustomers() {
@@ -133,6 +233,12 @@ export function createInvoice(payload) {
   return fetchJSON("/api/invoices", {
     method: "POST",
     body: JSON.stringify(payload)
+  });
+}
+
+export function deleteInvoice(invoiceId) {
+  return fetchJSON(`/api/invoices/${encodeURIComponent(invoiceId)}`, {
+    method: "DELETE"
   });
 }
 
