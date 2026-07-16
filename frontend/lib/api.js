@@ -163,6 +163,31 @@ export function getAuthContext() {
   return fetchJSON("/api/auth/context");
 }
 
+export function getPasswordRules() {
+  return fetchJSON("/api/auth/password-rules");
+}
+
+export function registerCinchAccount(payload) {
+  return fetchJSON("/api/auth/register", {
+    method: "POST",
+    body: JSON.stringify(payload)
+  });
+}
+
+export function loginCinchAccount(payload) {
+  return fetchJSON("/api/auth/login", {
+    method: "POST",
+    body: JSON.stringify(payload)
+  });
+}
+
+export function logoutCinchAccount() {
+  return fetchJSON("/api/auth/logout", {
+    method: "POST",
+    body: JSON.stringify({})
+  });
+}
+
 export function getAuthBusinesses() {
   return fetchJSON("/api/auth/businesses");
 }
@@ -205,6 +230,17 @@ export function createOfflineSession(payload = {}) {
 
 export function getAuthAuditLogs({ limit = 50 } = {}) {
   return fetchJSON(`/api/auth/audit?limit=${encodeURIComponent(limit)}`);
+}
+
+export function getWorkspaceSnapshot() {
+  return fetchJSON("/api/workspace/snapshot");
+}
+
+export function saveWorkspaceSnapshot(payload) {
+  return fetchJSON("/api/workspace/snapshot", {
+    method: "PUT",
+    body: JSON.stringify({ payload })
+  });
 }
 
 export function getCustomers() {

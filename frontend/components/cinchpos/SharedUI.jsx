@@ -134,9 +134,29 @@ export function TrendChart({ points }) {
     ? Math.min(width - tooltipWidth - 8, Math.max(8, activePoint.x - tooltipWidth / 2))
     : 0;
   const tooltipY = activePoint ? Math.max(8, activePoint.y - tooltipHeight - 14) : 0;
+  const labelStride = Math.max(1, Math.ceil(coordinates.length / 8));
+  const updateActivePoint = (event) => {
+    if (!safePoints.length) {
+      setActiveIndex(null);
+      return;
+    }
+    const rect = event.currentTarget.getBoundingClientRect();
+    const relativeX = ((event.clientX - rect.left) / Math.max(1, rect.width)) * width;
+    const nextIndex = stepX
+      ? Math.round((relativeX - padding.left) / stepX)
+      : 0;
+    setActiveIndex(Math.max(0, Math.min(coordinates.length - 1, nextIndex)));
+  };
 
   return (
-    <svg id="trendChart" className="chart-svg" viewBox={`0 0 ${width} ${height}`} aria-label="Revenue trend chart">
+    <svg
+      id="trendChart"
+      className="chart-svg"
+      viewBox={`0 0 ${width} ${height}`}
+      aria-label="Revenue trend chart"
+      onPointerMove={updateActivePoint}
+      onPointerLeave={() => setActiveIndex(null)}
+    >
       <defs>
         <linearGradient id="trendFill" x1="0" x2="0" y1="0" y2="1">
           <stop offset="0%" stopColor="var(--green)" stopOpacity="0.24"></stop>
@@ -152,7 +172,9 @@ export function TrendChart({ points }) {
       {coordinates.map((point, index) => (
         <g key={`${point.label}-${index}`}>
           <circle cx={point.x} cy={point.y} r="4.5" fill="var(--green)"></circle>
-          <text x={point.x} y={height - 14} textAnchor="middle" fill="var(--muted)" fontSize="12">{point.label}</text>
+          {index % labelStride === 0 || index === coordinates.length - 1 ? (
+            <text x={point.x} y={height - 14} textAnchor="middle" fill="var(--muted)" fontSize="12">{point.label}</text>
+          ) : null}
         </g>
       ))}
       {coordinates.map((point, index) => {
@@ -171,7 +193,6 @@ export function TrendChart({ points }) {
             role="button"
             aria-label={`${point.label || "Trend"} ${currency(point.value)}`}
             onPointerEnter={() => setActiveIndex(index)}
-            onPointerLeave={() => setActiveIndex(null)}
             onFocus={() => setActiveIndex(index)}
             onBlur={() => setActiveIndex(null)}
           />

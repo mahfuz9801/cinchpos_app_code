@@ -13,6 +13,7 @@ if BACKEND_DIR not in sys.path:
 
 def load_backend(db_path):
     os.environ["DATABASE_PATH"] = db_path
+    os.environ["CINCHPOS_AUTH_REQUIRED"] = "0"
     sys.modules.pop("app", None)
     import app
 
@@ -28,6 +29,7 @@ class CinchPOSAPITestCase(unittest.TestCase):
 
     def tearDown(self):
         os.environ.pop("DATABASE_PATH", None)
+        os.environ.pop("CINCHPOS_AUTH_REQUIRED", None)
         self.temp_dir.cleanup()
 
     def create_customer(self, name="Northwind", phone="+919876543210"):
@@ -71,6 +73,59 @@ class CinchPOSAPITestCase(unittest.TestCase):
         self.assertEqual(payload["status"], "ok")
         self.assertEqual(payload["schema_version"], self.backend.SCHEMA_VERSION)
         self.assertTrue(payload["database"].endswith(".db"))
+
+    def test_customer_account_register_login_logout_and_snapshot(self):
+        weak_response = self.client.post(
+            "/api/auth/register",
+            json={"customer_id": "testshop", "password": "weak"},
+        )
+        self.assertEqual(weak_response.status_code, 400)
+
+        register_response = self.client.post(
+            "/api/auth/register",
+            json={
+                "customer_id": "testshop",
+                "password": "Strong#123",
+                "name": "Test Shop",
+                "email": "owner@example.com",
+                "business_name": "Test Shop Business",
+            },
+        )
+        self.assertEqual(register_response.status_code, 201)
+        register_payload = register_response.get_json()
+        token = register_payload["token"]
+        self.assertTrue(token.startswith("cinch_"))
+        self.assertEqual(register_payload["context"]["customer_id"], "testshop")
+
+        auth_headers = {"Authorization": f"Bearer {token}"}
+        context_response = self.client.get("/api/auth/context", headers=auth_headers)
+        self.assertEqual(context_response.status_code, 200)
+        self.assertEqual(context_response.get_json()["context"]["source"], "cinchpos-account")
+
+        snapshot_response = self.client.put(
+            "/api/workspace/snapshot",
+            headers=auth_headers,
+            json={"payload": {"inventoryItems": [{"name": "Cloud Item", "stock": 2}]}},
+        )
+        self.assertEqual(snapshot_response.status_code, 200)
+        pulled_snapshot = self.client.get("/api/workspace/snapshot", headers=auth_headers)
+        self.assertEqual(pulled_snapshot.status_code, 200)
+        self.assertEqual(
+            pulled_snapshot.get_json()["payload"]["inventoryItems"][0]["name"],
+            "Cloud Item",
+        )
+
+        logout_response = self.client.post("/api/auth/logout", headers=auth_headers, json={})
+        self.assertEqual(logout_response.status_code, 200)
+        revoked_response = self.client.get("/api/auth/context", headers=auth_headers)
+        self.assertEqual(revoked_response.status_code, 401)
+
+        login_response = self.client.post(
+            "/api/auth/login",
+            json={"customer_id": "testshop", "password": "Strong#123"},
+        )
+        self.assertEqual(login_response.status_code, 200)
+        self.assertTrue(login_response.get_json()["token"].startswith("cinch_"))
 
     def test_duplicate_invoice_number_returns_conflict(self):
         customer = self.create_customer()

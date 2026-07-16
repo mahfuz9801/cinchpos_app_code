@@ -12,9 +12,14 @@ import {
   getDashboard,
   getInvoices,
   getTrend,
+  getWorkspaceSnapshot,
   isApiNetworkError,
   inviteEmployeeAccount,
+  loginCinchAccount,
+  logoutCinchAccount,
   recordPayment,
+  registerCinchAccount,
+  saveWorkspaceSnapshot,
   setAuthContextProvider,
   setAuthTokenProvider,
   updateCustomer
@@ -62,6 +67,7 @@ import {
 } from "@/lib/cinchpos/constants";
 import {
   accountFromAuthState,
+  clearAccountAuthSession,
   clearOfflineAuthSession,
   getClerkSessionToken,
   hasPermission,
@@ -69,8 +75,11 @@ import {
   makeLocalOwnerAuthState,
   makeSignedOutAuthState,
   normalizeBackendAuthContext,
+  normalizeCinchAccountAuth,
   permissionsForRole,
+  readAccountAuthSession,
   readOfflineAuthSession,
+  writeAccountAuthSession,
   viewPermissionMap,
   writeOfflineAuthSession
 } from "@/lib/cinchpos/auth";
@@ -367,7 +376,7 @@ const PRINT_PAPER_PROFILES = {
 };
 
 const THERMAL_RECEIPT_CSS = `
-  .thermal-receipt { display: block; width: 100%; overflow: hidden; color: #000; background: #fff; font-family: Arial, Helvetica, sans-serif; font-weight: 700; letter-spacing: 0; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  .thermal-receipt { display: block; width: 100%; overflow: visible; color: #000; background: #fff; font-family: Arial, Helvetica, sans-serif; font-weight: 700; letter-spacing: 0; -webkit-print-color-adjust: exact; print-color-adjust: exact; break-inside: auto; page-break-inside: auto; }
   .thermal-receipt * { box-sizing: border-box; color: #000; }
   .thermal-receipt--58 { font-size: 8.2px; line-height: 1.14; }
   .thermal-receipt--80 { font-size: 9.4px; line-height: 1.16; }
@@ -390,7 +399,7 @@ const THERMAL_RECEIPT_CSS = `
   .thermal-item-head span { display: block; min-width: 0; overflow-wrap: anywhere; }
   .thermal-item-head strong { display: block; font-weight: 900; }
   .thermal-item-head small { display: block; font-size: 0.96em; font-weight: 900; line-height: 1.06; }
-  .thermal-item-row { padding: 4px 0 3px; border-bottom: 1px dashed #000; break-inside: avoid; }
+  .thermal-item-row { padding: 4px 0 3px; border-bottom: 1px dashed #000; break-inside: avoid; page-break-inside: avoid; }
   .thermal-item-row:last-child { border-bottom: 0; }
   .thermal-col-center { text-align: center; }
   .thermal-col-right { text-align: right; }
@@ -399,7 +408,7 @@ const THERMAL_RECEIPT_CSS = `
   .thermal-item-name small { display: block; margin-top: 1px; font-size: 0.86em; line-height: 1.08; font-weight: 700; overflow-wrap: anywhere; }
   .thermal-col-center small, .thermal-col-right small { display: block; margin-top: 1px; font-size: 0.92em; line-height: 1.08; font-weight: 700; }
   .thermal-item-amount { font-weight: 900; }
-  .thermal-summary-block, .thermal-payment-block, .thermal-policy-block { display: grid; gap: 2px; }
+  .thermal-summary-block, .thermal-payment-block, .thermal-policy-block { display: grid; gap: 2px; break-inside: avoid; page-break-inside: avoid; }
   .thermal-summary-row, .thermal-payment-row { display: flex; justify-content: space-between; gap: 8px; }
   .thermal-summary-row strong, .thermal-payment-row strong { text-align: right; white-space: nowrap; font-weight: 900; }
   .thermal-grand-total { margin-top: 2px; padding: 3px 0; border-top: 1px solid #000; border-bottom: 1px solid #000; font-size: 1.22em; font-weight: 900; text-transform: uppercase; }
@@ -424,8 +433,8 @@ function toMicrons(mm) {
 }
 
 function getThermalReceiptHeightMm(itemCount = 0, { hasLogo = false, hasFooter = false, hasNotes = false } = {}) {
-  const estimatedHeight = 118 + Number(itemCount || 0) * 12 + (hasLogo ? 10 : 0) + (hasNotes ? 42 : 0) + (hasFooter ? 16 : 0);
-  return Math.max(150, Math.min(5000, estimatedHeight));
+  const estimatedHeight = 135 + Number(itemCount || 0) * 16 + (hasLogo ? 14 : 0) + (hasNotes ? 52 : 0) + (hasFooter ? 22 : 0);
+  return Math.max(180, Math.min(12000, estimatedHeight));
 }
 
 function getElectronPrintPageSize(profile, payload = {}) {
@@ -936,6 +945,15 @@ function makeDownloadFileName(value, fallback = "cinchpos-invoice") {
   return cleaned || fallback;
 }
 
+function csvCell(value) {
+  const text = String(value ?? "");
+  return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+function csvRow(values = []) {
+  return values.map(csvCell).join(",");
+}
+
 function buildInvoiceDownloadHTML(payload, detail = {}) {
   const summary = calculatePrintPayloadSummary(payload.items, payload.summary);
   const rows = (payload.items || []).map((item) => `
@@ -1175,10 +1193,20 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
   const [settings, setSettings] = useState(defaultSettings);
   const [workspaceLoaded, setWorkspaceLoaded] = useState(false);
   const [account, setAccount] = useState(defaultAccount);
-  const [authState, setAuthState] = useState(() => makeLocalOwnerAuthState({ reason: "local-default" }));
+  const [authState, setAuthState] = useState(() => makeSignedOutAuthState({ configured: true, required: true }));
   const [authBusy, setAuthBusy] = useState(false);
   const [authRoles, setAuthRoles] = useState([]);
   const [clerkClient, setClerkClient] = useState(null);
+  const [authFormMode, setAuthFormMode] = useState("login");
+  const [authForm, setAuthForm] = useState({
+    customerId: "",
+    password: "",
+    confirmPassword: "",
+    name: "",
+    email: "",
+    businessName: ""
+  });
+  const [cloudSyncBusy, setCloudSyncBusy] = useState(false);
   const [posState, setPosState] = useState(makeInitialPOSState);
   const [posNavigationOpen, setPosNavigationOpen] = useState(false);
   const [dataTransferResult, setDataTransferResult] = useState(null);
@@ -1219,6 +1247,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
   const transferFileRefs = useRef({});
   const transferFiles = useRef({});
   const dashboardRetryTimer = useRef(null);
+  const cloudSnapshotTimer = useRef(null);
   const settingsRestoreInputRef = useRef(null);
   const startupViewApplied = useRef(false);
   const authInitStarted = useRef(false);
@@ -1478,6 +1507,12 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     selectedInvoice ? getInvoiceDetail(selectedInvoice) : null
   ), [invoiceDetails, selectedInvoice]);
   const isOwner = cleanText(authState.role).toLowerCase() === "owner" || authState.userId === "local-owner" || hasPermission(authState, "*");
+  const authGateActive = authState.required && !authState.authenticated;
+  const visibleBusinessName = authGateActive ? APP_NAME : businessName;
+  const visibleOwnerName = authGateActive ? "Secure Workspace" : ownerName;
+  const visibleTitle = authGateActive ? "Login Required" : currentTitle;
+  const visibleLogoSource = authGateActive ? "" : storeLogoSource;
+  const visibleInitials = authGateActive ? "CP" : fallbackInitials;
   const invoiceStatusMenuInvoice = useMemo(() => {
     if (!invoiceStatusMenu?.invoiceId) {
       return null;
@@ -1831,6 +1866,102 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     return () => window.removeEventListener("beforeunload", flush);
   }, []);
 
+  const buildWorkspaceSnapshotPayload = useCallback(() => ({
+    settings,
+    account,
+    inventoryItems,
+    bankAccount,
+    purchaseRecords,
+    expenseRecords,
+    purchaseBills,
+    storeDocuments,
+    employees,
+    sellOnlineCatalog,
+    invoiceDetails,
+    supportRequests,
+    posState
+  }), [
+    account,
+    bankAccount,
+    employees,
+    expenseRecords,
+    inventoryItems,
+    invoiceDetails,
+    posState,
+    purchaseBills,
+    purchaseRecords,
+    sellOnlineCatalog,
+    settings,
+    storeDocuments,
+    supportRequests
+  ]);
+
+  const applyWorkspaceSnapshotPayload = useCallback((payload) => {
+    if (!payload || typeof payload !== "object") {
+      return false;
+    }
+    if (payload.settings && typeof payload.settings === "object") {
+      setSettings({ ...defaultSettings, ...payload.settings });
+    }
+    if (payload.account && typeof payload.account === "object") {
+      setAccount({ ...defaultAccount, ...payload.account });
+    }
+    if (Array.isArray(payload.inventoryItems)) {
+      setInventoryItems(payload.inventoryItems);
+    }
+    if ("bankAccount" in payload) {
+      setBankAccount(payload.bankAccount || null);
+    }
+    if (Array.isArray(payload.purchaseRecords)) {
+      setPurchaseRecords(payload.purchaseRecords);
+    }
+    if (Array.isArray(payload.expenseRecords)) {
+      setExpenseRecords(payload.expenseRecords);
+    }
+    if (Array.isArray(payload.purchaseBills)) {
+      setPurchaseBills(payload.purchaseBills);
+    }
+    if (Array.isArray(payload.storeDocuments)) {
+      setStoreDocuments(payload.storeDocuments);
+    }
+    if (Array.isArray(payload.employees)) {
+      setEmployees(payload.employees);
+    }
+    if (payload.sellOnlineCatalog && typeof payload.sellOnlineCatalog === "object") {
+      setSellOnlineCatalog(payload.sellOnlineCatalog);
+    }
+    if (payload.invoiceDetails && typeof payload.invoiceDetails === "object") {
+      setInvoiceDetails(payload.invoiceDetails);
+    }
+    if (Array.isArray(payload.supportRequests)) {
+      setSupportRequests(payload.supportRequests);
+    }
+    if (payload.posState && typeof payload.posState === "object") {
+      setPosState(payload.posState);
+    }
+    return true;
+  }, []);
+
+  const pullCloudWorkspace = useCallback(async () => {
+    if (!authState.authenticated || authState.offline) {
+      return false;
+    }
+    setCloudSyncBusy(true);
+    try {
+      const snapshot = await getWorkspaceSnapshot();
+      const applied = applyWorkspaceSnapshotPayload(snapshot?.payload);
+      if (applied) {
+        showMessage("Cloud workspace synced.");
+      }
+      return applied;
+    } catch (error) {
+      showMessage(error instanceof Error ? error.message : "Could not sync cloud workspace.");
+      return false;
+    } finally {
+      setCloudSyncBusy(false);
+    }
+  }, [applyWorkspaceSnapshotPayload, authState.authenticated, authState.offline, showMessage]);
+
   useEffect(() => {
     if (!workspaceLoaded) {
       return;
@@ -1928,6 +2059,27 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
   }, [trendEndDate, trendStartDate, trendView, workspaceLoaded]);
 
   useEffect(() => {
+    if (!workspaceLoaded || !authState.authenticated || authState.offline || !can("business:write")) {
+      return undefined;
+    }
+    if (cloudSnapshotTimer.current) {
+      window.clearTimeout(cloudSnapshotTimer.current);
+    }
+    cloudSnapshotTimer.current = window.setTimeout(() => {
+      cloudSnapshotTimer.current = null;
+      saveWorkspaceSnapshot(buildWorkspaceSnapshotPayload()).catch(() => {
+        // Snapshot sync is best-effort; local saved data remains available on this device.
+      });
+    }, 1800);
+    return () => {
+      if (cloudSnapshotTimer.current) {
+        window.clearTimeout(cloudSnapshotTimer.current);
+        cloudSnapshotTimer.current = null;
+      }
+    };
+  }, [authState.authenticated, authState.offline, buildWorkspaceSnapshotPayload, can, workspaceLoaded]);
+
+  useEffect(() => {
     if (!workspaceLoaded || startupViewApplied.current) {
       return;
     }
@@ -1952,8 +2104,8 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       businessId: activeBusinessId,
       warehouseId: activeWarehouseId
     }));
-    setAuthTokenProvider(async () => getClerkSessionToken(clerkClient));
-  }, [activeBusinessId, activeWarehouseId, clerkClient]);
+    setAuthTokenProvider(async () => authState.token || getClerkSessionToken(clerkClient));
+  }, [activeBusinessId, activeWarehouseId, authState.token, clerkClient]);
 
   const syncAuthContext = useCallback(async (client = clerkClient, options = {}) => {
     setAuthBusy(true);
@@ -1992,7 +2144,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
 
       return nextAuthState;
     } catch (error) {
-      const offlineSession = await readOfflineAuthSession();
+      const offlineSession = authState.token ? null : await readOfflineAuthSession();
       if (offlineSession?.authState) {
         const cachedAuthState = {
           ...offlineSession.authState,
@@ -2007,7 +2159,9 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         return cachedAuthState;
       }
 
-      const fallbackState = makeLocalOwnerAuthState({ reason: "auth-context-unavailable" });
+      const fallbackState = authState.required
+        ? makeSignedOutAuthState({ configured: true, required: true, reason: "auth-context-unavailable" })
+        : makeLocalOwnerAuthState({ reason: "auth-context-unavailable" });
       setAuthState(fallbackState);
       setAccount(accountFromAuthState(fallbackState));
       if (!options.silent) {
@@ -2017,7 +2171,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     } finally {
       setAuthBusy(false);
     }
-  }, [clerkClient, showMessage]);
+  }, [authState.required, authState.token, clerkClient, showMessage]);
 
   useEffect(() => {
     if (!workspaceLoaded || authInitStarted.current) {
@@ -2029,6 +2183,28 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
 
     async function initializeAuth() {
       setAuthBusy(true);
+      const cachedAccountSession = await readAccountAuthSession();
+      if (cachedAccountSession?.authState?.token && !cancelled) {
+        const cachedAuthState = {
+          ...cachedAccountSession.authState,
+          authenticated: true,
+          offline: false
+        };
+        setAuthState(cachedAuthState);
+        setAccount(accountFromAuthState(cachedAuthState));
+        setAuthTokenProvider(async () => cachedAuthState.token);
+        const refreshedState = await syncAuthContext(null, { silent: true });
+        if (refreshedState?.authenticated && !cancelled) {
+          try {
+            const snapshot = await getWorkspaceSnapshot();
+            applyWorkspaceSnapshotPayload(snapshot?.payload);
+          } catch {
+            // Local workspace remains available if the cloud snapshot cannot be pulled.
+          }
+        }
+        setAuthBusy(false);
+        return;
+      }
       const cachedSession = await readOfflineAuthSession();
       if (cachedSession?.authState && !cancelled) {
         const cachedAuthState = { ...cachedSession.authState, authenticated: true, offline: true };
@@ -2063,7 +2239,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         removeListener();
       }
     };
-  }, [syncAuthContext, workspaceLoaded]);
+  }, [applyWorkspaceSnapshotPayload, syncAuthContext, workspaceLoaded]);
 
   useEffect(() => {
     if (!workspaceLoaded || !can("employees:read")) {
@@ -2129,6 +2305,12 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       dashboardRetryTimer.current = null;
     }
 
+    if (authGateActive) {
+      return () => {
+        cancelled = true;
+      };
+    }
+
     attemptLoad();
 
     return () => {
@@ -2138,7 +2320,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         dashboardRetryTimer.current = null;
       }
     };
-  }, [loadDashboard, showMessage]);
+  }, [authGateActive, loadDashboard, showMessage]);
 
   function switchView(viewId) {
     setActiveView(viewId);
@@ -2163,6 +2345,65 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     setActiveModal("");
     setPrefillInvoiceId("");
     setSelectedInvoiceId("");
+  }
+
+  function updateAuthForm(field, value) {
+    setAuthForm((current) => ({ ...current, [field]: value }));
+  }
+
+  async function submitCinchAccountAuth(event) {
+    event.preventDefault();
+    if (authBusy) {
+      return;
+    }
+    const customerId = cleanText(authForm.customerId).toLowerCase();
+    const password = String(authForm.password || "");
+    if (!customerId || !password) {
+      showMessage("Enter customer ID and password.");
+      return;
+    }
+    if (authFormMode === "register" && password !== String(authForm.confirmPassword || "")) {
+      showMessage("Password and confirmation do not match.");
+      return;
+    }
+    setAuthBusy(true);
+    try {
+      const payload = authFormMode === "register"
+        ? await registerCinchAccount({
+            customer_id: customerId,
+            password,
+            name: authForm.name,
+            email: authForm.email,
+            business_name: authForm.businessName
+          })
+        : await loginCinchAccount({ customer_id: customerId, password });
+      const nextAuthState = normalizeCinchAccountAuth(payload);
+      await writeAccountAuthSession(nextAuthState, payload.expires_at || "");
+      await clearOfflineAuthSession();
+      setAuthState(nextAuthState);
+      setAccount(accountFromAuthState(nextAuthState));
+      setAuthTokenProvider(async () => nextAuthState.token);
+      setAuthForm((current) => ({ ...current, password: "", confirmPassword: "" }));
+      closeModal();
+
+      try {
+        const snapshot = await getWorkspaceSnapshot();
+        const applied = applyWorkspaceSnapshotPayload(snapshot?.payload);
+        if (!applied && authFormMode === "register") {
+          await saveWorkspaceSnapshot(buildWorkspaceSnapshotPayload());
+        }
+      } catch {
+        if (authFormMode === "register") {
+          await saveWorkspaceSnapshot(buildWorkspaceSnapshotPayload()).catch(() => {});
+        }
+      }
+      await loadDashboard().catch(() => {});
+      showMessage(authFormMode === "register" ? "CinchPOS account created." : "Logged in successfully.");
+    } catch (error) {
+      showMessage(error instanceof Error ? error.message : "Login failed.");
+    } finally {
+      setAuthBusy(false);
+    }
   }
 
   async function openClerkFlow(flow = "signIn") {
@@ -2193,16 +2434,22 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
   async function signOutOfAuth() {
     setAuthBusy(true);
     try {
+      if (authState.token) {
+        await logoutCinchAccount().catch(() => {});
+      }
       if (clerkClient?.signOut) {
         await clerkClient.signOut();
       }
+      await clearAccountAuthSession();
       await clearOfflineAuthSession();
       const signedOutState = makeSignedOutAuthState({
-        configured: Boolean(clerkClient),
-        required: authState.required
+        configured: true,
+        required: true
       });
       setAuthState(signedOutState);
       setAccount(defaultAccount);
+      setAuthTokenProvider(async () => "");
+      setActiveModal("login");
       showMessage("Signed out of this device.");
     } catch (error) {
       showMessage(error instanceof Error ? error.message : "Could not sign out.");
@@ -2483,7 +2730,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     const printClass = isInvoicePrint ? "invoice-print" : "thermal-print";
     const calibration = normalizePrintCalibration(payload.printCalibration);
     const printPadding = getPrintPadding(printProfile, calibration, isInvoicePrint);
-    const printScale = calibration.scale / 100;
+    const printScale = isInvoicePrint ? calibration.scale / 100 : 1;
     const printableSummary = calculatePrintPayloadSummary(payload.items, payload.summary);
     const printRows = payload.items.map((item) => `
       <tr>
@@ -2564,9 +2811,9 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         <style>
           * { box-sizing: border-box; }
           @page { size: ${printPageSize}; margin: ${printMargin}; }
-          html, body { width: ${printPageWidth}; min-height: 0; }
+          html, body { width: ${printPageWidth}; min-height: 0; overflow: visible; }
           body { margin: 0 auto; padding: ${printPadding}; color: #111; font-family: Arial, sans-serif; font-size: ${isInvoicePrint ? "12px" : "9.2px"}; line-height: 1.22; }
-          .print-content { transform: scale(${printScale}); transform-origin: top left; width: ${printScale ? `${100 / printScale}%` : "100%"}; }
+          .print-content { transform: ${isInvoicePrint ? `scale(${printScale})` : "none"}; transform-origin: top left; width: ${isInvoicePrint && printScale ? `${100 / printScale}%` : "100%"}; break-inside: auto; page-break-inside: auto; }
           .print-head { display: grid; justify-items: center; gap: ${isInvoicePrint ? "4px" : "1px"}; margin-bottom: ${isInvoicePrint ? "10px" : "5px"}; text-align: center; }
           .print-logo { width: ${isInvoicePrint ? "72px" : "28px"}; height: ${isInvoicePrint ? "72px" : "28px"}; object-fit: contain; }
           h1 { margin: 0; font-size: ${isInvoicePrint ? "20px" : "12px"}; font-weight: 700; }
@@ -2600,7 +2847,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
           .print-notes { display: grid; gap: 4px; margin-top: 10px; padding-top: 8px; border-top: 1px dashed #777; color: #333; }
           .print-footer { margin-top: ${isInvoicePrint ? "16px" : "14px"}; padding-top: ${isInvoicePrint ? "10px" : "9px"}; border-top: 1px dashed #777; text-align: center; color: #444; font-size: ${isInvoicePrint ? "10px" : "8.8px"}; }
           ${isInvoicePrint ? "" : THERMAL_RECEIPT_CSS}
-          @media print { html, body { width: ${printPageWidth}; height: auto; } }
+          @media print { html, body { width: ${printPageWidth}; height: auto; overflow: visible; } .thermal-print .print-content { transform: none !important; width: 100% !important; } }
         </style>
       </head>
       <body class="${printClass}">
@@ -4508,14 +4755,28 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         <section className="app-workspace" ref={appWorkspaceRef}>
           <header id="dashboard" className="app-toolbar">
             <div className="window-title">
-              <StoreLogo source={storeLogoSource} fallback={fallbackInitials} alt={settings.logoName || `${businessName} logo`} className="toolbar-store-logo" />
-              <HeaderTitle storeName={businessName} title={currentTitle} eyebrow={ownerName} />
+              <StoreLogo source={visibleLogoSource} fallback={visibleInitials} alt={`${visibleBusinessName} logo`} className="toolbar-store-logo" />
+              <HeaderTitle storeName={visibleBusinessName} title={visibleTitle} eyebrow={visibleOwnerName} />
             </div>
             <HeaderSupportMenu />
           </header>
 
           <div id="appMessage" className={`message ${message ? "show" : ""}`}>{message}</div>
 
+          {authGateActive ? (
+            <section className="auth-lock-screen" aria-label="CinchPOS account login required">
+              <div className="auth-lock-card">
+                <StoreLogo source={visibleLogoSource} fallback={visibleInitials} alt={`${APP_NAME} logo`} className="auth-lock-logo" />
+                <p className="action-label">Secure Workspace</p>
+                <h2>Login to view this shop data</h2>
+                <p>Customer, inventory, invoices, and billing records stay hidden on this device until a valid CinchPOS account is active.</p>
+                <div className="auth-lock-actions">
+                  <button className="button button-primary" type="button" onClick={() => { setAuthFormMode("login"); openModal("login"); }}>Login</button>
+                  <button className="button button-secondary" type="button" onClick={() => { setAuthFormMode("register"); openModal("login"); }}>Create Customer ID</button>
+                </div>
+              </div>
+            </section>
+          ) : (
           <div className="app-view-stack">
             {renderedViews.dashboardView ? <section id="dashboardView" className={`app-view ${activeView === "dashboardView" ? "active" : ""}`} data-title="Dashboard">
               <section className="quick-strip" aria-label="Quick Actions">
@@ -4749,12 +5010,13 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
             {renderedViews.documentsView ? DocumentsView({ active: activeView === "documentsView" }) : null}
             {renderedViews.dataTransferView ? DataTransferView({ active: activeView === "dataTransferView" }) : null}
           </div>
+          )}
         </section>
 
         <aside className="right-navigation" aria-label="Application navigation">
           <button className={`brand ${activeView === "dashboardView" ? "active" : ""}`} type="button" onClick={() => switchView("dashboardView")}>
-            <StoreLogo source={storeLogoSource} fallback={fallbackInitials} alt={settings.logoName || `${businessName} logo`} className="nav-store-logo" />
-            <span><span>{businessName}</span><small>Store workspace</small></span>
+            <StoreLogo source={visibleLogoSource} fallback={visibleInitials} alt={`${visibleBusinessName} logo`} className="nav-store-logo" />
+            <span><span>{visibleBusinessName}</span><small>{authGateActive ? "Locked workspace" : "Store workspace"}</small></span>
           </button>
           <nav className="right-nav-links">
             {navigationViews.map((view) => (
@@ -4763,7 +5025,11 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                 {view.title}
               </button>
             ))}
-            <button className="nav-item" type="button" onClick={() => openModal("settings")}><span className="nav-icon"><svg><use href="#icon-settings"></use></svg></span>Settings</button>
+            {authGateActive ? (
+              <button className="nav-item" type="button" onClick={() => openModal("login")}><span className="nav-icon"><svg><use href="#icon-settings"></use></svg></span>Login</button>
+            ) : (
+              <button className="nav-item" type="button" onClick={() => openModal("settings")}><span className="nav-icon"><svg><use href="#icon-settings"></use></svg></span>Settings</button>
+            )}
           </nav>
         </aside>
       </main>
@@ -5080,33 +5346,69 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         {SettingsForm()}
       </Modal>
 
-      <Modal open={activeModal === "login"} title="Login or Sign Up" subtitle="Secure account access for owners, admins, and employees." onClose={closeModal}>
+      <Modal open={activeModal === "login"} title="CinchPOS Account" subtitle="Login with your customer ID to unlock this cloud workspace." onClose={closeModal}>
         <div className="auth-panel">
           <div className="auth-status-card">
             <span className={`record-chip ${authState.authenticated ? "success" : ""}`}>{authState.authenticated ? "Session Active" : "Signed Out"}</span>
             <h3>{authState.authenticated ? cleanText(authState.name, "Operator") : "CinchPOS Account"}</h3>
-            <p>{authState.email || "Email/password login is handled by Clerk. CinchPOS never stores passwords locally."}</p>
+            <p>{authState.authenticated ? (authState.email || authState.customerId || "CinchPOS account active") : "Create a customer ID once, then login from any device connected to the same CinchPOS cloud backend."}</p>
             <div className="auth-meta-grid">
+              <span>Customer ID <strong>{authState.customerId || "Not logged in"}</strong></span>
               <span>Role <strong>{authState.role}</strong></span>
-              <span>Email <strong>{authState.emailVerified ? "Verified" : "Pending"}</strong></span>
-              <span>MFA <strong>{authState.mfaRequired ? (authState.mfaVerified ? "Ready" : "Required") : "Optional"}</strong></span>
-              <span>Mode <strong>{authState.offline ? "Offline cache" : "Online session"}</strong></span>
+              <span>Business <strong>{authState.businessId}</strong></span>
+              <span>Mode <strong>{authState.offline ? "Offline cache" : "Cloud session"}</strong></span>
             </div>
           </div>
-          <div className="auth-action-grid">
-            <button type="button" className="button button-primary" disabled={authBusy} onClick={() => openClerkFlow("signIn")}>Email / Password Login</button>
-            <button type="button" className="button button-secondary" disabled={authBusy} onClick={() => openClerkFlow("signUp")}>Register Business</button>
-            <button type="button" className="button button-secondary" disabled={authBusy} onClick={() => openClerkFlow("signIn")}>Forgot Password</button>
-            <button type="button" className="button button-secondary" disabled={authBusy} onClick={() => openClerkFlow("profile")}>MFA & Sessions</button>
+          <div className="auth-mode-tabs" role="tablist" aria-label="Account action">
+            <button type="button" className={authFormMode === "login" ? "active" : ""} onClick={() => setAuthFormMode("login")}>Login</button>
+            <button type="button" className={authFormMode === "register" ? "active" : ""} onClick={() => setAuthFormMode("register")}>Create Customer ID</button>
           </div>
+          <form className="auth-form" onSubmit={submitCinchAccountAuth}>
+            <label>Customer ID
+              <input type="text" autoComplete="username" value={authForm.customerId} onChange={(event) => updateAuthForm("customerId", event.target.value)} placeholder="for example: shopname01" required />
+            </label>
+            {authFormMode === "register" ? (
+              <>
+                <label>Owner / Store Name
+                  <input type="text" value={authForm.name} onChange={(event) => updateAuthForm("name", event.target.value)} placeholder="Owner name" />
+                </label>
+                <label>Business Name
+                  <input type="text" value={authForm.businessName} onChange={(event) => updateAuthForm("businessName", event.target.value)} placeholder="Store name" />
+                </label>
+                <label>Email
+                  <input type="email" autoComplete="email" value={authForm.email} onChange={(event) => updateAuthForm("email", event.target.value)} placeholder="Optional email" />
+                </label>
+              </>
+            ) : null}
+            <label>Password
+              <input type="password" autoComplete={authFormMode === "register" ? "new-password" : "current-password"} value={authForm.password} onChange={(event) => updateAuthForm("password", event.target.value)} placeholder="Password" required />
+            </label>
+            {authFormMode === "register" ? (
+              <label>Confirm Password
+                <input type="password" autoComplete="new-password" value={authForm.confirmPassword} onChange={(event) => updateAuthForm("confirmPassword", event.target.value)} placeholder="Repeat password" required />
+              </label>
+            ) : null}
+            <div className="password-rules">
+              <span>8+ characters</span>
+              <span>Upper & lower case</span>
+              <span>Number</span>
+              <span>Special character</span>
+              <span>No spaces</span>
+            </div>
+            <div className="modal-actions auth-form-actions">
+              <button type="button" className="button button-secondary" onClick={closeModal} disabled={authGateActive}>Cancel</button>
+              <button type="submit" className="button button-primary" disabled={authBusy}>{authBusy ? "Please wait..." : (authFormMode === "register" ? "Create Account" : "Login")}</button>
+            </div>
+          </form>
           <div className="auth-checklist">
-            <article><strong>Email verification</strong><span>New accounts must verify email in Clerk.</span></article>
-            <article><strong>Google sign-in</strong><span>Enable as an optional provider in the Clerk dashboard.</span></article>
-            <article><strong>Employee invitation</strong><span>Employees receive a secure invite and set their own password.</span></article>
-            <article><strong>Offline POS</strong><span>Existing sessions can keep billing from encrypted desktop storage.</span></article>
+            <article><strong>Cloud workspace</strong><span>Data is separated by customer ID and business workspace.</span></article>
+            <article><strong>Password safety</strong><span>Passwords are hashed on the backend and never saved in the app.</span></article>
+            <article><strong>Logout privacy</strong><span>Signed-out users cannot see local billing screens.</span></article>
+            <article><strong>Cross-device access</strong><span>Use the same hosted backend to access the same workspace elsewhere.</span></article>
           </div>
           <div className="modal-actions">
             <button type="button" className="button button-secondary" onClick={() => syncAuthContext(clerkClient)}>Refresh Session</button>
+            <button type="button" className="button button-secondary" onClick={pullCloudWorkspace} disabled={!authState.authenticated || cloudSyncBusy}>Pull Cloud Data</button>
             <button type="button" className="button button-secondary" onClick={signOutOfAuth} disabled={!authState.authenticated || authBusy}>Logout</button>
             <button type="button" className="button button-primary" onClick={closeModal}>Done</button>
           </div>
@@ -5637,6 +5939,50 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     const totalCollections = allInvoices.reduce((total, invoice) => total + invoicePaidAmount(invoice), 0);
     const totalOutstanding = allInvoices.reduce((total, invoice) => total + invoiceOutstandingAmount(invoice), 0);
     const averageInvoiceValue = allInvoices.length ? allInvoices.reduce((total, invoice) => total + Number(invoice.amount || 0), 0) / allInvoices.length : 0;
+    const downloadSalesReport = () => {
+      const lines = [
+        csvRow(["CinchPOS Sales Report"]),
+        csvRow(["Generated On", new Date().toLocaleString("en-IN")]),
+        csvRow(["Business", businessName]),
+        "",
+        csvRow(["Summary"]),
+        csvRow(["Stock Value", inventoryStockValue]),
+        csvRow(["Total Collected", totalCollections]),
+        csvRow(["Outstanding", totalOutstanding || currentSummary.outstanding_payments]),
+        csvRow(["Average Invoice", averageInvoiceValue]),
+        csvRow(["Paid Invoices", paidInvoices]),
+        csvRow(["Unpaid Invoices", pendingInvoices]),
+        csvRow(["Overdue Invoices", overdueInvoices]),
+        "",
+        csvRow(["Trend", trendView]),
+        csvRow(["Label", "Value"]),
+        ...trend.map((point) => csvRow([point.label, point.value])),
+        "",
+        csvRow(["Invoices"]),
+        csvRow(["Serial No.", "Invoice Number", "Date", "Customer", "Phone", "Amount", "Paid", "Outstanding", "Status"]),
+        ...allInvoices.map((invoice, index) => csvRow([
+          index + 1,
+          invoice.invoice_number || invoice.invoiceNumber || "",
+          invoice.issued_on || invoice.issuedOn || "",
+          cleanText(invoice.customer_name || invoice.customerName, DEFAULT_WALK_IN_CUSTOMER_NAME),
+          getInvoicePhone(invoice),
+          Number(invoice.amount || 0).toFixed(2),
+          invoicePaidAmount(invoice).toFixed(2),
+          invoiceOutstandingAmount(invoice).toFixed(2),
+          getInvoicePaymentStatus(invoice)
+        ]))
+      ];
+      const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8" });
+      const url = window.URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `${makeDownloadFileName(`${businessName}-${todayISO()}`, "cinchpos-sales-report")}.csv`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => window.URL.revokeObjectURL(url), 800);
+      showMessage("Sales report downloaded.");
+    };
     return (
       <section id="salesReportView" className={`app-view ${active ? "active" : ""}`} data-title="Sales Report">
         <section className="panel sales-report-panel">
@@ -5645,7 +5991,10 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
               <h2>Sales Report</h2>
               <div className="panel-subtitle">Sales performance, collections, outstanding invoices, and billing health.</div>
             </div>
-            <button className="button button-secondary" type="button" onClick={() => setActiveView("invoicesView")}>Open Invoices</button>
+            <div className="panel-actions">
+              <button className="button button-secondary" type="button" onClick={() => setActiveView("invoicesView")}>Open Invoices</button>
+              <button className="button button-primary" type="button" onClick={downloadSalesReport}>Download Report</button>
+            </div>
           </div>
 	          <div className="sales-report-grid">
 	            <article className="sales-report-card">
@@ -5691,6 +6040,18 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                   <p className="record-meta">{trendCaption}</p>
                 </div>
                 <span>Peak {currency(trendPeak)}</span>
+              </div>
+              <div className="segmented-control sales-trend-controls">
+                {["daily", "weekly", "monthly", "custom"].map((view) => (
+                  <button key={view} className={trendView === view ? "active" : ""} type="button" onClick={async () => {
+                    setTrendView(view);
+                    try {
+                      await refreshTrend(view);
+                    } catch (error) {
+                      showMessage(error.message);
+                    }
+                  }}>{view[0].toUpperCase() + view.slice(1)}</button>
+                ))}
               </div>
               <TrendChart points={trend} />
             </section>
@@ -6563,20 +6924,20 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                 <span className="account-avatar">{account.loggedIn ? cleanText(account.name, "Operator").charAt(0).toUpperCase() : "?"}</span>
                 <div>
                   <strong>{account.loggedIn ? cleanText(account.name, "Operator") : "Not logged in"}</strong>
-                  <span>{account.loggedIn ? (account.contact || `${authState.role} access`) : "Login or Sign Up to sync account access securely."}</span>
+                  <span>{account.loggedIn ? (account.contact || authState.customerId || `${authState.role} access`) : "Login with a CinchPOS customer ID to sync this workspace."}</span>
                 </div>
               </div>
               <div className="account-actions">
-                <button className="button button-primary" type="button" hidden={account.loggedIn} onClick={() => openModal("login")}>Login or Sign Up</button>
-                <button className="button button-secondary" type="button" hidden={!account.loggedIn} onClick={() => openClerkFlow("profile")}>MFA & Sessions</button>
+                <button className="button button-primary" type="button" hidden={account.loggedIn} onClick={() => openModal("login")}>Login or Create ID</button>
+                <button className="button button-secondary" type="button" hidden={!account.loggedIn} disabled={cloudSyncBusy} onClick={pullCloudWorkspace}>Pull Cloud Data</button>
                 <button className="button button-secondary" type="button" hidden={!account.loggedIn} onClick={signOutOfAuth}>Logout</button>
               </div>
             </div>
             <div className="settings-metric-grid">
               <article className="settings-metric"><strong>{authState.role}</strong><span>Role</span></article>
-              <article className="settings-metric"><strong>{authState.businessId}</strong><span>Business</span></article>
+              <article className="settings-metric"><strong>{authState.customerId || "Not linked"}</strong><span>Customer ID</span></article>
               <article className="settings-metric"><strong>{authState.warehouseId}</strong><span>Warehouse</span></article>
-              <article className="settings-metric"><strong>{authState.offline ? "Offline" : "Online"}</strong><span>Session Mode</span></article>
+              <article className="settings-metric"><strong>{authState.offline ? "Offline" : "Cloud"}</strong><span>Session Mode</span></article>
             </div>
             <div className="settings-metric-grid">
               {apiModuleSummary.map(([label, value]) => (
@@ -6586,7 +6947,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                 </article>
               ))}
             </div>
-            <p className="settings-help">Clerk handles email/password, verification, password reset, Google sign-in, MFA, and device sessions. CinchPOS stores only an encrypted offline access cache for already authenticated POS operators.</p>
+            <p className="settings-help">CinchPOS account passwords are validated on the backend, stored only as salted password hashes, and never saved in this app. Log out to hide all workspace data on this device.</p>
           </section>
         );
       }
@@ -7184,7 +7545,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       return (
         <section className="settings-section">
           <h4>Logout</h4>
-          <p className="settings-help">End the current Clerk session for this counter and clear the encrypted offline access cache.</p>
+          <p className="settings-help">End the current CinchPOS session for this counter and hide workspace data until the owner logs in again.</p>
           <div className="record-list">
             <article className="record-card">
               <div className="record-top">

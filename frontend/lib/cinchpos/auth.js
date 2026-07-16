@@ -1,9 +1,10 @@
 export const CLERK_PUBLISHABLE_KEY = process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY || "";
 export const CINCHPOS_AUTH_REQUIRED = ["1", "true", "yes", "on"].includes(
-  String(process.env.NEXT_PUBLIC_CINCHPOS_AUTH_REQUIRED || "").toLowerCase()
+  String(process.env.NEXT_PUBLIC_CINCHPOS_AUTH_REQUIRED || "1").toLowerCase()
 );
 
 const OFFLINE_AUTH_KEY = "offline-auth-session";
+const ACCOUNT_AUTH_KEY = "account-auth-session";
 let clerkClientPromise = null;
 
 export const rolePermissionMatrix = {
@@ -93,6 +94,9 @@ export function makeSignedOutAuthState(overrides = {}) {
     configured: Boolean(CLERK_PUBLISHABLE_KEY),
     required: CINCHPOS_AUTH_REQUIRED,
     authenticated: false,
+    source: "",
+    token: "",
+    customerId: "",
     offline: false,
     userId: "",
     name: "",
@@ -115,6 +119,9 @@ export function makeLocalOwnerAuthState(overrides = {}) {
     configured: Boolean(CLERK_PUBLISHABLE_KEY),
     required: CINCHPOS_AUTH_REQUIRED,
     authenticated: true,
+    source: "local-dev",
+    token: "",
+    customerId: "",
     offline: true,
     userId: "local-owner",
     name: "Local Owner",
@@ -136,7 +143,7 @@ export function accountFromAuthState(authState) {
     loggedIn: Boolean(authState?.authenticated),
     name: authState?.name || authState?.email || "Operator",
     contact: authState?.email || "",
-    provider: authState?.configured ? "clerk" : "local",
+    provider: authState?.source === "cinchpos-account" ? "cinchpos" : (authState?.configured ? "clerk" : "local"),
     role: normalizeRole(authState?.role || "employee"),
     businessId: authState?.businessId || "primary",
     warehouseId: authState?.warehouseId || "main",
@@ -157,6 +164,9 @@ export function normalizeBackendAuthContext(payload) {
     configured: Boolean(payload?.configured || CLERK_PUBLISHABLE_KEY),
     required: Boolean(payload?.auth_required ?? CINCHPOS_AUTH_REQUIRED),
     authenticated: Boolean(context.authenticated),
+    source: context.source || "",
+    token: payload?.token || "",
+    customerId: context.customer_id || payload?.account?.customer_id || "",
     offline: false,
     userId: context.user_id || "",
     name: context.name || "",
@@ -169,6 +179,17 @@ export function normalizeBackendAuthContext(payload) {
     mfaRequired: Boolean(context.mfa_required),
     mfaVerified: Boolean(context.mfa_verified),
     sessionId: context.session_id || ""
+  };
+}
+
+export function normalizeCinchAccountAuth(payload) {
+  return {
+    ...normalizeBackendAuthContext(payload),
+    configured: true,
+    source: "cinchpos-account",
+    token: payload?.token || "",
+    customerId: payload?.account?.customer_id || payload?.context?.customer_id || "",
+    authenticated: Boolean(payload?.token && payload?.context?.authenticated)
   };
 }
 
@@ -255,4 +276,57 @@ export async function clearOfflineAuthSession() {
     await window.cinchposSecureStorage.remove(OFFLINE_AUTH_KEY);
   }
   window.localStorage.removeItem(`cinchPOS:${OFFLINE_AUTH_KEY}`);
+}
+
+export async function writeAccountAuthSession(authState, expiresAt = "") {
+  if (typeof window === "undefined" || !authState?.authenticated || !authState?.token) {
+    return;
+  }
+  const payload = JSON.stringify({
+    savedAt: new Date().toISOString(),
+    expiresAt,
+    authState: {
+      ...authState,
+      offline: false,
+      permissions: Array.isArray(authState.permissions) ? authState.permissions : []
+    }
+  });
+  if (window.cinchposSecureStorage?.set) {
+    await window.cinchposSecureStorage.set(ACCOUNT_AUTH_KEY, payload);
+    return;
+  }
+  window.sessionStorage.setItem(`cinchPOS:${ACCOUNT_AUTH_KEY}`, payload);
+  window.localStorage.removeItem(`cinchPOS:${ACCOUNT_AUTH_KEY}`);
+}
+
+export async function readAccountAuthSession() {
+  if (typeof window === "undefined") {
+    return null;
+  }
+  try {
+    const payload = window.cinchposSecureStorage?.get
+      ? await window.cinchposSecureStorage.get(ACCOUNT_AUTH_KEY)
+      : window.sessionStorage.getItem(`cinchPOS:${ACCOUNT_AUTH_KEY}`);
+    if (!payload) {
+      return null;
+    }
+    const parsed = JSON.parse(payload);
+    if (!parsed?.authState?.token) {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+export async function clearAccountAuthSession() {
+  if (typeof window === "undefined") {
+    return;
+  }
+  if (window.cinchposSecureStorage?.remove) {
+    await window.cinchposSecureStorage.remove(ACCOUNT_AUTH_KEY);
+  }
+  window.sessionStorage.removeItem(`cinchPOS:${ACCOUNT_AUTH_KEY}`);
+  window.localStorage.removeItem(`cinchPOS:${ACCOUNT_AUTH_KEY}`);
 }

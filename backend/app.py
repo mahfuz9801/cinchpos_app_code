@@ -1,10 +1,13 @@
 import os
 import sqlite3
 import sys
+import hashlib
+import hmac
 from contextlib import closing
 from datetime import UTC, date, datetime, timedelta
 from functools import wraps
 import json
+import re
 import secrets
 from urllib import request as urlrequest
 from urllib.error import URLError
@@ -29,8 +32,8 @@ DATABASE = os.getenv(
     "DATABASE_PATH",
     os.path.join(os.path.dirname(__file__), "database.db"),
 )
-SCHEMA_VERSION = "3"
-AUTH_REQUIRED = os.getenv("CINCHPOS_AUTH_REQUIRED", "0").strip().lower() in {
+SCHEMA_VERSION = "4"
+AUTH_REQUIRED = os.getenv("CINCHPOS_AUTH_REQUIRED", "1").strip().lower() in {
     "1",
     "true",
     "yes",
@@ -48,6 +51,19 @@ DEFAULT_WAREHOUSE_ID = "main"
 DEFAULT_BUSINESS_NAME = "Store Name"
 AUTH_TOKEN_LEEWAY_SECONDS = int(os.getenv("CINCHPOS_AUTH_TOKEN_LEEWAY", "60"))
 OFFLINE_SESSION_HOURS = int(os.getenv("CINCHPOS_OFFLINE_SESSION_HOURS", "24"))
+CINCHPOS_SESSION_HOURS = int(os.getenv("CINCHPOS_ACCOUNT_SESSION_HOURS", "168"))
+PASSWORD_HASH_ITERATIONS = int(os.getenv("CINCHPOS_PASSWORD_HASH_ITERATIONS", "310000"))
+LOGIN_LOCK_THRESHOLD = int(os.getenv("CINCHPOS_LOGIN_LOCK_THRESHOLD", "5"))
+LOGIN_LOCK_MINUTES = int(os.getenv("CINCHPOS_LOGIN_LOCK_MINUTES", "15"))
+CUSTOMER_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{3,31}$")
+PASSWORD_RULES = {
+    "min_length": 8,
+    "uppercase": True,
+    "lowercase": True,
+    "number": True,
+    "special": True,
+    "spaces": False,
+}
 DB_INDEX_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS idx_customers_phone ON customers(phone)",
     "CREATE INDEX IF NOT EXISTS idx_customers_business_id ON customers(business_id)",
@@ -63,6 +79,10 @@ DB_INDEX_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS idx_auth_audit_business_id ON auth_audit_logs(business_id)",
     "CREATE INDEX IF NOT EXISTS idx_auth_audit_user_id ON auth_audit_logs(user_id)",
     "CREATE INDEX IF NOT EXISTS idx_memberships_user_business ON business_memberships(clerk_user_id, business_id)",
+    "CREATE INDEX IF NOT EXISTS idx_customer_accounts_customer_id ON customer_accounts(customer_id)",
+    "CREATE INDEX IF NOT EXISTS idx_customer_accounts_business_id ON customer_accounts(business_id)",
+    "CREATE INDEX IF NOT EXISTS idx_account_sessions_token_hash ON account_sessions(token_hash)",
+    "CREATE INDEX IF NOT EXISTS idx_account_sessions_account_id ON account_sessions(account_id)",
 )
 
 PERMISSIONS = {
@@ -189,6 +209,11 @@ def add_cors_headers(response):
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, HEAD"
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "no-referrer"
+    if request.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Pragma"] = "no-cache"
+    if request.is_secure:
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     return response
 
 
@@ -243,6 +268,76 @@ def normalize_permissions(values):
 
 def permissions_for_role(role_key):
     return list(ROLE_PERMISSION_MATRIX.get(normalize_role_key(role_key), ROLE_PERMISSION_MATRIX["employee"]))
+
+
+def normalize_customer_id(value):
+    return str(value or "").strip().lower()
+
+
+def validate_customer_id(value):
+    customer_id = normalize_customer_id(value)
+    if not CUSTOMER_ID_PATTERN.match(customer_id):
+        raise ValueError("Customer ID must be 4-32 characters and use letters, numbers, dot, dash, or underscore.")
+    return customer_id
+
+
+def password_validation_errors(password):
+    value = str(password or "")
+    errors = []
+    if len(value) < PASSWORD_RULES["min_length"]:
+        errors.append(f"Password must be at least {PASSWORD_RULES['min_length']} characters.")
+    if PASSWORD_RULES["uppercase"] and not re.search(r"[A-Z]", value):
+        errors.append("Password must include an uppercase letter.")
+    if PASSWORD_RULES["lowercase"] and not re.search(r"[a-z]", value):
+        errors.append("Password must include a lowercase letter.")
+    if PASSWORD_RULES["number"] and not re.search(r"\d", value):
+        errors.append("Password must include a number.")
+    if PASSWORD_RULES["special"] and not re.search(r"[^A-Za-z0-9\s]", value):
+        errors.append("Password must include a special character.")
+    if not PASSWORD_RULES["spaces"] and re.search(r"\s", value):
+        errors.append("Password must not contain spaces.")
+    return errors
+
+
+def hash_password(password, salt=None):
+    salt_bytes = salt or secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        str(password or "").encode("utf-8"),
+        salt_bytes,
+        PASSWORD_HASH_ITERATIONS,
+    )
+    return (
+        f"pbkdf2_sha256${PASSWORD_HASH_ITERATIONS}$"
+        f"{salt_bytes.hex()}${digest.hex()}"
+    )
+
+
+def verify_password(password, stored_hash):
+    try:
+        algorithm, iteration_text, salt_hex, digest_hex = str(stored_hash or "").split("$", 3)
+        if algorithm != "pbkdf2_sha256":
+            return False
+        salt_bytes = bytes.fromhex(salt_hex)
+        expected = bytes.fromhex(digest_hex)
+        actual = hashlib.pbkdf2_hmac(
+            "sha256",
+            str(password or "").encode("utf-8"),
+            salt_bytes,
+            int(iteration_text),
+        )
+        return hmac.compare_digest(actual, expected)
+    except (TypeError, ValueError):
+        return False
+
+
+def hash_session_token(token):
+    return hashlib.sha256(str(token or "").encode("utf-8")).hexdigest()
+
+
+def safe_identifier(value, prefix):
+    body = re.sub(r"[^a-z0-9_-]+", "_", normalize_customer_id(value)).strip("_")
+    return f"{prefix}_{body or secrets.token_hex(4)}"
 
 
 def current_auth_context():
@@ -483,11 +578,140 @@ def build_clerk_auth_context(claims):
     }
 
 
+def serialize_customer_account(row):
+    if not row:
+        return {}
+    return {
+        "id": row["id"],
+        "customer_id": row["customer_id"],
+        "name": row["name"] or row["customer_id"],
+        "email": row["email"] or "",
+        "business_id": row["business_id"] or DEFAULT_BUSINESS_ID,
+        "warehouse_id": row["warehouse_id"] or DEFAULT_WAREHOUSE_ID,
+        "role": normalize_role_key(row["role_key"] or "owner"),
+        "status": row["status"] or "Active",
+    }
+
+
+def ensure_roles_for_business(conn, business_id):
+    for role_key, permissions in ROLE_PERMISSION_MATRIX.items():
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO roles (
+                business_id, role_key, name, is_custom, permissions_json
+            )
+            VALUES (?, ?, ?, 0, ?)
+            """,
+            (
+                business_id,
+                role_key,
+                ROLE_LABELS.get(role_key, role_key.replace("_", " ").title()),
+                json_dumps(list(permissions)),
+            ),
+        )
+
+
+def build_account_auth_context(account_row, session_id=""):
+    membership = None
+    business_id = account_row["business_id"] or DEFAULT_BUSINESS_ID
+    with closing(get_connection()) as conn:
+        ensure_auth_schema(conn)
+        membership = get_membership_for_user(conn, account_row["id"], business_id)
+
+    role_key = normalize_role_key(
+        (membership["role_key"] if membership else account_row["role_key"]) or "owner"
+    )
+    permissions = normalize_permissions(json_loads(membership["permissions_json"], [])) if membership else []
+    if not permissions:
+        permissions = permissions_for_role(role_key)
+    if "*" not in permissions and role_key in {"owner", "admin"}:
+        permissions = list(ALL_PERMISSIONS)
+
+    return {
+        "authenticated": True,
+        "source": "cinchpos-account",
+        "user_id": account_row["id"],
+        "customer_id": account_row["customer_id"],
+        "email": account_row["email"] or "",
+        "name": account_row["name"] or account_row["customer_id"],
+        "business_id": business_id,
+        "warehouse_id": account_row["warehouse_id"] or DEFAULT_WAREHOUSE_ID,
+        "role": role_key,
+        "permissions": permissions,
+        "mfa_required": False,
+        "mfa_verified": True,
+        "session_id": session_id,
+    }
+
+
+def create_account_session(conn, account_row):
+    session_id = f"sess_{secrets.token_hex(16)}"
+    token = f"cinch_{secrets.token_urlsafe(32)}"
+    expires_at = datetime.now(UTC) + timedelta(hours=CINCHPOS_SESSION_HOURS)
+    conn.execute(
+        """
+        INSERT INTO account_sessions (
+            id, account_id, token_hash, business_id, warehouse_id, expires_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            session_id,
+            account_row["id"],
+            hash_session_token(token),
+            account_row["business_id"] or DEFAULT_BUSINESS_ID,
+            account_row["warehouse_id"] or DEFAULT_WAREHOUSE_ID,
+            expires_at.isoformat(),
+        ),
+    )
+    return token, session_id, expires_at
+
+
+def get_account_context_from_token(token):
+    token_hash = hash_session_token(token)
+    now_iso = datetime.now(UTC).isoformat()
+    with closing(get_connection()) as conn:
+        ensure_auth_schema(conn)
+        row = conn.execute(
+            """
+            SELECT account_sessions.id AS session_id,
+                   account_sessions.expires_at,
+                   account_sessions.revoked_at,
+                   customer_accounts.id,
+                   customer_accounts.customer_id,
+                   customer_accounts.email,
+                   customer_accounts.name,
+                   customer_accounts.business_id,
+                   customer_accounts.warehouse_id,
+                   customer_accounts.role_key,
+                   customer_accounts.status
+            FROM account_sessions
+            JOIN customer_accounts ON customer_accounts.id = account_sessions.account_id
+            WHERE account_sessions.token_hash = ?
+            """,
+            (token_hash,),
+        ).fetchone()
+        if not row or row["revoked_at"]:
+            raise PermissionError("Session expired. Please login again.")
+        if row["status"] != "Active":
+            raise PermissionError("This CinchPOS account is not active.")
+        if row["expires_at"] <= now_iso:
+            raise PermissionError("Session expired. Please login again.")
+        conn.execute(
+            "UPDATE account_sessions SET last_seen_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (row["session_id"],),
+        )
+        conn.commit()
+    return build_account_auth_context(row, row["session_id"])
+
+
 def get_request_auth_context(required=False):
     auth_header = request.headers.get("Authorization", "")
     if auth_header.lower().startswith("bearer "):
         token = auth_header.split(" ", 1)[1].strip()
         try:
+            if token.startswith("cinch_") or "." not in token:
+                return get_account_context_from_token(token)
             return build_clerk_auth_context(verify_clerk_token(token))
         except PermissionError:
             raise
@@ -714,6 +938,55 @@ def ensure_auth_schema(conn):
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS customer_accounts (
+            id TEXT PRIMARY KEY,
+            customer_id TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            business_id TEXT NOT NULL,
+            warehouse_id TEXT DEFAULT 'main',
+            role_key TEXT NOT NULL DEFAULT 'owner',
+            status TEXT DEFAULT 'Active',
+            email TEXT DEFAULT '',
+            name TEXT DEFAULT '',
+            failed_login_count INTEGER DEFAULT 0,
+            locked_until TEXT DEFAULT '',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_login_at TEXT DEFAULT '',
+            FOREIGN KEY (business_id) REFERENCES businesses (id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS account_sessions (
+            id TEXT PRIMARY KEY,
+            account_id TEXT NOT NULL,
+            token_hash TEXT NOT NULL UNIQUE,
+            business_id TEXT NOT NULL,
+            warehouse_id TEXT DEFAULT 'main',
+            expires_at TEXT NOT NULL,
+            revoked_at TEXT DEFAULT '',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (account_id) REFERENCES customer_accounts (id),
+            FOREIGN KEY (business_id) REFERENCES businesses (id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS workspace_snapshots (
+            business_id TEXT PRIMARY KEY,
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            updated_by TEXT DEFAULT '',
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (business_id) REFERENCES businesses (id)
+        )
+        """
+    )
     ensure_default_auth_records(conn)
 
 
@@ -790,6 +1063,8 @@ def init_db():
     ensure_column("payments", "method", "TEXT DEFAULT 'Bank Transfer'")
     ensure_column("payments", "notes", "TEXT DEFAULT ''")
     ensure_column("payments", "business_id", f"TEXT DEFAULT '{DEFAULT_BUSINESS_ID}'")
+    ensure_column("customer_accounts", "failed_login_count", "INTEGER DEFAULT 0")
+    ensure_column("customer_accounts", "locked_until", "TEXT DEFAULT ''")
 
     with closing(get_connection()) as conn:
         ensure_auth_schema(conn)
@@ -896,6 +1171,45 @@ def generate_invoice_number(conn, issued_on):
         suffix += 1
 
 
+def get_sales_events(business_id=None):
+    business_id = business_id or current_business_id()
+    with closing(get_connection()) as conn:
+        payment_rows = conn.execute(
+            """
+            SELECT paid_on AS sale_date, amount
+            FROM payments
+            WHERE business_id = ?
+            ORDER BY paid_on ASC, id ASC
+            """,
+            (business_id,),
+        ).fetchall()
+        invoice_rows = conn.execute(
+            """
+            SELECT
+                invoices.issued_on AS sale_date,
+                CASE
+                    WHEN invoices.total_paid - COALESCE(SUM(payments.amount), 0) > 0
+                    THEN invoices.total_paid - COALESCE(SUM(payments.amount), 0)
+                    ELSE 0
+                END AS amount
+            FROM invoices
+            LEFT JOIN payments ON payments.invoice_id = invoices.id
+            WHERE invoices.business_id = ?
+              AND invoices.total_paid > 0
+            GROUP BY invoices.id
+            ORDER BY invoices.issued_on ASC, invoices.id ASC
+            """,
+            (business_id,),
+        ).fetchall()
+
+    events = []
+    for row in [*payment_rows, *invoice_rows]:
+        amount = float(row["amount"] or 0)
+        if amount > 0:
+            events.append({"sale_date": row["sale_date"], "amount": amount})
+    return events
+
+
 def get_summary_data(business_id=None):
     business_id = business_id or current_business_id()
     today = today_value()
@@ -914,17 +1228,13 @@ def get_summary_data(business_id=None):
             ,
             (business_id,),
         ).fetchone()
-        revenue = conn.execute(
-            """
-            SELECT COALESCE(SUM(amount), 0) AS revenue
-            FROM payments
-            WHERE business_id = ?
-              AND paid_on BETWEEN ? AND ?
-            """,
-            (business_id, month_start, today_iso),
-        ).fetchone()
-
-    monthly_revenue = format_money(revenue["revenue"])
+    monthly_revenue = format_money(
+        sum(
+            event["amount"]
+            for event in get_sales_events(business_id)
+            if month_start <= event["sale_date"] <= today_iso
+        )
+    )
     expenses = format_money(totals["outstanding_total"])
     net_balance = format_money(monthly_revenue - expenses)
     return {
@@ -1036,16 +1346,7 @@ def get_alerts(limit=6, business_id=None):
 def get_trend_data(view, start_date=None, end_date=None, business_id=None):
     business_id = business_id or current_business_id()
     today = today_value()
-    with closing(get_connection()) as conn:
-        rows = conn.execute(
-            """
-            SELECT paid_on, amount
-            FROM payments
-            WHERE business_id = ?
-            ORDER BY paid_on ASC, id ASC
-            """,
-            (business_id,),
-        ).fetchall()
+    events = get_sales_events(business_id)
 
     points = []
     if view == "monthly":
@@ -1057,11 +1358,11 @@ def get_trend_data(view, start_date=None, end_date=None, business_id=None):
             cursor = (cursor.replace(day=1) - timedelta(days=1)).replace(day=1)
         month_starts.sort()
         totals = {month.strftime("%Y-%m"): 0.0 for month in month_starts}
-        for row in rows:
-            paid_on = parse_date(row["paid_on"], "paid_on")
-            key = paid_on.strftime("%Y-%m")
+        for event in events:
+            sale_date = parse_date(event["sale_date"], "sale_date")
+            key = sale_date.strftime("%Y-%m")
             if key in totals:
-                totals[key] += float(row["amount"] or 0)
+                totals[key] += float(event["amount"] or 0)
         for month in month_starts:
             key = month.strftime("%Y-%m")
             points.append(
@@ -1074,12 +1375,12 @@ def get_trend_data(view, start_date=None, end_date=None, business_id=None):
         week_starts = [today - timedelta(days=today.weekday()) - timedelta(weeks=offset) for offset in range(7, -1, -1)]
         week_starts.sort()
         totals = {day.isoformat(): 0.0 for day in week_starts}
-        for row in rows:
-            paid_on = parse_date(row["paid_on"], "paid_on")
-            week_start = paid_on - timedelta(days=paid_on.weekday())
+        for event in events:
+            sale_date = parse_date(event["sale_date"], "sale_date")
+            week_start = sale_date - timedelta(days=sale_date.weekday())
             key = week_start.isoformat()
             if key in totals:
-                totals[key] += float(row["amount"] or 0)
+                totals[key] += float(event["amount"] or 0)
         for day in week_starts:
             points.append(
                 {
@@ -1098,10 +1399,10 @@ def get_trend_data(view, start_date=None, end_date=None, business_id=None):
             raise ValueError("Custom range must be 90 days or less.")
         dates = [start + timedelta(days=offset) for offset in range((end - start).days + 1)]
         totals = {day.isoformat(): 0.0 for day in dates}
-        for row in rows:
-            paid_on = parse_date(row["paid_on"], "paid_on").isoformat()
-            if paid_on in totals:
-                totals[paid_on] += float(row["amount"] or 0)
+        for event in events:
+            sale_date = parse_date(event["sale_date"], "sale_date").isoformat()
+            if sale_date in totals:
+                totals[sale_date] += float(event["amount"] or 0)
         for day in dates:
             points.append(
                 {
@@ -1112,10 +1413,10 @@ def get_trend_data(view, start_date=None, end_date=None, business_id=None):
     else:
         dates = [today - timedelta(days=offset) for offset in range(6, -1, -1)]
         totals = {day.isoformat(): 0.0 for day in dates}
-        for row in rows:
-            paid_on = parse_date(row["paid_on"], "paid_on").isoformat()
-            if paid_on in totals:
-                totals[paid_on] += float(row["amount"] or 0)
+        for event in events:
+            sale_date = parse_date(event["sale_date"], "sale_date").isoformat()
+            if sale_date in totals:
+                totals[sale_date] += float(event["amount"] or 0)
         for day in dates:
             points.append(
                 {
@@ -1177,12 +1478,206 @@ def auth_context_endpoint():
     return jsonify(
         {
             "auth_required": AUTH_REQUIRED,
-            "configured": bool(CLERK_JWKS_URL),
+            "configured": True,
+            "cinchpos_accounts": True,
+            "password_rules": PASSWORD_RULES,
             "context": context,
             "permissions": PERMISSIONS,
             "role_permissions": {key: list(value) for key, value in ROLE_PERMISSION_MATRIX.items()},
         }
     )
+
+
+@app.route("/api/auth/password-rules", methods=["GET"])
+def auth_password_rules():
+    return jsonify({"rules": PASSWORD_RULES})
+
+
+@app.route("/api/auth/register", methods=["POST"])
+def register_customer_account():
+    data = request.get_json() or {}
+    try:
+        customer_id = validate_customer_id(data.get("customer_id") or data.get("user_id"))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    password = str(data.get("password") or "")
+    errors = password_validation_errors(password)
+    if errors:
+        return jsonify({"error": " ".join(errors), "password_errors": errors}), 400
+
+    display_name = (data.get("name") or customer_id).strip()
+    email = (data.get("email") or "").strip().lower()
+    business_name = (data.get("business_name") or f"{display_name} Store").strip()
+    account_id = f"acct_{secrets.token_hex(12)}"
+    business_id = safe_identifier(customer_id, "biz")
+    warehouse_id = f"{business_id}_main"
+
+    with closing(get_connection()) as conn:
+        ensure_auth_schema(conn)
+        if conn.execute(
+            "SELECT 1 FROM customer_accounts WHERE customer_id = ?",
+            (customer_id,),
+        ).fetchone():
+            return jsonify({"error": "This customer ID is already registered."}), 409
+
+        conn.execute(
+            """
+            INSERT INTO businesses (id, name, owner_user_id, status)
+            VALUES (?, ?, ?, 'Active')
+            """,
+            (business_id, business_name, account_id),
+        )
+        conn.execute(
+            """
+            INSERT INTO warehouses (id, business_id, name, status)
+            VALUES (?, ?, 'Main Warehouse', 'Active')
+            """,
+            (warehouse_id, business_id),
+        )
+        ensure_roles_for_business(conn, business_id)
+        conn.execute(
+            """
+            INSERT INTO customer_accounts (
+                id, customer_id, password_hash, business_id, warehouse_id,
+                role_key, status, email, name, last_login_at
+            )
+            VALUES (?, ?, ?, ?, ?, 'owner', 'Active', ?, ?, ?)
+            """,
+            (
+                account_id,
+                customer_id,
+                hash_password(password),
+                business_id,
+                warehouse_id,
+                email,
+                display_name,
+                datetime.now(UTC).isoformat(),
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO business_memberships (
+                clerk_user_id, business_id, warehouse_id, role_key,
+                permissions_json, status, email, name, mfa_required
+            )
+            VALUES (?, ?, ?, 'owner', ?, 'Active', ?, ?, 0)
+            """,
+            (
+                account_id,
+                business_id,
+                warehouse_id,
+                json_dumps(list(ALL_PERMISSIONS)),
+                email,
+                display_name,
+            ),
+        )
+        account_row = conn.execute(
+            "SELECT * FROM customer_accounts WHERE id = ?",
+            (account_id,),
+        ).fetchone()
+        token, session_id, expires_at = create_account_session(conn, account_row)
+        conn.commit()
+
+    context = build_account_auth_context(account_row, session_id)
+    g.auth_context = context
+    log_auth_event("customer_account.registered", context, {"customer_id": customer_id})
+    return jsonify(
+        {
+            "token": token,
+            "expires_at": expires_at.isoformat(),
+            "account": serialize_customer_account(account_row),
+            "context": context,
+            "auth_required": AUTH_REQUIRED,
+            "configured": True,
+        }
+    ), 201
+
+
+@app.route("/api/auth/login", methods=["POST"])
+def login_customer_account():
+    data = request.get_json() or {}
+    customer_id = normalize_customer_id(data.get("customer_id") or data.get("user_id"))
+    password = str(data.get("password") or "")
+    if not customer_id or not password:
+        return jsonify({"error": "Customer ID and password are required."}), 400
+
+    with closing(get_connection()) as conn:
+        ensure_auth_schema(conn)
+        account_row = conn.execute(
+            "SELECT * FROM customer_accounts WHERE customer_id = ?",
+            (customer_id,),
+        ).fetchone()
+        now_iso = datetime.now(UTC).isoformat()
+        if not account_row or account_row["status"] != "Active":
+            return jsonify({"error": "Invalid customer ID or password."}), 401
+        if account_row["locked_until"] and account_row["locked_until"] > now_iso:
+            return jsonify({"error": "Account is temporarily locked. Please try again later."}), 423
+        if not verify_password(password, account_row["password_hash"]):
+            next_failed_count = int(account_row["failed_login_count"] or 0) + 1
+            locked_until = ""
+            if next_failed_count >= LOGIN_LOCK_THRESHOLD:
+                locked_until = (datetime.now(UTC) + timedelta(minutes=LOGIN_LOCK_MINUTES)).isoformat()
+                next_failed_count = 0
+            conn.execute(
+                """
+                UPDATE customer_accounts
+                SET failed_login_count = ?,
+                    locked_until = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (next_failed_count, locked_until, account_row["id"]),
+            )
+            conn.commit()
+            return jsonify({"error": "Invalid customer ID or password."}), 401
+        conn.execute(
+            """
+            UPDATE customer_accounts
+            SET last_login_at = ?,
+                failed_login_count = 0,
+                locked_until = '',
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (now_iso, account_row["id"]),
+        )
+        token, session_id, expires_at = create_account_session(conn, account_row)
+        conn.commit()
+
+    context = build_account_auth_context(account_row, session_id)
+    g.auth_context = context
+    log_auth_event("customer_account.login", context, {"customer_id": customer_id})
+    return jsonify(
+        {
+            "token": token,
+            "expires_at": expires_at.isoformat(),
+            "account": serialize_customer_account(account_row),
+            "context": context,
+            "auth_required": AUTH_REQUIRED,
+            "configured": True,
+        }
+    )
+
+
+@app.route("/api/auth/logout", methods=["POST"])
+def logout_customer_account():
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.lower().startswith("bearer "):
+        token = auth_header.split(" ", 1)[1].strip()
+        if token.startswith("cinch_") or "." not in token:
+            with closing(get_connection()) as conn:
+                ensure_auth_schema(conn)
+                conn.execute(
+                    """
+                    UPDATE account_sessions
+                    SET revoked_at = ?
+                    WHERE token_hash = ? AND revoked_at = ''
+                    """,
+                    (datetime.now(UTC).isoformat(), hash_session_token(token)),
+                )
+                conn.commit()
+    return jsonify({"ok": True})
 
 
 @app.route("/api/auth/businesses", methods=["GET"])
@@ -1448,6 +1943,60 @@ def list_auth_audit_logs():
         }
         for row in rows
     ])
+
+
+@app.route("/api/workspace/snapshot", methods=["GET"])
+@require_permission("business:read")
+def get_workspace_snapshot():
+    business_id = current_business_id()
+    with closing(get_connection()) as conn:
+        ensure_auth_schema(conn)
+        row = conn.execute(
+            """
+            SELECT payload_json, updated_by, updated_at
+            FROM workspace_snapshots
+            WHERE business_id = ?
+            """,
+            (business_id,),
+        ).fetchone()
+    payload = json_loads(row["payload_json"], {}) if row else {}
+    return jsonify(
+        {
+            "business_id": business_id,
+            "payload": payload,
+            "updated_by": row["updated_by"] if row else "",
+            "updated_at": row["updated_at"] if row else "",
+        }
+    )
+
+
+@app.route("/api/workspace/snapshot", methods=["PUT"])
+@require_permission("business:write")
+def save_workspace_snapshot():
+    data = request.get_json() or {}
+    payload = data.get("payload")
+    if not isinstance(payload, dict):
+        return jsonify({"error": "Workspace payload must be an object."}), 400
+    context = current_auth_context()
+    business_id = current_business_id()
+    with closing(get_connection()) as conn:
+        ensure_auth_schema(conn)
+        conn.execute(
+            """
+            INSERT INTO workspace_snapshots (
+                business_id, payload_json, updated_by, updated_at
+            )
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(business_id)
+            DO UPDATE SET payload_json = excluded.payload_json,
+                          updated_by = excluded.updated_by,
+                          updated_at = CURRENT_TIMESTAMP
+            """,
+            (business_id, json_dumps(payload), context["user_id"]),
+        )
+        conn.commit()
+    log_auth_event("workspace_snapshot.saved", context, {"keys": sorted(payload.keys())[:30]})
+    return jsonify({"business_id": business_id, "updated_by": context["user_id"], "ok": True})
 
 
 @app.route("/api/dashboard")
