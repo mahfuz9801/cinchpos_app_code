@@ -77,17 +77,19 @@ class CinchPOSAPITestCase(unittest.TestCase):
     def test_customer_account_register_login_logout_and_snapshot(self):
         weak_response = self.client.post(
             "/api/auth/register",
-            json={"customer_id": "testshop", "password": "weak"},
+            json={"username": "testshop", "password": "weak"},
         )
         self.assertEqual(weak_response.status_code, 400)
 
         register_response = self.client.post(
             "/api/auth/register",
             json={
-                "customer_id": "testshop",
+                "username": "testshop",
                 "password": "Strong#123",
+                "confirm_password": "Strong#123",
                 "name": "Test Shop",
                 "email": "owner@example.com",
+                "phone": "+919876543210",
                 "business_name": "Test Shop Business",
             },
         )
@@ -95,7 +97,53 @@ class CinchPOSAPITestCase(unittest.TestCase):
         register_payload = register_response.get_json()
         token = register_payload["token"]
         self.assertTrue(token.startswith("cinch_"))
+        self.assertEqual(register_payload["account"]["username"], "testshop")
+        self.assertEqual(register_payload["context"]["username"], "testshop")
         self.assertEqual(register_payload["context"]["customer_id"], "testshop")
+
+        duplicate_response = self.client.post(
+            "/api/auth/register",
+            json={
+                "username": "testshop",
+                "password": "Strong#123",
+                "confirm_password": "Strong#123",
+                "email": "other@example.com",
+                "phone": "+919999999999",
+                "business_name": "Duplicate Shop",
+            },
+        )
+        self.assertEqual(duplicate_response.status_code, 409)
+        self.assertEqual(duplicate_response.get_json()["error"], "This username is already registered.")
+
+        email_otp_response = self.client.post(
+            "/api/auth/otp/request",
+            json={"identifier": "owner@example.com"},
+        )
+        self.assertEqual(email_otp_response.status_code, 200)
+        email_otp_payload = email_otp_response.get_json()
+        self.assertEqual(email_otp_payload["channel"], "email")
+        self.assertTrue(email_otp_payload["dev_otp"])
+        email_otp_login_response = self.client.post(
+            "/api/auth/otp/verify",
+            json={"identifier": "owner@example.com", "otp": email_otp_payload["dev_otp"]},
+        )
+        self.assertEqual(email_otp_login_response.status_code, 200)
+        self.assertTrue(email_otp_login_response.get_json()["token"].startswith("cinch_"))
+
+        phone_otp_response = self.client.post(
+            "/api/auth/otp/request",
+            json={"identifier": "+919876543210"},
+        )
+        self.assertEqual(phone_otp_response.status_code, 200)
+        phone_otp_payload = phone_otp_response.get_json()
+        self.assertEqual(phone_otp_payload["channel"], "phone")
+        self.assertTrue(phone_otp_payload["dev_otp"])
+        phone_otp_login_response = self.client.post(
+            "/api/auth/otp/verify",
+            json={"identifier": "9876543210", "otp": phone_otp_payload["dev_otp"]},
+        )
+        self.assertEqual(phone_otp_login_response.status_code, 200)
+        self.assertTrue(phone_otp_login_response.get_json()["token"].startswith("cinch_"))
 
         auth_headers = {"Authorization": f"Bearer {token}"}
         context_response = self.client.get("/api/auth/context", headers=auth_headers)
@@ -122,10 +170,12 @@ class CinchPOSAPITestCase(unittest.TestCase):
 
         login_response = self.client.post(
             "/api/auth/login",
-            json={"customer_id": "testshop", "password": "Strong#123"},
+            json={"username": "testshop", "password": "Strong#123"},
         )
         self.assertEqual(login_response.status_code, 200)
-        self.assertTrue(login_response.get_json()["token"].startswith("cinch_"))
+        login_payload = login_response.get_json()
+        self.assertTrue(login_payload["token"].startswith("cinch_"))
+        self.assertEqual(login_payload["context"]["username"], "testshop")
 
     def test_duplicate_invoice_number_returns_conflict(self):
         customer = self.create_customer()
@@ -210,6 +260,78 @@ class CinchPOSAPITestCase(unittest.TestCase):
         self.assertEqual(payload["view"], "custom")
         self.assertEqual(len(payload["points"]), 2)
         self.assertEqual(payload["points"][1]["value"], 200.0)
+
+    def test_online_store_publish_checkout_and_invoice_download_data(self):
+        publish_response = self.client.put(
+            "/api/online-store/publish",
+            json={
+                "store": {
+                    "store_name": "Ardh Sainik Canteen",
+                    "contact_phone": "+919038956555",
+                    "contact_email": "support@cinchpos.in",
+                    "address": "Kolkata",
+                    "logo_url": "/assets/logo-cinchpos-mark.png",
+                },
+                "products": [
+                    {
+                        "id": "vasline-90ml",
+                        "name": "Vasline deep moisture 90ml",
+                        "barcode": "8901030978449",
+                        "barcodes": ["8901030978449"],
+                        "category": "Personal Care",
+                        "stock": 5,
+                        "offlinePrice": 85,
+                        "onlinePrice": 82,
+                        "mrp": 90,
+                        "gstRate": 18,
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(publish_response.status_code, 200)
+        published = publish_response.get_json()
+        self.assertEqual(published["published_count"], 1)
+        self.assertRegex(published["store"]["slug"], r"^ardh-sainik-canteen-\d{4}$")
+        self.assertIn("/online-store", published["store"]["public_url"])
+
+        store_slug = published["store"]["slug"]
+        public_response = self.client.get(f"/api/public/stores/{store_slug}")
+        self.assertEqual(public_response.status_code, 200)
+        public_payload = public_response.get_json()
+        self.assertEqual(public_payload["store"]["store_name"], "Ardh Sainik Canteen")
+        self.assertEqual(len(public_payload["products"]), 1)
+        self.assertEqual(public_payload["products"][0]["online_price"], 82.0)
+
+        checkout_response = self.client.post(
+            f"/api/public/stores/{store_slug}/checkout",
+            json={
+                "customer": {
+                    "name": "Online Customer",
+                    "phone": "9876543210",
+                    "email": "customer@example.com",
+                    "address": "Sample address",
+                },
+                "items": [{"product_key": "vasline-90ml", "quantity": 2}],
+            },
+        )
+        self.assertEqual(checkout_response.status_code, 201)
+        checkout_payload = checkout_response.get_json()
+        self.assertTrue(checkout_payload["order"]["invoice_number"].startswith("WEB-"))
+        self.assertEqual(checkout_payload["order"]["total"], 164.0)
+        self.assertEqual(checkout_payload["order"]["discount_total"], 16.0)
+        self.assertEqual(checkout_payload["order"]["items"][0]["quantity"], 2)
+
+        refreshed_store = self.client.get(f"/api/public/stores/{store_slug}").get_json()
+        self.assertEqual(refreshed_store["products"][0]["stock"], 3.0)
+
+        invoice_response = self.client.get(
+            f"/api/public/orders/{checkout_payload['order']['id']}/invoice"
+        )
+        self.assertEqual(invoice_response.status_code, 200)
+        invoice_payload = invoice_response.get_json()
+        self.assertEqual(invoice_payload["order"]["invoice_number"], checkout_payload["order"]["invoice_number"])
+        self.assertEqual(invoice_payload["store"]["store_name"], "Ardh Sainik Canteen")
 
 
 if __name__ == "__main__":

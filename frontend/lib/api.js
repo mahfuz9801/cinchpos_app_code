@@ -181,6 +181,20 @@ export function loginCinchAccount(payload) {
   });
 }
 
+export function requestCinchAccountOtp(payload) {
+  return fetchJSON("/api/auth/otp/request", {
+    method: "POST",
+    body: JSON.stringify(payload)
+  });
+}
+
+export function verifyCinchAccountOtp(payload) {
+  return fetchJSON("/api/auth/otp/verify", {
+    method: "POST",
+    body: JSON.stringify(payload)
+  });
+}
+
 export function logoutCinchAccount() {
   return fetchJSON("/api/auth/logout", {
     method: "POST",
@@ -241,6 +255,32 @@ export function saveWorkspaceSnapshot(payload) {
     method: "PUT",
     body: JSON.stringify({ payload })
   });
+}
+
+export function getOnlineStoreProfile() {
+  return fetchJSON("/api/online-store/profile");
+}
+
+export function publishOnlineStore(payload) {
+  return fetchJSON("/api/online-store/publish", {
+    method: "PUT",
+    body: JSON.stringify(payload)
+  });
+}
+
+export function getPublicOnlineStore(storeSlug) {
+  return fetchJSON(`/api/public/stores/${encodeURIComponent(storeSlug)}`);
+}
+
+export function checkoutPublicOnlineStore(storeSlug, payload) {
+  return fetchJSON(`/api/public/stores/${encodeURIComponent(storeSlug)}/checkout`, {
+    method: "POST",
+    body: JSON.stringify(payload)
+  });
+}
+
+export function getPublicOnlineInvoice(orderId) {
+  return fetchJSON(`/api/public/orders/${encodeURIComponent(orderId)}/invoice`);
 }
 
 export function getCustomers() {

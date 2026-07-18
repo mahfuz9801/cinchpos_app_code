@@ -3,8 +3,11 @@ import sqlite3
 import sys
 import hashlib
 import hmac
+import smtplib
+import ssl
 from contextlib import closing
 from datetime import UTC, date, datetime, timedelta
+from email.message import EmailMessage
 from functools import wraps
 import json
 import re
@@ -55,6 +58,23 @@ CINCHPOS_SESSION_HOURS = int(os.getenv("CINCHPOS_ACCOUNT_SESSION_HOURS", "168"))
 PASSWORD_HASH_ITERATIONS = int(os.getenv("CINCHPOS_PASSWORD_HASH_ITERATIONS", "310000"))
 LOGIN_LOCK_THRESHOLD = int(os.getenv("CINCHPOS_LOGIN_LOCK_THRESHOLD", "5"))
 LOGIN_LOCK_MINUTES = int(os.getenv("CINCHPOS_LOGIN_LOCK_MINUTES", "15"))
+OTP_LENGTH = int(os.getenv("CINCHPOS_OTP_LENGTH", "6"))
+OTP_EXPIRY_MINUTES = int(os.getenv("CINCHPOS_OTP_EXPIRY_MINUTES", "10"))
+OTP_RESEND_SECONDS = int(os.getenv("CINCHPOS_OTP_RESEND_SECONDS", "60"))
+OTP_MAX_ATTEMPTS = int(os.getenv("CINCHPOS_OTP_MAX_ATTEMPTS", "5"))
+EMAIL_OTP_FROM = os.getenv("CINCHPOS_EMAIL_FROM", "support@cinchpos.in").strip()
+SMTP_HOST = os.getenv("CINCHPOS_SMTP_HOST", "").strip()
+SMTP_PORT = int(os.getenv("CINCHPOS_SMTP_PORT", "587"))
+SMTP_USERNAME = os.getenv("CINCHPOS_SMTP_USERNAME", EMAIL_OTP_FROM).strip()
+SMTP_PASSWORD = os.getenv("CINCHPOS_SMTP_PASSWORD", "").strip()
+SMTP_SECURITY = os.getenv("CINCHPOS_SMTP_SECURITY", "starttls").strip().lower()
+SMS_WEBHOOK_URL = os.getenv("CINCHPOS_SMS_WEBHOOK_URL", "").strip()
+EXPOSE_DEV_OTP = os.getenv("CINCHPOS_EXPOSE_DEV_OTP", "0").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 CUSTOMER_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{3,31}$")
 PASSWORD_RULES = {
     "min_length": 8,
@@ -80,9 +100,19 @@ DB_INDEX_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS idx_auth_audit_user_id ON auth_audit_logs(user_id)",
     "CREATE INDEX IF NOT EXISTS idx_memberships_user_business ON business_memberships(clerk_user_id, business_id)",
     "CREATE INDEX IF NOT EXISTS idx_customer_accounts_customer_id ON customer_accounts(customer_id)",
+    "CREATE INDEX IF NOT EXISTS idx_customer_accounts_email ON customer_accounts(email)",
+    "CREATE INDEX IF NOT EXISTS idx_customer_accounts_phone ON customer_accounts(phone)",
     "CREATE INDEX IF NOT EXISTS idx_customer_accounts_business_id ON customer_accounts(business_id)",
     "CREATE INDEX IF NOT EXISTS idx_account_sessions_token_hash ON account_sessions(token_hash)",
     "CREATE INDEX IF NOT EXISTS idx_account_sessions_account_id ON account_sessions(account_id)",
+    "CREATE INDEX IF NOT EXISTS idx_account_otp_codes_account_id ON account_otp_codes(account_id)",
+    "CREATE INDEX IF NOT EXISTS idx_account_otp_codes_destination ON account_otp_codes(destination)",
+    "CREATE INDEX IF NOT EXISTS idx_online_stores_business_id ON online_stores(business_id)",
+    "CREATE INDEX IF NOT EXISTS idx_online_stores_slug ON online_stores(slug)",
+    "CREATE INDEX IF NOT EXISTS idx_online_products_business_id ON online_products(business_id)",
+    "CREATE INDEX IF NOT EXISTS idx_online_products_store_id ON online_products(store_id)",
+    "CREATE INDEX IF NOT EXISTS idx_online_orders_business_id ON online_orders(business_id)",
+    "CREATE INDEX IF NOT EXISTS idx_online_orders_store_id ON online_orders(store_id)",
 )
 
 PERMISSIONS = {
@@ -274,10 +304,37 @@ def normalize_customer_id(value):
     return str(value or "").strip().lower()
 
 
+def account_username_from_payload(data):
+    return data.get("username") or data.get("user_name") or data.get("customer_id") or data.get("user_id")
+
+
+def normalize_account_email(value):
+    return str(value or "").strip().lower()
+
+
+def normalize_account_phone(value):
+    digits = re.sub(r"\D+", "", str(value or ""))
+    if digits.startswith("91") and len(digits) == 12:
+        digits = digits[2:]
+    return digits[-10:] if len(digits) >= 10 else digits
+
+
+def account_identifier_from_payload(data):
+    return (
+        data.get("identifier")
+        or data.get("login")
+        or data.get("username")
+        or data.get("email")
+        or data.get("phone")
+        or data.get("customer_id")
+        or data.get("user_id")
+    )
+
+
 def validate_customer_id(value):
     customer_id = normalize_customer_id(value)
     if not CUSTOMER_ID_PATTERN.match(customer_id):
-        raise ValueError("Customer ID must be 4-32 characters and use letters, numbers, dot, dash, or underscore.")
+        raise ValueError("Username must be 4-32 characters and use letters, numbers, dot, dash, or underscore.")
     return customer_id
 
 
@@ -581,11 +638,14 @@ def build_clerk_auth_context(claims):
 def serialize_customer_account(row):
     if not row:
         return {}
+    username = row["customer_id"]
     return {
         "id": row["id"],
-        "customer_id": row["customer_id"],
-        "name": row["name"] or row["customer_id"],
+        "username": username,
+        "customer_id": username,
+        "name": row["name"] or username,
         "email": row["email"] or "",
+        "phone": row["phone"] or "",
         "business_id": row["business_id"] or DEFAULT_BUSINESS_ID,
         "warehouse_id": row["warehouse_id"] or DEFAULT_WAREHOUSE_ID,
         "role": normalize_role_key(row["role_key"] or "owner"),
@@ -631,8 +691,10 @@ def build_account_auth_context(account_row, session_id=""):
         "authenticated": True,
         "source": "cinchpos-account",
         "user_id": account_row["id"],
+        "username": account_row["customer_id"],
         "customer_id": account_row["customer_id"],
         "email": account_row["email"] or "",
+        "phone": account_row["phone"] or "",
         "name": account_row["name"] or account_row["customer_id"],
         "business_id": business_id,
         "warehouse_id": account_row["warehouse_id"] or DEFAULT_WAREHOUSE_ID,
@@ -667,6 +729,163 @@ def create_account_session(conn, account_row):
     return token, session_id, expires_at
 
 
+def parse_db_datetime(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00").replace(" ", "T"))
+    except ValueError:
+        return None
+
+
+def make_otp_code():
+    max_value = 10 ** max(4, OTP_LENGTH)
+    return f"{secrets.randbelow(max_value):0{max(4, OTP_LENGTH)}d}"
+
+
+def find_account_for_login_identifier(conn, identifier):
+    value = str(identifier or "").strip()
+    email = normalize_account_email(value)
+    phone = normalize_account_phone(value)
+    username = normalize_customer_id(value)
+    if "@" in value:
+        return conn.execute(
+            "SELECT * FROM customer_accounts WHERE lower(email) = ?",
+            (email,),
+        ).fetchone()
+    if phone and len(phone) == 10 and re.fullmatch(r"\d{10}", phone):
+        return conn.execute(
+            "SELECT * FROM customer_accounts WHERE phone = ?",
+            (phone,),
+        ).fetchone()
+    return conn.execute(
+        "SELECT * FROM customer_accounts WHERE customer_id = ?",
+        (username,),
+    ).fetchone()
+
+
+def send_email_otp(destination, code):
+    if not SMTP_HOST or not SMTP_PASSWORD:
+        return {"sent": False, "reason": "smtp_not_configured"}
+
+    message = EmailMessage()
+    message["Subject"] = "Your CinchPOS login OTP"
+    message["From"] = EMAIL_OTP_FROM
+    message["To"] = destination
+    message.set_content(
+        "\n".join(
+            [
+                "Your CinchPOS login OTP is:",
+                "",
+                code,
+                "",
+                f"This OTP expires in {OTP_EXPIRY_MINUTES} minutes.",
+                "If you did not request this, you can ignore this email.",
+            ]
+        )
+    )
+
+    if SMTP_SECURITY in {"ssl", "smtps"}:
+        context = ssl.create_default_context()
+        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=context, timeout=15) as smtp:
+            smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
+            smtp.send_message(message)
+    else:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as smtp:
+            if SMTP_SECURITY in {"starttls", "tls"}:
+                smtp.starttls(context=ssl.create_default_context())
+            smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
+            smtp.send_message(message)
+    return {"sent": True, "reason": ""}
+
+
+def send_sms_otp(destination, code):
+    if not SMS_WEBHOOK_URL:
+        return {"sent": False, "reason": "sms_not_configured"}
+    payload = json_dumps(
+        {
+            "to": destination,
+            "message": f"Your CinchPOS OTP is {code}. It expires in {OTP_EXPIRY_MINUTES} minutes.",
+            "otp": code,
+            "purpose": "cinchpos-login",
+        }
+    ).encode("utf-8")
+    request_obj = urlrequest.Request(
+        SMS_WEBHOOK_URL,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urlrequest.urlopen(request_obj, timeout=15) as response:
+        if response.status >= 400:
+            return {"sent": False, "reason": "sms_provider_failed"}
+    return {"sent": True, "reason": ""}
+
+
+def deliver_otp(channel, destination, code):
+    try:
+        if channel == "email":
+            return send_email_otp(destination, code)
+        if channel == "phone":
+            return send_sms_otp(destination, code)
+    except Exception as exc:
+        return {"sent": False, "reason": str(exc)}
+    return {"sent": False, "reason": "unsupported_channel"}
+
+
+def mask_contact(destination, channel):
+    value = str(destination or "")
+    if channel == "email" and "@" in value:
+        local, domain = value.split("@", 1)
+        visible = local[:2] if len(local) > 2 else local[:1]
+        return f"{visible}{'*' * max(2, len(local) - len(visible))}@{domain}"
+    if channel == "phone":
+        digits = normalize_account_phone(value)
+        return f"******{digits[-4:]}" if len(digits) >= 4 else "phone number"
+    return "registered contact"
+
+
+def create_otp_challenge(conn, account_row, channel, destination):
+    latest = conn.execute(
+        """
+        SELECT created_at
+        FROM account_otp_codes
+        WHERE account_id = ? AND consumed_at = ''
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        (account_row["id"],),
+    ).fetchone()
+    latest_created_at = parse_db_datetime(latest["created_at"]) if latest else None
+    if latest_created_at:
+        seconds_since = (datetime.now(UTC).replace(tzinfo=None) - latest_created_at.replace(tzinfo=None)).total_seconds()
+        if seconds_since < OTP_RESEND_SECONDS:
+            wait_seconds = max(1, int(OTP_RESEND_SECONDS - seconds_since))
+            return None, {"error": f"Please wait {wait_seconds} seconds before requesting another OTP.", "status": 429}
+
+    code = make_otp_code()
+    otp_id = f"otp_{secrets.token_hex(12)}"
+    expires_at = datetime.now(UTC) + timedelta(minutes=OTP_EXPIRY_MINUTES)
+    conn.execute(
+        """
+        UPDATE account_otp_codes
+        SET consumed_at = ?
+        WHERE account_id = ? AND consumed_at = ''
+        """,
+        (datetime.now(UTC).isoformat(), account_row["id"]),
+    )
+    conn.execute(
+        """
+        INSERT INTO account_otp_codes (
+            id, account_id, channel, destination, code_hash, expires_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (otp_id, account_row["id"], channel, destination, hash_password(code), expires_at.isoformat()),
+    )
+    return {"id": otp_id, "code": code, "expires_at": expires_at}, None
+
+
 def get_account_context_from_token(token):
     token_hash = hash_session_token(token)
     now_iso = datetime.now(UTC).isoformat()
@@ -680,6 +899,7 @@ def get_account_context_from_token(token):
                    customer_accounts.id,
                    customer_accounts.customer_id,
                    customer_accounts.email,
+                   customer_accounts.phone,
                    customer_accounts.name,
                    customer_accounts.business_id,
                    customer_accounts.warehouse_id,
@@ -949,6 +1169,7 @@ def ensure_auth_schema(conn):
             role_key TEXT NOT NULL DEFAULT 'owner',
             status TEXT DEFAULT 'Active',
             email TEXT DEFAULT '',
+            phone TEXT DEFAULT '',
             name TEXT DEFAULT '',
             failed_login_count INTEGER DEFAULT 0,
             locked_until TEXT DEFAULT '',
@@ -956,6 +1177,22 @@ def ensure_auth_schema(conn):
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             last_login_at TEXT DEFAULT '',
             FOREIGN KEY (business_id) REFERENCES businesses (id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS account_otp_codes (
+            id TEXT PRIMARY KEY,
+            account_id TEXT NOT NULL,
+            channel TEXT NOT NULL,
+            destination TEXT NOT NULL,
+            code_hash TEXT NOT NULL,
+            attempts INTEGER DEFAULT 0,
+            expires_at TEXT NOT NULL,
+            consumed_at TEXT DEFAULT '',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (account_id) REFERENCES customer_accounts (id)
         )
         """
     )
@@ -983,6 +1220,78 @@ def ensure_auth_schema(conn):
             payload_json TEXT NOT NULL DEFAULT '{}',
             updated_by TEXT DEFAULT '',
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (business_id) REFERENCES businesses (id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS online_stores (
+            id TEXT PRIMARY KEY,
+            business_id TEXT NOT NULL UNIQUE,
+            public_code TEXT NOT NULL UNIQUE,
+            slug TEXT NOT NULL UNIQUE,
+            store_name TEXT NOT NULL,
+            contact_phone TEXT DEFAULT '',
+            contact_email TEXT DEFAULT '',
+            address TEXT DEFAULT '',
+            logo_url TEXT DEFAULT '',
+            status TEXT DEFAULT 'Active',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (business_id) REFERENCES businesses (id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS online_products (
+            id TEXT PRIMARY KEY,
+            store_id TEXT NOT NULL,
+            business_id TEXT NOT NULL,
+            product_key TEXT NOT NULL,
+            name TEXT NOT NULL,
+            barcode TEXT DEFAULT '',
+            barcodes_json TEXT NOT NULL DEFAULT '[]',
+            category TEXT DEFAULT '',
+            hsn TEXT DEFAULT '',
+            unit TEXT DEFAULT 'Pcs',
+            stock REAL DEFAULT 0,
+            offline_price REAL DEFAULT 0,
+            online_price REAL DEFAULT 0,
+            mrp REAL DEFAULT 0,
+            gst_rate REAL DEFAULT 0,
+            image_url TEXT DEFAULT '',
+            status TEXT DEFAULT 'Active',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (business_id, product_key),
+            FOREIGN KEY (store_id) REFERENCES online_stores (id),
+            FOREIGN KEY (business_id) REFERENCES businesses (id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS online_orders (
+            id TEXT PRIMARY KEY,
+            store_id TEXT NOT NULL,
+            business_id TEXT NOT NULL,
+            invoice_number TEXT NOT NULL UNIQUE,
+            customer_name TEXT NOT NULL,
+            customer_phone TEXT DEFAULT '',
+            customer_email TEXT DEFAULT '',
+            customer_address TEXT DEFAULT '',
+            items_json TEXT NOT NULL DEFAULT '[]',
+            subtotal REAL DEFAULT 0,
+            gst_total REAL DEFAULT 0,
+            discount_total REAL DEFAULT 0,
+            total REAL DEFAULT 0,
+            status TEXT DEFAULT 'Placed',
+            payment_status TEXT DEFAULT 'Unpaid',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (store_id) REFERENCES online_stores (id),
             FOREIGN KEY (business_id) REFERENCES businesses (id)
         )
         """
@@ -1065,6 +1374,7 @@ def init_db():
     ensure_column("payments", "business_id", f"TEXT DEFAULT '{DEFAULT_BUSINESS_ID}'")
     ensure_column("customer_accounts", "failed_login_count", "INTEGER DEFAULT 0")
     ensure_column("customer_accounts", "locked_until", "TEXT DEFAULT ''")
+    ensure_column("customer_accounts", "phone", "TEXT DEFAULT ''")
 
     with closing(get_connection()) as conn:
         ensure_auth_schema(conn)
@@ -1141,6 +1451,161 @@ def serialize_payment(row):
         "method": row["method"] or "Bank Transfer",
         "paid_on": row["paid_on"],
         "notes": row["notes"] or "",
+        "created_at": row["created_at"],
+    }
+
+
+def slugify_store_name(value):
+    slug = re.sub(r"[^a-z0-9]+", "-", str(value or "").strip().lower()).strip("-")
+    return slug[:48].strip("-") or "store"
+
+
+def generate_online_public_code(conn):
+    for _ in range(300):
+        candidate = f"{secrets.randbelow(10000):04d}"
+        existing = conn.execute(
+            "SELECT 1 FROM online_stores WHERE public_code = ?",
+            (candidate,),
+        ).fetchone()
+        if not existing:
+            return candidate
+    raise RuntimeError("Could not generate a unique online store code.")
+
+
+def build_online_store_slug(store_name, public_code):
+    return f"{slugify_store_name(store_name)}-{public_code}"
+
+
+def generate_online_invoice_number(conn):
+    prefix = datetime.now(UTC).strftime("WEB-%Y%m%d")
+    suffix = 1
+    while True:
+        candidate = f"{prefix}-{suffix:04d}"
+        existing = conn.execute(
+            "SELECT 1 FROM online_orders WHERE invoice_number = ?",
+            (candidate,),
+        ).fetchone()
+        if not existing:
+            return candidate
+        suffix += 1
+
+
+def serialize_online_store(row):
+    if not row:
+        return None
+    public_url = f"https://www.cinchpos.in/{row['slug']}/online-store"
+    return {
+        "id": row["id"],
+        "business_id": row["business_id"],
+        "public_code": row["public_code"],
+        "slug": row["slug"],
+        "store_name": row["store_name"],
+        "contact_phone": row["contact_phone"] or "",
+        "contact_email": row["contact_email"] or "",
+        "address": row["address"] or "",
+        "logo_url": row["logo_url"] or "",
+        "status": row["status"] or "Active",
+        "public_url": public_url,
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def serialize_online_product(row):
+    if not row:
+        return None
+    return {
+        "id": row["id"],
+        "product_key": row["product_key"],
+        "name": row["name"],
+        "barcode": row["barcode"] or "",
+        "barcodes": json_loads(row["barcodes_json"], []),
+        "category": row["category"] or "",
+        "hsn": row["hsn"] or "",
+        "unit": row["unit"] or "Pcs",
+        "stock": format_money(row["stock"]),
+        "offline_price": format_money(row["offline_price"]),
+        "online_price": format_money(row["online_price"]),
+        "mrp": format_money(row["mrp"]),
+        "gst_rate": format_money(row["gst_rate"]),
+        "image_url": row["image_url"] or "",
+        "status": row["status"] or "Active",
+        "updated_at": row["updated_at"],
+    }
+
+
+def get_online_store_by_business(conn, business_id):
+    return conn.execute(
+        "SELECT * FROM online_stores WHERE business_id = ?",
+        (business_id,),
+    ).fetchone()
+
+
+def get_online_store_by_slug(conn, slug):
+    return conn.execute(
+        "SELECT * FROM online_stores WHERE slug = ? AND status = 'Active'",
+        (slug,),
+    ).fetchone()
+
+
+def normalize_online_product(product):
+    product_key = str(product.get("id") or product.get("product_key") or product.get("productKey") or "").strip()
+    name = str(product.get("name") or product.get("itemName") or "").strip()
+    barcodes = product.get("barcodes")
+    if not isinstance(barcodes, list):
+        barcodes = []
+    barcode = str(product.get("barcode") or (barcodes[0] if barcodes else "") or "").strip()
+    if barcode and barcode not in barcodes:
+        barcodes = [barcode, *barcodes]
+    offline_price = format_money(product.get("offline_price") or product.get("offlinePrice") or product.get("price") or 0)
+    online_price = format_money(product.get("online_price") or product.get("onlinePrice") or offline_price)
+    return {
+        "id": product_key,
+        "product_key": product_key,
+        "name": name,
+        "barcode": barcode,
+        "barcodes": [str(value).strip() for value in barcodes if str(value).strip()],
+        "category": str(product.get("category") or "").strip(),
+        "hsn": str(product.get("hsn") or product.get("hsnSac") or "").strip(),
+        "unit": str(product.get("unit") or "Pcs").strip() or "Pcs",
+        "stock": format_money(product.get("stock")),
+        "offline_price": offline_price,
+        "online_price": online_price,
+        "mrp": format_money(product.get("mrp") or offline_price),
+        "gst_rate": format_money(product.get("gst_rate") or product.get("gstRate") or 0),
+        "image_url": str(product.get("image_url") or product.get("imageUrl") or "").strip(),
+        "status": "Active" if str(product.get("status") or "Active").lower() != "inactive" else "Inactive",
+    }
+
+
+def get_online_store_products(conn, store_id, public_only=False):
+    sql = """
+        SELECT *
+        FROM online_products
+        WHERE store_id = ?
+    """
+    params = [store_id]
+    if public_only:
+        sql += " AND status = 'Active' AND stock > 0"
+    sql += " ORDER BY name COLLATE NOCASE ASC"
+    return [serialize_online_product(row) for row in conn.execute(sql, params).fetchall()]
+
+
+def serialize_online_order(row):
+    return {
+        "id": row["id"],
+        "invoice_number": row["invoice_number"],
+        "customer_name": row["customer_name"],
+        "customer_phone": row["customer_phone"] or "",
+        "customer_email": row["customer_email"] or "",
+        "customer_address": row["customer_address"] or "",
+        "items": json_loads(row["items_json"], []),
+        "subtotal": format_money(row["subtotal"]),
+        "gst_total": format_money(row["gst_total"]),
+        "discount_total": format_money(row["discount_total"]),
+        "total": format_money(row["total"]),
+        "status": row["status"] or "Placed",
+        "payment_status": row["payment_status"] or "Unpaid",
         "created_at": row["created_at"],
     }
 
@@ -1497,18 +1962,28 @@ def auth_password_rules():
 def register_customer_account():
     data = request.get_json() or {}
     try:
-        customer_id = validate_customer_id(data.get("customer_id") or data.get("user_id"))
+        customer_id = validate_customer_id(account_username_from_payload(data))
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
 
     password = str(data.get("password") or "")
+    confirm_password = str(data.get("confirm_password") or data.get("confirmPassword") or password)
+    if password != confirm_password:
+        return jsonify({"error": "Password and confirmation do not match."}), 400
     errors = password_validation_errors(password)
     if errors:
         return jsonify({"error": " ".join(errors), "password_errors": errors}), 400
 
-    display_name = (data.get("name") or customer_id).strip()
-    email = (data.get("email") or "").strip().lower()
-    business_name = (data.get("business_name") or f"{display_name} Store").strip()
+    business_name = (data.get("business_name") or data.get("businessName") or "").strip()
+    email = normalize_account_email(data.get("email"))
+    phone = normalize_account_phone(data.get("phone"))
+    if not business_name:
+        return jsonify({"error": "Business name is required."}), 400
+    if not email or "@" not in email:
+        return jsonify({"error": "A valid email id is required."}), 400
+    if not phone or len(phone) != 10:
+        return jsonify({"error": "A valid 10 digit phone number is required."}), 400
+    display_name = business_name
     account_id = f"acct_{secrets.token_hex(12)}"
     business_id = safe_identifier(customer_id, "biz")
     warehouse_id = f"{business_id}_main"
@@ -1519,7 +1994,17 @@ def register_customer_account():
             "SELECT 1 FROM customer_accounts WHERE customer_id = ?",
             (customer_id,),
         ).fetchone():
-            return jsonify({"error": "This customer ID is already registered."}), 409
+            return jsonify({"error": "This username is already registered."}), 409
+        if conn.execute(
+            "SELECT 1 FROM customer_accounts WHERE lower(email) = ?",
+            (email,),
+        ).fetchone():
+            return jsonify({"error": "This email id is already registered."}), 409
+        if conn.execute(
+            "SELECT 1 FROM customer_accounts WHERE phone = ?",
+            (phone,),
+        ).fetchone():
+            return jsonify({"error": "This phone number is already registered."}), 409
 
         conn.execute(
             """
@@ -1540,9 +2025,9 @@ def register_customer_account():
             """
             INSERT INTO customer_accounts (
                 id, customer_id, password_hash, business_id, warehouse_id,
-                role_key, status, email, name, last_login_at
+                role_key, status, email, phone, name, last_login_at
             )
-            VALUES (?, ?, ?, ?, ?, 'owner', 'Active', ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, 'owner', 'Active', ?, ?, ?, ?)
             """,
             (
                 account_id,
@@ -1551,6 +2036,7 @@ def register_customer_account():
                 business_id,
                 warehouse_id,
                 email,
+                phone,
                 display_name,
                 datetime.now(UTC).isoformat(),
             ),
@@ -1581,7 +2067,7 @@ def register_customer_account():
 
     context = build_account_auth_context(account_row, session_id)
     g.auth_context = context
-    log_auth_event("customer_account.registered", context, {"customer_id": customer_id})
+    log_auth_event("customer_account.registered", context, {"username": customer_id})
     return jsonify(
         {
             "token": token,
@@ -1597,10 +2083,10 @@ def register_customer_account():
 @app.route("/api/auth/login", methods=["POST"])
 def login_customer_account():
     data = request.get_json() or {}
-    customer_id = normalize_customer_id(data.get("customer_id") or data.get("user_id"))
+    customer_id = normalize_customer_id(account_username_from_payload(data))
     password = str(data.get("password") or "")
     if not customer_id or not password:
-        return jsonify({"error": "Customer ID and password are required."}), 400
+        return jsonify({"error": "Username and password are required."}), 400
 
     with closing(get_connection()) as conn:
         ensure_auth_schema(conn)
@@ -1610,7 +2096,7 @@ def login_customer_account():
         ).fetchone()
         now_iso = datetime.now(UTC).isoformat()
         if not account_row or account_row["status"] != "Active":
-            return jsonify({"error": "Invalid customer ID or password."}), 401
+            return jsonify({"error": "Invalid username or password."}), 401
         if account_row["locked_until"] and account_row["locked_until"] > now_iso:
             return jsonify({"error": "Account is temporarily locked. Please try again later."}), 423
         if not verify_password(password, account_row["password_hash"]):
@@ -1630,7 +2116,7 @@ def login_customer_account():
                 (next_failed_count, locked_until, account_row["id"]),
             )
             conn.commit()
-            return jsonify({"error": "Invalid customer ID or password."}), 401
+            return jsonify({"error": "Invalid username or password."}), 401
         conn.execute(
             """
             UPDATE customer_accounts
@@ -1647,7 +2133,142 @@ def login_customer_account():
 
     context = build_account_auth_context(account_row, session_id)
     g.auth_context = context
-    log_auth_event("customer_account.login", context, {"customer_id": customer_id})
+    log_auth_event("customer_account.login", context, {"username": customer_id})
+    return jsonify(
+        {
+            "token": token,
+            "expires_at": expires_at.isoformat(),
+            "account": serialize_customer_account(account_row),
+            "context": context,
+            "auth_required": AUTH_REQUIRED,
+            "configured": True,
+        }
+    )
+
+
+@app.route("/api/auth/otp/request", methods=["POST"])
+def request_account_otp():
+    data = request.get_json() or {}
+    identifier = account_identifier_from_payload(data)
+    if not identifier:
+        return jsonify({"error": "Enter your email id or phone number."}), 400
+
+    identifier_value = str(identifier or "").strip()
+    requested_channel = str(data.get("channel") or "").strip().lower()
+    channel = requested_channel if requested_channel in {"email", "phone"} else ""
+    if not channel:
+        channel = "email" if "@" in identifier_value else "phone"
+
+    with closing(get_connection()) as conn:
+        ensure_auth_schema(conn)
+        account_row = find_account_for_login_identifier(conn, identifier_value)
+        if not account_row or account_row["status"] != "Active":
+            return jsonify(
+                {
+                    "ok": True,
+                    "message": "If an active CinchPOS account matches this detail, an OTP will be sent.",
+                    "expires_in_minutes": OTP_EXPIRY_MINUTES,
+                }
+            )
+
+        destination = normalize_account_email(account_row["email"]) if channel == "email" else normalize_account_phone(account_row["phone"])
+        if not destination:
+            return jsonify({"error": f"No {channel} is linked with this CinchPOS account."}), 400
+
+        challenge, blocked = create_otp_challenge(conn, account_row, channel, destination)
+        if blocked:
+            status = int(blocked.pop("status", 429))
+            return jsonify(blocked), status
+
+        delivery = deliver_otp(channel, destination, challenge["code"])
+        if not delivery["sent"] and not EXPOSE_DEV_OTP and AUTH_REQUIRED:
+            conn.rollback()
+            if channel == "phone" and delivery["reason"] == "sms_not_configured":
+                return jsonify({"error": "Phone OTP is not configured yet. Add an SMS provider before using phone OTP."}), 503
+            return jsonify({"error": "OTP delivery is not configured. Add SMTP settings for support@cinchpos.in."}), 503
+
+        conn.commit()
+
+    response = {
+        "ok": True,
+        "channel": channel,
+        "masked_destination": mask_contact(destination, channel),
+        "expires_in_minutes": OTP_EXPIRY_MINUTES,
+        "message": f"OTP sent to {mask_contact(destination, channel)}.",
+    }
+    if EXPOSE_DEV_OTP or not AUTH_REQUIRED:
+        response["dev_otp"] = challenge["code"]
+        if not delivery["sent"]:
+            response["delivery_warning"] = delivery["reason"]
+    return jsonify(response)
+
+
+@app.route("/api/auth/otp/verify", methods=["POST"])
+def verify_account_otp():
+    data = request.get_json() or {}
+    identifier = account_identifier_from_payload(data)
+    code = re.sub(r"\D+", "", str(data.get("otp") or data.get("code") or ""))
+    if not identifier or not code:
+        return jsonify({"error": "Enter your email id or phone number and OTP."}), 400
+
+    with closing(get_connection()) as conn:
+        ensure_auth_schema(conn)
+        account_row = find_account_for_login_identifier(conn, identifier)
+        now_iso = datetime.now(UTC).isoformat()
+        if not account_row or account_row["status"] != "Active":
+            return jsonify({"error": "Invalid or expired OTP."}), 401
+        otp_row = conn.execute(
+            """
+            SELECT *
+            FROM account_otp_codes
+            WHERE account_id = ? AND consumed_at = '' AND expires_at > ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (account_row["id"], now_iso),
+        ).fetchone()
+        if not otp_row:
+            return jsonify({"error": "Invalid or expired OTP."}), 401
+        if int(otp_row["attempts"] or 0) >= OTP_MAX_ATTEMPTS:
+            return jsonify({"error": "Too many OTP attempts. Request a fresh OTP."}), 429
+        if not verify_password(code, otp_row["code_hash"]):
+            conn.execute(
+                """
+                UPDATE account_otp_codes
+                SET attempts = attempts + 1
+                WHERE id = ?
+                """,
+                (otp_row["id"],),
+            )
+            conn.commit()
+            return jsonify({"error": "Invalid or expired OTP."}), 401
+
+        consumed_at = datetime.now(UTC).isoformat()
+        conn.execute(
+            """
+            UPDATE account_otp_codes
+            SET consumed_at = ?
+            WHERE id = ?
+            """,
+            (consumed_at, otp_row["id"]),
+        )
+        conn.execute(
+            """
+            UPDATE customer_accounts
+            SET last_login_at = ?,
+                failed_login_count = 0,
+                locked_until = '',
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (consumed_at, account_row["id"]),
+        )
+        token, session_id, expires_at = create_account_session(conn, account_row)
+        conn.commit()
+
+    context = build_account_auth_context(account_row, session_id)
+    g.auth_context = context
+    log_auth_event("customer_account.otp_login", context, {"channel": otp_row["channel"]})
     return jsonify(
         {
             "token": token,
@@ -1997,6 +2618,330 @@ def save_workspace_snapshot():
         conn.commit()
     log_auth_event("workspace_snapshot.saved", context, {"keys": sorted(payload.keys())[:30]})
     return jsonify({"business_id": business_id, "updated_by": context["user_id"], "ok": True})
+
+
+@app.route("/api/online-store/profile", methods=["GET"])
+@require_permission("sales:read")
+def get_online_store_profile():
+    business_id = current_business_id()
+    with closing(get_connection()) as conn:
+        ensure_auth_schema(conn)
+        store_row = get_online_store_by_business(conn, business_id)
+        products = get_online_store_products(conn, store_row["id"]) if store_row else []
+    return jsonify({"store": serialize_online_store(store_row), "products": products})
+
+
+@app.route("/api/online-store/publish", methods=["PUT"])
+@require_permission("sales:read")
+def publish_online_store():
+    data = request.get_json() or {}
+    store_payload = data.get("store") if isinstance(data.get("store"), dict) else {}
+    product_payloads = data.get("products") if isinstance(data.get("products"), list) else []
+    store_name = str(store_payload.get("store_name") or store_payload.get("storeName") or "").strip()
+    if not store_name:
+        return jsonify({"error": "Store name is required before publishing online."}), 400
+    normalized_products = [normalize_online_product(product) for product in product_payloads]
+    normalized_products = [
+        product for product in normalized_products
+        if product["product_key"] and product["name"] and product["online_price"] > 0
+    ]
+    if not normalized_products:
+        return jsonify({"error": "Select at least one product with a name and online price."}), 400
+
+    business_id = current_business_id()
+    context = current_auth_context()
+    with closing(get_connection()) as conn:
+        ensure_auth_schema(conn)
+        store_row = get_online_store_by_business(conn, business_id)
+        if store_row:
+            store_id = store_row["id"]
+            public_code = store_row["public_code"]
+        else:
+            store_id = f"store_{secrets.token_hex(12)}"
+            public_code = generate_online_public_code(conn)
+        next_slug = build_online_store_slug(store_name, public_code)
+        if store_row:
+            conn.execute(
+                """
+                UPDATE online_stores
+                SET slug = ?,
+                    store_name = ?,
+                    contact_phone = ?,
+                    contact_email = ?,
+                    address = ?,
+                    logo_url = ?,
+                    status = 'Active',
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (
+                    next_slug,
+                    store_name,
+                    str(store_payload.get("contact_phone") or store_payload.get("contactPhone") or "").strip(),
+                    str(store_payload.get("contact_email") or store_payload.get("contactEmail") or "").strip(),
+                    str(store_payload.get("address") or "").strip(),
+                    str(store_payload.get("logo_url") or store_payload.get("logoUrl") or "").strip(),
+                    store_id,
+                ),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO online_stores (
+                    id, business_id, public_code, slug, store_name,
+                    contact_phone, contact_email, address, logo_url, status
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Active')
+                """,
+                (
+                    store_id,
+                    business_id,
+                    public_code,
+                    next_slug,
+                    store_name,
+                    str(store_payload.get("contact_phone") or store_payload.get("contactPhone") or "").strip(),
+                    str(store_payload.get("contact_email") or store_payload.get("contactEmail") or "").strip(),
+                    str(store_payload.get("address") or "").strip(),
+                    str(store_payload.get("logo_url") or store_payload.get("logoUrl") or "").strip(),
+                ),
+            )
+
+        active_keys = {product["product_key"] for product in normalized_products}
+        if active_keys:
+            placeholders = ",".join("?" for _ in active_keys)
+            conn.execute(
+                f"""
+                UPDATE online_products
+                SET status = 'Inactive', updated_at = CURRENT_TIMESTAMP
+                WHERE business_id = ? AND product_key NOT IN ({placeholders})
+                """,
+                [business_id, *active_keys],
+            )
+        for product in normalized_products:
+            product_id = f"online_{business_id}_{product['product_key']}"
+            conn.execute(
+                """
+                INSERT INTO online_products (
+                    id, store_id, business_id, product_key, name, barcode,
+                    barcodes_json, category, hsn, unit, stock, offline_price,
+                    online_price, mrp, gst_rate, image_url, status, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Active', CURRENT_TIMESTAMP)
+                ON CONFLICT(business_id, product_key)
+                DO UPDATE SET store_id = excluded.store_id,
+                              name = excluded.name,
+                              barcode = excluded.barcode,
+                              barcodes_json = excluded.barcodes_json,
+                              category = excluded.category,
+                              hsn = excluded.hsn,
+                              unit = excluded.unit,
+                              stock = excluded.stock,
+                              offline_price = excluded.offline_price,
+                              online_price = excluded.online_price,
+                              mrp = excluded.mrp,
+                              gst_rate = excluded.gst_rate,
+                              image_url = excluded.image_url,
+                              status = 'Active',
+                              updated_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    product_id,
+                    store_id,
+                    business_id,
+                    product["product_key"],
+                    product["name"],
+                    product["barcode"],
+                    json_dumps(product["barcodes"]),
+                    product["category"],
+                    product["hsn"],
+                    product["unit"],
+                    product["stock"],
+                    product["offline_price"],
+                    product["online_price"],
+                    product["mrp"],
+                    product["gst_rate"],
+                    product["image_url"],
+                ),
+            )
+        conn.commit()
+        store_row = get_online_store_by_business(conn, business_id)
+        products = get_online_store_products(conn, store_row["id"])
+
+    log_auth_event("online_store.published", context, {"products": len(normalized_products), "slug": next_slug})
+    return jsonify({"store": serialize_online_store(store_row), "products": products, "published_count": len(normalized_products)})
+
+
+@app.route("/api/public/stores/<store_slug>", methods=["GET"])
+def public_online_store(store_slug):
+    with closing(get_connection()) as conn:
+        ensure_auth_schema(conn)
+        store_row = get_online_store_by_slug(conn, store_slug)
+        if not store_row:
+            return jsonify({"error": "Online store not found."}), 404
+        products = get_online_store_products(conn, store_row["id"], public_only=True)
+    return jsonify({"store": serialize_online_store(store_row), "products": products})
+
+
+@app.route("/api/public/stores/<store_slug>/checkout", methods=["POST"])
+def checkout_online_store(store_slug):
+    data = request.get_json() or {}
+    customer = data.get("customer") if isinstance(data.get("customer"), dict) else {}
+    cart_items = data.get("items") if isinstance(data.get("items"), list) else []
+    customer_name = str(customer.get("name") or "").strip()
+    customer_phone = normalize_account_phone(customer.get("phone"))
+    customer_email = normalize_account_email(customer.get("email"))
+    customer_address = str(customer.get("address") or "").strip()
+    if not customer_name:
+        return jsonify({"error": "Customer name is required."}), 400
+    if len(customer_phone) != 10:
+        return jsonify({"error": "A valid 10 digit phone number is required."}), 400
+    if not cart_items:
+        return jsonify({"error": "Cart is empty."}), 400
+
+    requested_quantities = {}
+    for item in cart_items:
+        product_id = str(item.get("id") or item.get("product_key") or item.get("productKey") or "").strip()
+        quantity = int(float(item.get("quantity") or 0))
+        if product_id and quantity > 0:
+            requested_quantities[product_id] = requested_quantities.get(product_id, 0) + min(quantity, 999)
+    if not requested_quantities:
+        return jsonify({"error": "Cart is empty."}), 400
+
+    with closing(get_connection()) as conn:
+        ensure_auth_schema(conn)
+        store_row = get_online_store_by_slug(conn, store_slug)
+        if not store_row:
+            return jsonify({"error": "Online store not found."}), 404
+        product_rows = []
+        for product_key, quantity in requested_quantities.items():
+            row = conn.execute(
+                """
+                SELECT *
+                FROM online_products
+                WHERE store_id = ? AND product_key = ? AND status = 'Active'
+                """,
+                (store_row["id"], product_key),
+            ).fetchone()
+            if not row:
+                return jsonify({"error": "One or more cart items are no longer available."}), 409
+            if float(row["stock"] or 0) < quantity:
+                return jsonify({"error": f"{row['name']} has only {format_money(row['stock'])} in stock."}), 409
+            product_rows.append((row, quantity))
+
+        order_items = []
+        subtotal = 0.0
+        gst_total = 0.0
+        discount_total = 0.0
+        total = 0.0
+        for row, quantity in product_rows:
+            online_price = format_money(row["online_price"])
+            mrp = format_money(row["mrp"] or online_price)
+            gst_rate = format_money(row["gst_rate"])
+            line_total = format_money(online_price * quantity)
+            taxable = format_money(line_total / (1 + (gst_rate / 100))) if gst_rate else line_total
+            gst_amount = format_money(line_total - taxable)
+            discount_amount = format_money(max(0, mrp - online_price) * quantity)
+            subtotal += taxable
+            gst_total += gst_amount
+            discount_total += discount_amount
+            total += line_total
+            order_items.append(
+                {
+                    "id": row["product_key"],
+                    "name": row["name"],
+                    "barcode": row["barcode"] or "",
+                    "quantity": quantity,
+                    "unit": row["unit"] or "Pcs",
+                    "mrp": mrp,
+                    "price": online_price,
+                    "gst_rate": gst_rate,
+                    "taxable": taxable,
+                    "gst_amount": gst_amount,
+                    "total": line_total,
+                }
+            )
+
+        order_id = f"order_{secrets.token_hex(12)}"
+        invoice_number = generate_online_invoice_number(conn)
+        conn.execute(
+            """
+            INSERT INTO online_orders (
+                id, store_id, business_id, invoice_number, customer_name,
+                customer_phone, customer_email, customer_address, items_json,
+                subtotal, gst_total, discount_total, total, status, payment_status
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Placed', 'Unpaid')
+            """,
+            (
+                order_id,
+                store_row["id"],
+                store_row["business_id"],
+                invoice_number,
+                customer_name,
+                customer_phone,
+                customer_email,
+                customer_address,
+                json_dumps(order_items),
+                format_money(subtotal),
+                format_money(gst_total),
+                format_money(discount_total),
+                format_money(total),
+            ),
+        )
+        for row, quantity in product_rows:
+            conn.execute(
+                """
+                UPDATE online_products
+                SET stock = stock - ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (quantity, row["id"]),
+            )
+        conn.commit()
+        order_row = conn.execute(
+            "SELECT * FROM online_orders WHERE id = ?",
+            (order_id,),
+        ).fetchone()
+
+    return jsonify(
+        {
+            "order": serialize_online_order(order_row),
+            "store": serialize_online_store(store_row),
+            "invoice_download_name": f"{invoice_number}.html",
+        }
+    ), 201
+
+
+@app.route("/api/public/orders/<order_id>/invoice", methods=["GET"])
+def public_online_order_invoice(order_id):
+    with closing(get_connection()) as conn:
+        ensure_auth_schema(conn)
+        row = conn.execute(
+            """
+            SELECT online_orders.*, online_stores.store_name, online_stores.contact_phone,
+                   online_stores.contact_email, online_stores.address, online_stores.logo_url,
+                   online_stores.slug
+            FROM online_orders
+            JOIN online_stores ON online_stores.id = online_orders.store_id
+            WHERE online_orders.id = ?
+            """,
+            (order_id,),
+        ).fetchone()
+        if not row:
+            return jsonify({"error": "Invoice not found."}), 404
+    return jsonify(
+        {
+            "store": {
+                "store_name": row["store_name"],
+                "contact_phone": row["contact_phone"] or "",
+                "contact_email": row["contact_email"] or "",
+                "address": row["address"] or "",
+                "logo_url": row["logo_url"] or "",
+                "slug": row["slug"],
+            },
+            "order": serialize_online_order(row),
+        }
+    )
 
 
 @app.route("/api/dashboard")

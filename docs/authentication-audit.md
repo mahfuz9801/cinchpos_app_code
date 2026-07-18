@@ -11,8 +11,11 @@
 
 ## Implemented Direction
 
-- Clerk is the primary identity provider for email/password, email verification, password reset, Google sign-in, MFA, and device sessions.
-- The backend validates Clerk JWTs when `CINCHPOS_AUTH_REQUIRED=true` and Clerk issuer/JWKS values are configured.
+- CinchPOS account login supports unique username/password and email/phone OTP login for owner accounts.
+- OTP codes are stored as hashes, expire quickly, and are single-use.
+- Email OTP delivery is configured through the backend SMTP settings for `support@cinchpos.in`.
+- Clerk can still be used as an external identity provider for richer hosted identity flows when configured.
+- When Clerk is used, the backend validates Clerk JWTs when `CINCHPOS_AUTH_REQUIRED=true` and Clerk issuer/JWKS values are configured.
 - The backend maintains business, warehouse, role, membership, invitation, offline-session, and audit-log tables.
 - API permissions are enforced by backend decorators and tenant-scoped database queries.
 - The frontend uses a single API auth provider for bearer tokens and active business/warehouse headers.

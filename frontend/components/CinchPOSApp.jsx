@@ -11,18 +11,22 @@ import {
   getCustomers,
   getDashboard,
   getInvoices,
+  getOnlineStoreProfile,
   getTrend,
   getWorkspaceSnapshot,
   isApiNetworkError,
   inviteEmployeeAccount,
   loginCinchAccount,
   logoutCinchAccount,
+  publishOnlineStore,
   recordPayment,
   registerCinchAccount,
+  requestCinchAccountOtp,
   saveWorkspaceSnapshot,
   setAuthContextProvider,
   setAuthTokenProvider,
-  updateCustomer
+  updateCustomer,
+  verifyCinchAccountOtp
 } from "@/lib/api";
 import {
   calculateDiscountPercent,
@@ -1182,6 +1186,8 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
   const [inventoryVisibleCount, setInventoryVisibleCount] = useState(120);
   const [sellOnlineSearch, setSellOnlineSearch] = useState("");
   const [sellOnlineCatalog, setSellOnlineCatalog] = useState({});
+  const [onlineStoreProfile, setOnlineStoreProfile] = useState(null);
+  const [onlineStoreBusy, setOnlineStoreBusy] = useState(false);
   const [settingsDraft, setSettingsDraft] = useState(defaultSettings);
   const [settingsPanelSection, setSettingsPanelSection] = useState("account");
   const [bankAccount, setBankAccount] = useState(null);
@@ -1204,7 +1210,12 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     confirmPassword: "",
     name: "",
     email: "",
-    businessName: ""
+    phone: "",
+    businessName: "",
+    otpIdentifier: "",
+    otpCode: "",
+    otpSent: false,
+    otpMessage: ""
   });
   const [cloudSyncBusy, setCloudSyncBusy] = useState(false);
   const [posState, setPosState] = useState(makeInitialPOSState);
@@ -1462,6 +1473,8 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       const barcode = getInventoryBarcodeLabel(item);
       const stock = Number(item.stock || 0);
       const price = Number(item.inclusivePrice || item.inclusive_price || item.price || 0);
+      const catalogEntry = sellOnlineCatalog?.[id] || {};
+      const onlinePrice = Number(catalogEntry.onlinePrice || price || 0);
       const searchable = normalizeKey(`${name} ${barcode} ${item.category || ""} ${item.hsn || item.hsnSac || ""}`);
       return {
         id,
@@ -1469,7 +1482,8 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         barcode,
         stock,
         price,
-        selected: Boolean(sellOnlineCatalog?.[id]),
+        onlinePrice,
+        selected: Boolean(catalogEntry),
         searchable
       };
     }).filter((item) => !search || item.searchable.includes(search));
@@ -1484,8 +1498,17 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         id,
         name: getInventoryItemName(item),
         barcode: getInventoryBarcodeLabel(item),
+        barcodes: getInventoryItemBarcodes(item),
+        category: cleanText(item.category),
+        hsn: cleanText(item.hsn || item.hsnSac),
+        unit: cleanText(item.unit, "Pcs"),
         price: Number(item.inclusivePrice || item.inclusive_price || item.price || 0),
-        stock: Number(item.stock || 0)
+        offlinePrice: Number(item.inclusivePrice || item.inclusive_price || item.price || 0),
+        onlinePrice: Number(sellOnlineCatalog[id]?.onlinePrice || item.inclusivePrice || item.inclusive_price || item.price || 0),
+        mrp: Number(item.mrp || item.inclusivePrice || item.inclusive_price || item.price || 0),
+        gstRate: Number(item.gstRate || item.gst_rate || 0),
+        stock: Number(item.stock || 0),
+        imageUrl: cleanText(item.imageUrl || item.image_url)
       };
     }).filter(Boolean)
   ), [inventoryItems, sellOnlineCatalog]);
@@ -2107,6 +2130,13 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     setAuthTokenProvider(async () => authState.token || getClerkSessionToken(clerkClient));
   }, [activeBusinessId, activeWarehouseId, authState.token, clerkClient]);
 
+  useEffect(() => {
+    if (!workspaceLoaded || authGateActive || !can("sales:read")) {
+      return;
+    }
+    loadOnlineStoreProfile();
+  }, [activeBusinessId, authGateActive, can, workspaceLoaded]);
+
   const syncAuthContext = useCallback(async (client = clerkClient, options = {}) => {
     setAuthBusy(true);
     try {
@@ -2351,56 +2381,139 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     setAuthForm((current) => ({ ...current, [field]: value }));
   }
 
+  async function activateCinchAccountSession(payload, { persistInitialSnapshot = false, successMessage = "Logged in successfully." } = {}) {
+    const nextAuthState = normalizeCinchAccountAuth(payload);
+    await writeAccountAuthSession(nextAuthState, payload.expires_at || "");
+    await clearOfflineAuthSession();
+    setAuthState(nextAuthState);
+    setAccount(accountFromAuthState(nextAuthState));
+    setAuthTokenProvider(async () => nextAuthState.token);
+    setAuthForm((current) => ({
+      ...current,
+      password: "",
+      confirmPassword: "",
+      otpCode: "",
+      otpSent: false,
+      otpMessage: ""
+    }));
+    closeModal();
+
+    try {
+      const snapshot = await getWorkspaceSnapshot();
+      const applied = applyWorkspaceSnapshotPayload(snapshot?.payload);
+      if (!applied && persistInitialSnapshot) {
+        await saveWorkspaceSnapshot(buildWorkspaceSnapshotPayload());
+      }
+    } catch {
+      if (persistInitialSnapshot) {
+        await saveWorkspaceSnapshot(buildWorkspaceSnapshotPayload()).catch(() => {});
+      }
+    }
+    await loadDashboard().catch(() => {});
+    showMessage(successMessage);
+  }
+
   async function submitCinchAccountAuth(event) {
     event.preventDefault();
     if (authBusy) {
       return;
     }
-    const customerId = cleanText(authForm.customerId).toLowerCase();
+    const username = cleanText(authForm.customerId).toLowerCase();
     const password = String(authForm.password || "");
-    if (!customerId || !password) {
-      showMessage("Enter customer ID and password.");
+    const email = cleanText(authForm.email).toLowerCase();
+    const phone = normalizePhone(authForm.phone).slice(-10);
+    const businessName = cleanText(authForm.businessName);
+    if (!username || !password) {
+      showMessage("Enter username and password.");
       return;
     }
-    if (authFormMode === "register" && password !== String(authForm.confirmPassword || "")) {
-      showMessage("Password and confirmation do not match.");
-      return;
+    if (authFormMode === "register") {
+      if (!businessName || !email || !phone) {
+        showMessage("Add business name, phone number, and email id.");
+        return;
+      }
+      if (phone.length !== 10) {
+        showMessage("Phone number must be 10 digits.");
+        return;
+      }
+      if (!email.includes("@")) {
+        showMessage("Enter a valid email id.");
+        return;
+      }
+      if (password !== String(authForm.confirmPassword || "")) {
+        showMessage("Password and confirmation do not match.");
+        return;
+      }
     }
     setAuthBusy(true);
     try {
       const payload = authFormMode === "register"
         ? await registerCinchAccount({
-            customer_id: customerId,
+            username,
             password,
-            name: authForm.name,
-            email: authForm.email,
-            business_name: authForm.businessName
+            confirm_password: authForm.confirmPassword,
+            email,
+            phone,
+            business_name: businessName
           })
-        : await loginCinchAccount({ customer_id: customerId, password });
-      const nextAuthState = normalizeCinchAccountAuth(payload);
-      await writeAccountAuthSession(nextAuthState, payload.expires_at || "");
-      await clearOfflineAuthSession();
-      setAuthState(nextAuthState);
-      setAccount(accountFromAuthState(nextAuthState));
-      setAuthTokenProvider(async () => nextAuthState.token);
-      setAuthForm((current) => ({ ...current, password: "", confirmPassword: "" }));
-      closeModal();
-
-      try {
-        const snapshot = await getWorkspaceSnapshot();
-        const applied = applyWorkspaceSnapshotPayload(snapshot?.payload);
-        if (!applied && authFormMode === "register") {
-          await saveWorkspaceSnapshot(buildWorkspaceSnapshotPayload());
-        }
-      } catch {
-        if (authFormMode === "register") {
-          await saveWorkspaceSnapshot(buildWorkspaceSnapshotPayload()).catch(() => {});
-        }
-      }
-      await loadDashboard().catch(() => {});
-      showMessage(authFormMode === "register" ? "CinchPOS account created." : "Logged in successfully.");
+        : await loginCinchAccount({ username, password });
+      await activateCinchAccountSession(payload, {
+        persistInitialSnapshot: authFormMode === "register",
+        successMessage: authFormMode === "register" ? "CinchPOS account created." : "Logged in successfully."
+      });
     } catch (error) {
       showMessage(error instanceof Error ? error.message : "Login failed.");
+    } finally {
+      setAuthBusy(false);
+    }
+  }
+
+  async function requestCinchOtp() {
+    if (authBusy) {
+      return;
+    }
+    const identifier = cleanText(authForm.otpIdentifier);
+    if (!identifier) {
+      showMessage("Enter your email id or phone number.");
+      return;
+    }
+    setAuthBusy(true);
+    try {
+      const payload = await requestCinchAccountOtp({
+        identifier,
+        channel: identifier.includes("@") ? "email" : "phone"
+      });
+      setAuthForm((current) => ({
+        ...current,
+        otpSent: true,
+        otpCode: payload.dev_otp || "",
+        otpMessage: payload.message || "OTP sent. Enter it below."
+      }));
+      showMessage(payload.delivery_warning ? `${payload.message} (${payload.delivery_warning})` : (payload.message || "OTP sent."));
+    } catch (error) {
+      showMessage(error instanceof Error ? error.message : "Could not send OTP.");
+    } finally {
+      setAuthBusy(false);
+    }
+  }
+
+  async function verifyCinchOtp(event) {
+    event.preventDefault();
+    if (authBusy) {
+      return;
+    }
+    const identifier = cleanText(authForm.otpIdentifier);
+    const otp = normalizePhone(authForm.otpCode);
+    if (!identifier || !otp) {
+      showMessage("Enter your email id or phone number and OTP.");
+      return;
+    }
+    setAuthBusy(true);
+    try {
+      const payload = await verifyCinchAccountOtp({ identifier, otp });
+      await activateCinchAccountSession(payload, { successMessage: "Logged in with OTP." });
+    } catch (error) {
+      showMessage(error instanceof Error ? error.message : "OTP login failed.");
     } finally {
       setAuthBusy(false);
     }
@@ -3190,8 +3303,26 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       if (next[productId]) {
         delete next[productId];
       } else {
-        next[productId] = { selectedAt: new Date().toISOString() };
+        const product = sellOnlineProducts.find((entry) => entry.id === productId);
+        next[productId] = {
+          selectedAt: new Date().toISOString(),
+          onlinePrice: Number(product?.price || 0)
+        };
       }
+      return next;
+    });
+  }
+
+  function updateSellOnlinePrice(productId, value) {
+    setSellOnlineCatalog((current) => {
+      const next = { ...(current || {}) };
+      if (!next[productId]) {
+        return next;
+      }
+      next[productId] = {
+        ...next[productId],
+        onlinePrice: value
+      };
       return next;
     });
   }
@@ -3204,7 +3335,11 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     setSellOnlineCatalog((current) => {
       const next = { ...(current || {}) };
       productIds.forEach((productId) => {
-        next[productId] = next[productId] || { selectedAt: new Date().toISOString() };
+        const product = sellOnlineProducts.find((entry) => entry.id === productId);
+        next[productId] = next[productId] || {
+          selectedAt: new Date().toISOString(),
+          onlinePrice: Number(product?.price || 0)
+        };
       });
       return next;
     });
@@ -3214,6 +3349,58 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
   function clearSellOnlineProducts() {
     setSellOnlineCatalog({});
     showMessage("Sell Online product selection cleared.");
+  }
+
+  async function loadOnlineStoreProfile() {
+    try {
+      const payload = await getOnlineStoreProfile();
+      setOnlineStoreProfile(payload?.store || null);
+      if (Array.isArray(payload?.products) && payload.products.length) {
+        setSellOnlineCatalog((current) => {
+          const next = { ...(current || {}) };
+          payload.products.forEach((product) => {
+            const id = cleanText(product.product_key || product.id);
+            if (!id) {
+              return;
+            }
+            next[id] = {
+              ...(next[id] || {}),
+              selectedAt: next[id]?.selectedAt || product.updated_at || new Date().toISOString(),
+              onlinePrice: Number(product.online_price || product.onlinePrice || 0)
+            };
+          });
+          return next;
+        });
+      }
+    } catch {
+      setOnlineStoreProfile(null);
+    }
+  }
+
+  async function publishSellOnlineCatalog() {
+    if (!selectedSellOnlineProducts.length) {
+      showMessage("Select products before publishing the online store.");
+      return;
+    }
+    setOnlineStoreBusy(true);
+    try {
+      const payload = await publishOnlineStore({
+        store: {
+          store_name: businessName,
+          contact_phone: settings.businessPhone,
+          contact_email: settings.businessEmail,
+          address: settings.businessAddress,
+          logo_url: settings.storeLogoUrl || settings.storeLogo
+        },
+        products: selectedSellOnlineProducts
+      });
+      setOnlineStoreProfile(payload.store || null);
+      showMessage(`Online store published with ${payload.published_count || selectedSellOnlineProducts.length} products.`);
+    } catch (error) {
+      showMessage(error instanceof Error ? error.message : "Could not publish online store.");
+    } finally {
+      setOnlineStoreBusy(false);
+    }
   }
 
   async function submitInvoice(event) {
@@ -4772,7 +4959,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                 <p>Customer, inventory, invoices, and billing records stay hidden on this device until a valid CinchPOS account is active.</p>
                 <div className="auth-lock-actions">
                   <button className="button button-primary" type="button" onClick={() => { setAuthFormMode("login"); openModal("login"); }}>Login</button>
-                  <button className="button button-secondary" type="button" onClick={() => { setAuthFormMode("register"); openModal("login"); }}>Create Customer ID</button>
+                  <button className="button button-secondary" type="button" onClick={() => { setAuthFormMode("register"); openModal("login"); }}>Create Account</button>
                 </div>
               </div>
             </section>
@@ -5346,65 +5533,110 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         {SettingsForm()}
       </Modal>
 
-      <Modal open={activeModal === "login"} title="CinchPOS Account" subtitle="Login with your customer ID to unlock this cloud workspace." onClose={closeModal}>
+      <Modal open={activeModal === "login"} title={authFormMode === "register" ? "Create Your CinchPOS Account" : "Login to CinchPOS"} subtitle="Use a unique username to protect and access this workspace." cardClass="auth-modal-card" onClose={closeModal}>
         <div className="auth-panel">
-          <div className="auth-status-card">
-            <span className={`record-chip ${authState.authenticated ? "success" : ""}`}>{authState.authenticated ? "Session Active" : "Signed Out"}</span>
-            <h3>{authState.authenticated ? cleanText(authState.name, "Operator") : "CinchPOS Account"}</h3>
-            <p>{authState.authenticated ? (authState.email || authState.customerId || "CinchPOS account active") : "Create a customer ID once, then login from any device connected to the same CinchPOS cloud backend."}</p>
-            <div className="auth-meta-grid">
-              <span>Customer ID <strong>{authState.customerId || "Not logged in"}</strong></span>
-              <span>Role <strong>{authState.role}</strong></span>
-              <span>Business <strong>{authState.businessId}</strong></span>
-              <span>Mode <strong>{authState.offline ? "Offline cache" : "Cloud session"}</strong></span>
+          <div className="auth-hero-card">
+            <div className="auth-brand-row">
+              <AppLogo />
+              <div>
+                <span>Secure Store Workspace</span>
+                <strong>{APP_NAME}</strong>
+              </div>
+            </div>
+            <h3>{authFormMode === "register" ? "Create a shop account." : "Welcome back."}</h3>
+            <p>{authFormMode === "register" ? "Only the essentials are needed: business name, phone, email, unique username, and password." : "Login with username and password, or use an OTP sent to the registered email id or phone number."}</p>
+            <div className="auth-trust-row">
+              <span>Unique username</span>
+              <span>Private workspace</span>
+              <span>Password hashed</span>
             </div>
           </div>
-          <div className="auth-mode-tabs" role="tablist" aria-label="Account action">
-            <button type="button" className={authFormMode === "login" ? "active" : ""} onClick={() => setAuthFormMode("login")}>Login</button>
-            <button type="button" className={authFormMode === "register" ? "active" : ""} onClick={() => setAuthFormMode("register")}>Create Customer ID</button>
-          </div>
-          <form className="auth-form" onSubmit={submitCinchAccountAuth}>
-            <label>Customer ID
-              <input type="text" autoComplete="username" value={authForm.customerId} onChange={(event) => updateAuthForm("customerId", event.target.value)} placeholder="for example: shopname01" required />
-            </label>
+          <div className="auth-workspace-card">
+            <div className="auth-status-card">
+              <span className={`record-chip ${authState.authenticated ? "success" : ""}`}>{authState.authenticated ? "Session Active" : "Signed Out"}</span>
+              <h3>{authState.authenticated ? cleanText(authState.name, "Operator") : "Account Access"}</h3>
+              <p>{authState.authenticated ? (authState.email || authState.phone || authState.username || authState.customerId || "CinchPOS account active") : "Create one username, then use it to login to this protected workspace."}</p>
+              <div className="auth-meta-grid">
+                <span>Username <strong>{authState.username || authState.customerId || "Not logged in"}</strong></span>
+                <span>Role <strong>{authState.role}</strong></span>
+                <span>Business <strong>{authState.businessId}</strong></span>
+                <span>Mode <strong>{authState.offline ? "Offline cache" : "Cloud session"}</strong></span>
+              </div>
+            </div>
+            <div className="auth-mode-tabs" role="tablist" aria-label="Account action">
+              <button type="button" className={authFormMode === "login" ? "active" : ""} onClick={() => setAuthFormMode("login")}>Login</button>
+              <button type="button" className={authFormMode === "register" ? "active" : ""} onClick={() => setAuthFormMode("register")}>Create Account</button>
+            </div>
             {authFormMode === "register" ? (
-              <>
-                <label>Owner / Store Name
-                  <input type="text" value={authForm.name} onChange={(event) => updateAuthForm("name", event.target.value)} placeholder="Owner name" />
-                </label>
+              <form className="auth-form" onSubmit={submitCinchAccountAuth}>
                 <label>Business Name
-                  <input type="text" value={authForm.businessName} onChange={(event) => updateAuthForm("businessName", event.target.value)} placeholder="Store name" />
+                  <input type="text" value={authForm.businessName} onChange={(event) => updateAuthForm("businessName", event.target.value)} placeholder="Store or company name" required />
                 </label>
-                <label>Email
-                  <input type="email" autoComplete="email" value={authForm.email} onChange={(event) => updateAuthForm("email", event.target.value)} placeholder="Optional email" />
+                <label>Phone Number
+                  <input type="tel" autoComplete="tel-national" inputMode="numeric" value={authForm.phone} onChange={(event) => updateAuthForm("phone", event.target.value)} placeholder="10 digit phone number" required />
                 </label>
-              </>
-            ) : null}
-            <label>Password
-              <input type="password" autoComplete={authFormMode === "register" ? "new-password" : "current-password"} value={authForm.password} onChange={(event) => updateAuthForm("password", event.target.value)} placeholder="Password" required />
-            </label>
-            {authFormMode === "register" ? (
-              <label>Confirm Password
-                <input type="password" autoComplete="new-password" value={authForm.confirmPassword} onChange={(event) => updateAuthForm("confirmPassword", event.target.value)} placeholder="Repeat password" required />
-              </label>
-            ) : null}
-            <div className="password-rules">
-              <span>8+ characters</span>
-              <span>Upper & lower case</span>
-              <span>Number</span>
-              <span>Special character</span>
-              <span>No spaces</span>
+                <label>Email ID
+                  <input type="email" autoComplete="email" value={authForm.email} onChange={(event) => updateAuthForm("email", event.target.value)} placeholder="support email or owner email" required />
+                </label>
+                <label>Username
+                  <input type="text" autoComplete="username" value={authForm.customerId} onChange={(event) => updateAuthForm("customerId", event.target.value)} placeholder="for example: ardh-sainik" required />
+                </label>
+                <label>Password
+                  <input type="password" autoComplete="new-password" value={authForm.password} onChange={(event) => updateAuthForm("password", event.target.value)} placeholder="Password" required />
+                </label>
+                <label>Re-enter Password
+                  <input type="password" autoComplete="new-password" value={authForm.confirmPassword} onChange={(event) => updateAuthForm("confirmPassword", event.target.value)} placeholder="Repeat password" required />
+                </label>
+                <div className="password-rules">
+                  <span>8+ characters</span>
+                  <span>Upper & lower case</span>
+                  <span>Number</span>
+                  <span>Special character</span>
+                  <span>No spaces</span>
+                </div>
+                <div className="modal-actions auth-form-actions">
+                  <button type="button" className="button button-secondary" onClick={closeModal} disabled={authGateActive}>Cancel</button>
+                  <button type="submit" className="button button-primary" disabled={authBusy}>{authBusy ? "Creating..." : "Create Account"}</button>
+                </div>
+              </form>
+            ) : (
+              <div className="auth-login-grid">
+                <form className="auth-method-card" onSubmit={submitCinchAccountAuth}>
+                  <div>
+                    <strong>Username + Password</strong>
+                    <span>Best for regular desktop login.</span>
+                  </div>
+                  <label>Username
+                    <input type="text" autoComplete="username" value={authForm.customerId} onChange={(event) => updateAuthForm("customerId", event.target.value)} placeholder="your unique username" required />
+                  </label>
+                  <label>Password
+                    <input type="password" autoComplete="current-password" value={authForm.password} onChange={(event) => updateAuthForm("password", event.target.value)} placeholder="Password" required />
+                  </label>
+                  <button type="submit" className="button button-primary" disabled={authBusy}>{authBusy ? "Checking..." : "Login"}</button>
+                </form>
+                <form className="auth-method-card" onSubmit={verifyCinchOtp}>
+                  <div>
+                    <strong>Email / Phone OTP</strong>
+                    <span>Use the email id or phone number linked to this account.</span>
+                  </div>
+                  <label>Email ID or Phone Number
+                    <input type="text" autoComplete="email tel" value={authForm.otpIdentifier} onChange={(event) => updateAuthForm("otpIdentifier", event.target.value)} placeholder="email id or phone number" required />
+                  </label>
+                  <div className="auth-otp-row">
+                    <button type="button" className="button button-secondary" onClick={requestCinchOtp} disabled={authBusy}>{authBusy ? "Sending..." : (authForm.otpSent ? "Resend OTP" : "Send OTP")}</button>
+                    <input type="text" inputMode="numeric" value={authForm.otpCode} onChange={(event) => updateAuthForm("otpCode", event.target.value)} placeholder="Enter OTP" />
+                  </div>
+                  {authForm.otpMessage ? <p className="auth-otp-note">{authForm.otpMessage}</p> : null}
+                  <button type="submit" className="button button-primary" disabled={authBusy || !authForm.otpSent}>{authBusy ? "Verifying..." : "Verify OTP & Login"}</button>
+                </form>
+              </div>
+            )}
+            <div className="auth-checklist">
+              <article><strong>Cloud workspace</strong><span>Data is separated by unique username and business workspace.</span></article>
+              <article><strong>Password safety</strong><span>Passwords are hashed on the backend and never saved in the app.</span></article>
+              <article><strong>Logout privacy</strong><span>Signed-out users cannot see billing screens.</span></article>
+              <article><strong>Cross-device access</strong><span>Use the same hosted backend to access the same workspace elsewhere.</span></article>
             </div>
-            <div className="modal-actions auth-form-actions">
-              <button type="button" className="button button-secondary" onClick={closeModal} disabled={authGateActive}>Cancel</button>
-              <button type="submit" className="button button-primary" disabled={authBusy}>{authBusy ? "Please wait..." : (authFormMode === "register" ? "Create Account" : "Login")}</button>
-            </div>
-          </form>
-          <div className="auth-checklist">
-            <article><strong>Cloud workspace</strong><span>Data is separated by customer ID and business workspace.</span></article>
-            <article><strong>Password safety</strong><span>Passwords are hashed on the backend and never saved in the app.</span></article>
-            <article><strong>Logout privacy</strong><span>Signed-out users cannot see local billing screens.</span></article>
-            <article><strong>Cross-device access</strong><span>Use the same hosted backend to access the same workspace elsewhere.</span></article>
           </div>
           <div className="modal-actions">
             <button type="button" className="button button-secondary" onClick={() => syncAuthContext(clerkClient)}>Refresh Session</button>
@@ -5788,6 +6020,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
   function SellOnlineView({ active }) {
     const visibleProducts = sellOnlineProducts.slice(0, 180);
     const hiddenCount = Math.max(0, sellOnlineProducts.length - visibleProducts.length);
+    const onlineStoreUrl = onlineStoreProfile?.public_url || "";
 
     return (
       <section id="sellOnlineView" className={`app-view ${active ? "active" : ""}`} data-title="Sell Online">
@@ -5795,11 +6028,12 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
           <div className="panel-header sell-online-header">
             <div>
               <h2>Sell Online</h2>
-              <div className="panel-subtitle">Choose which inventory products should be available for online selling.</div>
+              <div className="panel-subtitle">Publish selected inventory products to your public CinchPOS online store.</div>
             </div>
             <div className="sell-online-stats">
               <span>{selectedSellOnlineProducts.length} selected</span>
               <span>{inventoryItems.length} inventory items</span>
+              {onlineStoreProfile?.slug ? <span>{onlineStoreProfile.slug}</span> : null}
             </div>
           </div>
 
@@ -5827,8 +6061,19 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                   <div className="sell-online-card-copy">
                     <h3>{product.name || "Untitled item"}</h3>
                     <p>Barcode {product.barcode || "Not added"}</p>
-                    <span>{currency(product.price)} | Qty {product.stock}</span>
+                    <span>Offline {currency(product.price)} | Online {currency(product.onlinePrice)} | Qty {product.stock}</span>
                   </div>
+                  {product.selected ? (
+                    <label className="sell-online-price-field">Online Price
+                      <input
+                        type="number"
+                        min="0"
+                        step="0.01"
+                        value={sellOnlineCatalog[product.id]?.onlinePrice ?? product.price}
+                        onChange={(event) => updateSellOnlinePrice(product.id, event.target.value)}
+                      />
+                    </label>
+                  ) : null}
                   <button
                     type="button"
                     className={`button ${product.selected ? "button-secondary" : "button-primary"}`}
@@ -5843,16 +6088,29 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
 
             <aside className="sell-online-summary">
               <h3>Online Catalog</h3>
-              <p className="panel-subtitle">Selected products stay saved on this device and can be connected to website, WhatsApp catalog, or marketplace publishing later.</p>
+              <p className="panel-subtitle">The online store URL uses your shop name and the unique store ID generated by the CinchPOS database.</p>
               <div className="sell-online-count-card">
                 <span>Ready to sell online</span>
                 <strong>{selectedSellOnlineProducts.length}</strong>
               </div>
+              <div className="online-store-url-card">
+                <span>Public Store URL</span>
+                <strong>{onlineStoreUrl || "Publish once to generate URL"}</strong>
+                {onlineStoreUrl ? (
+                  <div className="sell-online-url-actions">
+                    <button type="button" className="button button-secondary" onClick={() => navigator.clipboard?.writeText(onlineStoreUrl).then(() => showMessage("Online store URL copied."))}>Copy URL</button>
+                    <a className="button button-secondary" href={onlineStoreUrl} target="_blank" rel="noreferrer">Open Store</a>
+                  </div>
+                ) : null}
+              </div>
+              <button type="button" className="button button-primary" onClick={publishSellOnlineCatalog} disabled={onlineStoreBusy || !selectedSellOnlineProducts.length}>
+                {onlineStoreBusy ? "Publishing..." : "Publish Online Store"}
+              </button>
               <div className="sell-online-selected-list">
                 {selectedSellOnlineProducts.length ? selectedSellOnlineProducts.slice(0, 12).map((product) => (
                   <article key={product.id}>
                     <span>{product.name || "Untitled item"}</span>
-                    <small>{currency(product.price)} | Qty {product.stock}</small>
+                    <small>Online {currency(product.onlinePrice)} | Offline {currency(product.offlinePrice)} | Qty {product.stock}</small>
                   </article>
                 )) : <Empty>No products selected yet.</Empty>}
               </div>
@@ -6924,18 +7182,18 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                 <span className="account-avatar">{account.loggedIn ? cleanText(account.name, "Operator").charAt(0).toUpperCase() : "?"}</span>
                 <div>
                   <strong>{account.loggedIn ? cleanText(account.name, "Operator") : "Not logged in"}</strong>
-                  <span>{account.loggedIn ? (account.contact || authState.customerId || `${authState.role} access`) : "Login with a CinchPOS customer ID to sync this workspace."}</span>
+                  <span>{account.loggedIn ? (account.contact || authState.username || authState.customerId || `${authState.role} access`) : "Login with a CinchPOS username to sync this workspace."}</span>
                 </div>
               </div>
               <div className="account-actions">
-                <button className="button button-primary" type="button" hidden={account.loggedIn} onClick={() => openModal("login")}>Login or Create ID</button>
+                <button className="button button-primary" type="button" hidden={account.loggedIn} onClick={() => openModal("login")}>Login or Create Account</button>
                 <button className="button button-secondary" type="button" hidden={!account.loggedIn} disabled={cloudSyncBusy} onClick={pullCloudWorkspace}>Pull Cloud Data</button>
                 <button className="button button-secondary" type="button" hidden={!account.loggedIn} onClick={signOutOfAuth}>Logout</button>
               </div>
             </div>
             <div className="settings-metric-grid">
               <article className="settings-metric"><strong>{authState.role}</strong><span>Role</span></article>
-              <article className="settings-metric"><strong>{authState.customerId || "Not linked"}</strong><span>Customer ID</span></article>
+              <article className="settings-metric"><strong>{authState.username || authState.customerId || "Not linked"}</strong><span>Username</span></article>
               <article className="settings-metric"><strong>{authState.warehouseId}</strong><span>Warehouse</span></article>
               <article className="settings-metric"><strong>{authState.offline ? "Offline" : "Cloud"}</strong><span>Session Mode</span></article>
             </div>
