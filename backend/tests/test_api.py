@@ -98,8 +98,9 @@ class CinchPOSAPITestCase(unittest.TestCase):
         token = register_payload["token"]
         self.assertTrue(token.startswith("cinch_"))
         self.assertEqual(register_payload["account"]["username"], "testshop")
+        self.assertRegex(register_payload["account"]["customer_id"], r"^CP\d{6}$")
         self.assertEqual(register_payload["context"]["username"], "testshop")
-        self.assertEqual(register_payload["context"]["customer_id"], "testshop")
+        self.assertEqual(register_payload["context"]["customer_id"], register_payload["account"]["customer_id"])
 
         duplicate_response = self.client.post(
             "/api/auth/register",

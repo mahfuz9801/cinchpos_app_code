@@ -161,6 +161,9 @@ export function accountFromAuthState(authState) {
 
 export function normalizeBackendAuthContext(payload) {
   const context = payload?.context || {};
+  const account = payload?.account || {};
+  const username = context.username || account.username || "";
+  const customerId = context.customer_id || account.customer_id || "";
   const permissions = Array.isArray(context.permissions) && context.permissions.length
     ? context.permissions
     : permissionsForRole(context.role || "employee");
@@ -170,8 +173,8 @@ export function normalizeBackendAuthContext(payload) {
     authenticated: Boolean(context.authenticated),
     source: context.source || "",
     token: payload?.token || "",
-    username: context.username || context.customer_id || payload?.account?.username || payload?.account?.customer_id || "",
-    customerId: context.customer_id || context.username || payload?.account?.customer_id || payload?.account?.username || "",
+    username: username || customerId,
+    customerId: customerId || username,
     offline: false,
     userId: context.user_id || "",
     name: context.name || "",
@@ -189,13 +192,17 @@ export function normalizeBackendAuthContext(payload) {
 }
 
 export function normalizeCinchAccountAuth(payload) {
+  const account = payload?.account || {};
+  const context = payload?.context || {};
+  const username = account.username || context.username || "";
+  const customerId = account.customer_id || context.customer_id || "";
   return {
     ...normalizeBackendAuthContext(payload),
     configured: true,
     source: "cinchpos-account",
     token: payload?.token || "",
-    username: payload?.account?.username || payload?.context?.username || payload?.account?.customer_id || payload?.context?.customer_id || "",
-    customerId: payload?.account?.customer_id || payload?.context?.customer_id || payload?.account?.username || payload?.context?.username || "",
+    username: username || customerId,
+    customerId: customerId || username,
     authenticated: Boolean(payload?.token && payload?.context?.authenticated)
   };
 }

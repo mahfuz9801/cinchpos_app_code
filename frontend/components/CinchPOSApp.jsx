@@ -5555,11 +5555,11 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
             <div className="auth-status-card">
               <span className={`record-chip ${authState.authenticated ? "success" : ""}`}>{authState.authenticated ? "Session Active" : "Signed Out"}</span>
               <h3>{authState.authenticated ? cleanText(authState.name, "Operator") : "Account Access"}</h3>
-              <p>{authState.authenticated ? (authState.email || authState.phone || authState.username || authState.customerId || "CinchPOS account active") : "Create one username, then use it to login to this protected workspace."}</p>
+              <p>{authState.authenticated ? (authState.email || authState.phone || authState.username || authState.customerId || "CinchPOS account active") : "Choose your own username. CinchPOS will generate the customer ID automatically."}</p>
               <div className="auth-meta-grid">
-                <span>Username <strong>{authState.username || authState.customerId || "Not logged in"}</strong></span>
+                <span>Username <strong>{authState.username || "Not logged in"}</strong></span>
+                <span>Customer ID <strong>{authState.customerId || "Auto generated"}</strong></span>
                 <span>Role <strong>{authState.role}</strong></span>
-                <span>Business <strong>{authState.businessId}</strong></span>
                 <span>Mode <strong>{authState.offline ? "Offline cache" : "Cloud session"}</strong></span>
               </div>
             </div>
@@ -5632,7 +5632,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
               </div>
             )}
             <div className="auth-checklist">
-              <article><strong>Cloud workspace</strong><span>Data is separated by unique username and business workspace.</span></article>
+              <article><strong>Cloud workspace</strong><span>Data is separated by username, generated customer ID, and business workspace.</span></article>
               <article><strong>Password safety</strong><span>Passwords are hashed on the backend and never saved in the app.</span></article>
               <article><strong>Logout privacy</strong><span>Signed-out users cannot see billing screens.</span></article>
               <article><strong>Cross-device access</strong><span>Use the same hosted backend to access the same workspace elsewhere.</span></article>
@@ -7193,7 +7193,8 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
             </div>
             <div className="settings-metric-grid">
               <article className="settings-metric"><strong>{authState.role}</strong><span>Role</span></article>
-              <article className="settings-metric"><strong>{authState.username || authState.customerId || "Not linked"}</strong><span>Username</span></article>
+              <article className="settings-metric"><strong>{authState.username || "Not linked"}</strong><span>Username</span></article>
+              <article className="settings-metric"><strong>{authState.customerId || "Auto generated"}</strong><span>Customer ID</span></article>
               <article className="settings-metric"><strong>{authState.warehouseId}</strong><span>Warehouse</span></article>
               <article className="settings-metric"><strong>{authState.offline ? "Offline" : "Cloud"}</strong><span>Session Mode</span></article>
             </div>

@@ -35,7 +35,7 @@ DATABASE = os.getenv(
     "DATABASE_PATH",
     os.path.join(os.path.dirname(__file__), "database.db"),
 )
-SCHEMA_VERSION = "4"
+SCHEMA_VERSION = "5"
 AUTH_REQUIRED = os.getenv("CINCHPOS_AUTH_REQUIRED", "1").strip().lower() in {
     "1",
     "true",
@@ -69,6 +69,7 @@ SMTP_USERNAME = os.getenv("CINCHPOS_SMTP_USERNAME", EMAIL_OTP_FROM).strip()
 SMTP_PASSWORD = os.getenv("CINCHPOS_SMTP_PASSWORD", "").strip()
 SMTP_SECURITY = os.getenv("CINCHPOS_SMTP_SECURITY", "starttls").strip().lower()
 SMS_WEBHOOK_URL = os.getenv("CINCHPOS_SMS_WEBHOOK_URL", "").strip()
+PUBLIC_STORE_BASE_URL = os.getenv("CINCHPOS_PUBLIC_STORE_BASE_URL", "https://cinchpos.in").strip().rstrip("/")
 EXPOSE_DEV_OTP = os.getenv("CINCHPOS_EXPOSE_DEV_OTP", "0").strip().lower() in {
     "1",
     "true",
@@ -76,6 +77,8 @@ EXPOSE_DEV_OTP = os.getenv("CINCHPOS_EXPOSE_DEV_OTP", "0").strip().lower() in {
     "on",
 }
 CUSTOMER_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{3,31}$")
+CUSTOMER_ACCOUNT_ID_PREFIX = os.getenv("CINCHPOS_CUSTOMER_ID_PREFIX", "CP").strip().upper() or "CP"
+CUSTOMER_ACCOUNT_ID_DIGITS = max(4, int(os.getenv("CINCHPOS_CUSTOMER_ID_DIGITS", "6")))
 PASSWORD_RULES = {
     "min_length": 8,
     "uppercase": True,
@@ -100,6 +103,7 @@ DB_INDEX_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS idx_auth_audit_user_id ON auth_audit_logs(user_id)",
     "CREATE INDEX IF NOT EXISTS idx_memberships_user_business ON business_memberships(clerk_user_id, business_id)",
     "CREATE INDEX IF NOT EXISTS idx_customer_accounts_customer_id ON customer_accounts(customer_id)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_customer_accounts_username_unique ON customer_accounts(username) WHERE username <> ''",
     "CREATE INDEX IF NOT EXISTS idx_customer_accounts_email ON customer_accounts(email)",
     "CREATE INDEX IF NOT EXISTS idx_customer_accounts_phone ON customer_accounts(phone)",
     "CREATE INDEX IF NOT EXISTS idx_customer_accounts_business_id ON customer_accounts(business_id)",
@@ -304,6 +308,10 @@ def normalize_customer_id(value):
     return str(value or "").strip().lower()
 
 
+def normalize_username(value):
+    return str(value or "").strip().lower()
+
+
 def account_username_from_payload(data):
     return data.get("username") or data.get("user_name") or data.get("customer_id") or data.get("user_id")
 
@@ -331,11 +339,15 @@ def account_identifier_from_payload(data):
     )
 
 
-def validate_customer_id(value):
-    customer_id = normalize_customer_id(value)
-    if not CUSTOMER_ID_PATTERN.match(customer_id):
+def validate_username(value):
+    username = normalize_username(value)
+    if not CUSTOMER_ID_PATTERN.match(username):
         raise ValueError("Username must be 4-32 characters and use letters, numbers, dot, dash, or underscore.")
-    return customer_id
+    return username
+
+
+def validate_customer_id(value):
+    return validate_username(value)
 
 
 def password_validation_errors(password):
@@ -395,6 +407,67 @@ def hash_session_token(token):
 def safe_identifier(value, prefix):
     body = re.sub(r"[^a-z0-9_-]+", "_", normalize_customer_id(value)).strip("_")
     return f"{prefix}_{body or secrets.token_hex(4)}"
+
+
+def row_get(row, key, default=""):
+    if not row:
+        return default
+    try:
+        return row[key]
+    except (IndexError, KeyError):
+        return default
+
+
+def generate_customer_account_id(conn):
+    prefix = re.sub(r"[^A-Z0-9]+", "", CUSTOMER_ACCOUNT_ID_PREFIX.upper())[:8] or "CP"
+    digits = CUSTOMER_ACCOUNT_ID_DIGITS
+    rows = conn.execute(
+        "SELECT customer_id FROM customer_accounts WHERE customer_id LIKE ?",
+        (f"{prefix}%",),
+    ).fetchall()
+    highest = 0
+    for row in rows:
+        value = str(row_get(row, "customer_id", "") or "").upper()
+        suffix = value[len(prefix):] if value.startswith(prefix) else ""
+        if suffix.isdigit():
+            highest = max(highest, int(suffix))
+    for number in range(highest + 1, highest + 10000):
+        candidate = f"{prefix}{number:0{digits}d}"
+        exists = conn.execute(
+            "SELECT 1 FROM customer_accounts WHERE customer_id = ?",
+            (candidate,),
+        ).fetchone()
+        if not exists:
+            return candidate
+    raise RuntimeError("Could not generate a unique customer id.")
+
+
+def migrate_customer_account_usernames(conn):
+    rows = conn.execute(
+        "SELECT id, customer_id, username FROM customer_accounts"
+    ).fetchall()
+    for row in rows:
+        if row_get(row, "username"):
+            continue
+        base_username = normalize_username(row_get(row, "customer_id"))
+        if not base_username or not CUSTOMER_ID_PATTERN.match(base_username):
+            base_username = f"user_{str(row_get(row, 'id', '')).replace('acct_', '')[:8] or secrets.token_hex(4)}"
+        username = base_username
+        suffix = 2
+        while conn.execute(
+            "SELECT 1 FROM customer_accounts WHERE username = ? AND id <> ?",
+            (username, row["id"]),
+        ).fetchone():
+            username = f"{base_username}_{suffix}"
+            suffix += 1
+        conn.execute(
+            """
+            UPDATE customer_accounts
+            SET username = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (username, row["id"]),
+        )
 
 
 def current_auth_context():
@@ -638,11 +711,12 @@ def build_clerk_auth_context(claims):
 def serialize_customer_account(row):
     if not row:
         return {}
-    username = row["customer_id"]
+    username = row_get(row, "username") or row_get(row, "customer_id")
+    customer_id = row_get(row, "customer_id") or username
     return {
         "id": row["id"],
         "username": username,
-        "customer_id": username,
+        "customer_id": customer_id,
         "name": row["name"] or username,
         "email": row["email"] or "",
         "phone": row["phone"] or "",
@@ -674,6 +748,8 @@ def ensure_roles_for_business(conn, business_id):
 def build_account_auth_context(account_row, session_id=""):
     membership = None
     business_id = account_row["business_id"] or DEFAULT_BUSINESS_ID
+    username = row_get(account_row, "username") or row_get(account_row, "customer_id")
+    customer_id = row_get(account_row, "customer_id") or username
     with closing(get_connection()) as conn:
         ensure_auth_schema(conn)
         membership = get_membership_for_user(conn, account_row["id"], business_id)
@@ -691,11 +767,11 @@ def build_account_auth_context(account_row, session_id=""):
         "authenticated": True,
         "source": "cinchpos-account",
         "user_id": account_row["id"],
-        "username": account_row["customer_id"],
-        "customer_id": account_row["customer_id"],
+        "username": username,
+        "customer_id": customer_id,
         "email": account_row["email"] or "",
         "phone": account_row["phone"] or "",
-        "name": account_row["name"] or account_row["customer_id"],
+        "name": account_row["name"] or username,
         "business_id": business_id,
         "warehouse_id": account_row["warehouse_id"] or DEFAULT_WAREHOUSE_ID,
         "role": role_key,
@@ -747,7 +823,7 @@ def find_account_for_login_identifier(conn, identifier):
     value = str(identifier or "").strip()
     email = normalize_account_email(value)
     phone = normalize_account_phone(value)
-    username = normalize_customer_id(value)
+    username = normalize_username(value)
     if "@" in value:
         return conn.execute(
             "SELECT * FROM customer_accounts WHERE lower(email) = ?",
@@ -759,8 +835,11 @@ def find_account_for_login_identifier(conn, identifier):
             (phone,),
         ).fetchone()
     return conn.execute(
-        "SELECT * FROM customer_accounts WHERE customer_id = ?",
-        (username,),
+        """
+        SELECT * FROM customer_accounts
+        WHERE username = ? OR (username = '' AND customer_id = ?)
+        """,
+        (username, username),
     ).fetchone()
 
 
@@ -1163,6 +1242,7 @@ def ensure_auth_schema(conn):
         CREATE TABLE IF NOT EXISTS customer_accounts (
             id TEXT PRIMARY KEY,
             customer_id TEXT NOT NULL UNIQUE,
+            username TEXT NOT NULL DEFAULT '',
             password_hash TEXT NOT NULL,
             business_id TEXT NOT NULL,
             warehouse_id TEXT DEFAULT 'main',
@@ -1375,9 +1455,11 @@ def init_db():
     ensure_column("customer_accounts", "failed_login_count", "INTEGER DEFAULT 0")
     ensure_column("customer_accounts", "locked_until", "TEXT DEFAULT ''")
     ensure_column("customer_accounts", "phone", "TEXT DEFAULT ''")
+    ensure_column("customer_accounts", "username", "TEXT DEFAULT ''")
 
     with closing(get_connection()) as conn:
         ensure_auth_schema(conn)
+        migrate_customer_account_usernames(conn)
         for statement in DB_INDEX_STATEMENTS:
             conn.execute(statement)
         set_app_meta(conn, "schema_version", SCHEMA_VERSION)
@@ -1472,8 +1554,22 @@ def generate_online_public_code(conn):
     raise RuntimeError("Could not generate a unique online store code.")
 
 
+def normalize_online_public_code(value):
+    return re.sub(r"[^A-Za-z0-9]+", "", str(value or "")).upper()[:16]
+
+
+def online_public_code_is_available(conn, public_code, store_id=""):
+    if not public_code:
+        return False
+    existing = conn.execute(
+        "SELECT id FROM online_stores WHERE public_code = ?",
+        (public_code,),
+    ).fetchone()
+    return not existing or existing["id"] == store_id
+
+
 def build_online_store_slug(store_name, public_code):
-    return f"{slugify_store_name(store_name)}-{public_code}"
+    return f"{slugify_store_name(store_name)}-{slugify_store_name(public_code)}"
 
 
 def generate_online_invoice_number(conn):
@@ -1493,7 +1589,7 @@ def generate_online_invoice_number(conn):
 def serialize_online_store(row):
     if not row:
         return None
-    public_url = f"https://www.cinchpos.in/{row['slug']}/online-store"
+    public_url = f"{PUBLIC_STORE_BASE_URL}/{row['slug']}/online-store"
     return {
         "id": row["id"],
         "business_id": row["business_id"],
@@ -1962,7 +2058,7 @@ def auth_password_rules():
 def register_customer_account():
     data = request.get_json() or {}
     try:
-        customer_id = validate_customer_id(account_username_from_payload(data))
+        username = validate_username(account_username_from_payload(data))
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
 
@@ -1985,14 +2081,15 @@ def register_customer_account():
         return jsonify({"error": "A valid 10 digit phone number is required."}), 400
     display_name = business_name
     account_id = f"acct_{secrets.token_hex(12)}"
-    business_id = safe_identifier(customer_id, "biz")
+    business_id = safe_identifier(username, "biz")
     warehouse_id = f"{business_id}_main"
 
     with closing(get_connection()) as conn:
         ensure_auth_schema(conn)
+        migrate_customer_account_usernames(conn)
         if conn.execute(
-            "SELECT 1 FROM customer_accounts WHERE customer_id = ?",
-            (customer_id,),
+            "SELECT 1 FROM customer_accounts WHERE username = ?",
+            (username,),
         ).fetchone():
             return jsonify({"error": "This username is already registered."}), 409
         if conn.execute(
@@ -2006,6 +2103,7 @@ def register_customer_account():
         ).fetchone():
             return jsonify({"error": "This phone number is already registered."}), 409
 
+        customer_id = generate_customer_account_id(conn)
         conn.execute(
             """
             INSERT INTO businesses (id, name, owner_user_id, status)
@@ -2024,14 +2122,15 @@ def register_customer_account():
         conn.execute(
             """
             INSERT INTO customer_accounts (
-                id, customer_id, password_hash, business_id, warehouse_id,
+                id, customer_id, username, password_hash, business_id, warehouse_id,
                 role_key, status, email, phone, name, last_login_at
             )
-            VALUES (?, ?, ?, ?, ?, 'owner', 'Active', ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, 'owner', 'Active', ?, ?, ?, ?)
             """,
             (
                 account_id,
                 customer_id,
+                username,
                 hash_password(password),
                 business_id,
                 warehouse_id,
@@ -2067,7 +2166,7 @@ def register_customer_account():
 
     context = build_account_auth_context(account_row, session_id)
     g.auth_context = context
-    log_auth_event("customer_account.registered", context, {"username": customer_id})
+    log_auth_event("customer_account.registered", context, {"username": username, "customer_id": customer_id})
     return jsonify(
         {
             "token": token,
@@ -2083,16 +2182,20 @@ def register_customer_account():
 @app.route("/api/auth/login", methods=["POST"])
 def login_customer_account():
     data = request.get_json() or {}
-    customer_id = normalize_customer_id(account_username_from_payload(data))
+    username = normalize_username(account_username_from_payload(data))
     password = str(data.get("password") or "")
-    if not customer_id or not password:
+    if not username or not password:
         return jsonify({"error": "Username and password are required."}), 400
 
     with closing(get_connection()) as conn:
         ensure_auth_schema(conn)
+        migrate_customer_account_usernames(conn)
         account_row = conn.execute(
-            "SELECT * FROM customer_accounts WHERE customer_id = ?",
-            (customer_id,),
+            """
+            SELECT * FROM customer_accounts
+            WHERE username = ? OR (username = '' AND customer_id = ?)
+            """,
+            (username, username),
         ).fetchone()
         now_iso = datetime.now(UTC).isoformat()
         if not account_row or account_row["status"] != "Active":
@@ -2133,7 +2236,7 @@ def login_customer_account():
 
     context = build_account_auth_context(account_row, session_id)
     g.auth_context = context
-    log_auth_event("customer_account.login", context, {"username": customer_id})
+    log_auth_event("customer_account.login", context, {"username": username, "customer_id": context.get("customer_id")})
     return jsonify(
         {
             "token": token,
@@ -2653,18 +2756,31 @@ def publish_online_store():
     with closing(get_connection()) as conn:
         ensure_auth_schema(conn)
         store_row = get_online_store_by_business(conn, business_id)
+        preferred_public_code = ""
+        if context.get("source") == "cinchpos-account":
+            preferred_public_code = normalize_online_public_code(context.get("customer_id"))
         if store_row:
             store_id = store_row["id"]
             public_code = store_row["public_code"]
+            if (
+                preferred_public_code
+                and preferred_public_code != public_code
+                and online_public_code_is_available(conn, preferred_public_code, store_id)
+            ):
+                public_code = preferred_public_code
         else:
             store_id = f"store_{secrets.token_hex(12)}"
-            public_code = generate_online_public_code(conn)
+            if preferred_public_code and online_public_code_is_available(conn, preferred_public_code):
+                public_code = preferred_public_code
+            else:
+                public_code = generate_online_public_code(conn)
         next_slug = build_online_store_slug(store_name, public_code)
         if store_row:
             conn.execute(
                 """
                 UPDATE online_stores
-                SET slug = ?,
+                SET public_code = ?,
+                    slug = ?,
                     store_name = ?,
                     contact_phone = ?,
                     contact_email = ?,
@@ -2675,6 +2791,7 @@ def publish_online_store():
                 WHERE id = ?
                 """,
                 (
+                    public_code,
                     next_slug,
                     store_name,
                     str(store_payload.get("contact_phone") or store_payload.get("contactPhone") or "").strip(),
