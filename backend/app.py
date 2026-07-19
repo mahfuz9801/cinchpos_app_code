@@ -13,7 +13,7 @@ import json
 import re
 import secrets
 from urllib import request as urlrequest
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 
 from flask import Flask, g, jsonify, request
 from werkzeug.exceptions import HTTPException
@@ -35,7 +35,7 @@ DATABASE = os.getenv(
     "DATABASE_PATH",
     os.path.join(os.path.dirname(__file__), "database.db"),
 )
-SCHEMA_VERSION = "5"
+SCHEMA_VERSION = "6"
 AUTH_REQUIRED = os.getenv("CINCHPOS_AUTH_REQUIRED", "1").strip().lower() in {
     "1",
     "true",
@@ -70,6 +70,7 @@ SMTP_PASSWORD = os.getenv("CINCHPOS_SMTP_PASSWORD", "").strip()
 SMTP_SECURITY = os.getenv("CINCHPOS_SMTP_SECURITY", "starttls").strip().lower()
 SMS_WEBHOOK_URL = os.getenv("CINCHPOS_SMS_WEBHOOK_URL", "").strip()
 PUBLIC_STORE_BASE_URL = os.getenv("CINCHPOS_PUBLIC_STORE_BASE_URL", "https://cinchpos.in").strip().rstrip("/")
+PUBLIC_STORE_SYNC_URL = os.getenv("CINCHPOS_PUBLIC_STORE_SYNC_URL", f"{PUBLIC_STORE_BASE_URL}/api/online-store/sync").strip()
 EXPOSE_DEV_OTP = os.getenv("CINCHPOS_EXPOSE_DEV_OTP", "0").strip().lower() in {
     "1",
     "true",
@@ -1316,6 +1317,7 @@ def ensure_auth_schema(conn):
             contact_email TEXT DEFAULT '',
             address TEXT DEFAULT '',
             logo_url TEXT DEFAULT '',
+            sync_token TEXT DEFAULT '',
             status TEXT DEFAULT 'Active',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -1456,6 +1458,7 @@ def init_db():
     ensure_column("customer_accounts", "locked_until", "TEXT DEFAULT ''")
     ensure_column("customer_accounts", "phone", "TEXT DEFAULT ''")
     ensure_column("customer_accounts", "username", "TEXT DEFAULT ''")
+    ensure_column("online_stores", "sync_token", "TEXT DEFAULT ''")
 
     with closing(get_connection()) as conn:
         ensure_auth_schema(conn)
@@ -1628,6 +1631,49 @@ def serialize_online_product(row):
         "status": row["status"] or "Active",
         "updated_at": row["updated_at"],
     }
+
+
+def sync_online_store_public_catalog(store_row, products):
+    if app.config.get("TESTING"):
+        return {"status": "skipped", "reason": "testing"}
+    if not PUBLIC_STORE_SYNC_URL:
+        return {"status": "skipped", "reason": "sync_url_not_configured"}
+    sync_token = row_get(store_row, "sync_token")
+    if not sync_token:
+        return {"status": "skipped", "reason": "sync_token_missing"}
+
+    payload = {
+        "store": serialize_online_store(store_row),
+        "products": products,
+        "sync_token": sync_token,
+    }
+    request_obj = urlrequest.Request(
+        PUBLIC_STORE_SYNC_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "CinchPOS-Desktop/1.0",
+        },
+        method="POST",
+    )
+    try:
+        with urlrequest.urlopen(request_obj, timeout=12) as response:
+            body = response.read().decode("utf-8")
+            response_payload = json_loads(body, {})
+            return {
+                "status": response_payload.get("status") or "synced",
+                "store_url": response_payload.get("store", {}).get("public_url") or payload["store"].get("public_url"),
+                "synced_count": response_payload.get("published_count", len(products)),
+            }
+    except HTTPError as exc:
+        try:
+            body = exc.read().decode("utf-8")
+        except Exception:
+            body = ""
+        response_payload = json_loads(body, {})
+        return {"status": "failed", "error": response_payload.get("error") or str(exc)}
+    except URLError as exc:
+        return {"status": "failed", "error": str(exc)}
 
 
 def get_online_store_by_business(conn, business_id):
@@ -2762,6 +2808,7 @@ def publish_online_store():
         if store_row:
             store_id = store_row["id"]
             public_code = store_row["public_code"]
+            sync_token = row_get(store_row, "sync_token") or secrets.token_urlsafe(32)
             if (
                 preferred_public_code
                 and preferred_public_code != public_code
@@ -2770,6 +2817,7 @@ def publish_online_store():
                 public_code = preferred_public_code
         else:
             store_id = f"store_{secrets.token_hex(12)}"
+            sync_token = secrets.token_urlsafe(32)
             if preferred_public_code and online_public_code_is_available(conn, preferred_public_code):
                 public_code = preferred_public_code
             else:
@@ -2786,6 +2834,7 @@ def publish_online_store():
                     contact_email = ?,
                     address = ?,
                     logo_url = ?,
+                    sync_token = ?,
                     status = 'Active',
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
@@ -2798,6 +2847,7 @@ def publish_online_store():
                     str(store_payload.get("contact_email") or store_payload.get("contactEmail") or "").strip(),
                     str(store_payload.get("address") or "").strip(),
                     str(store_payload.get("logo_url") or store_payload.get("logoUrl") or "").strip(),
+                    sync_token,
                     store_id,
                 ),
             )
@@ -2806,9 +2856,9 @@ def publish_online_store():
                 """
                 INSERT INTO online_stores (
                     id, business_id, public_code, slug, store_name,
-                    contact_phone, contact_email, address, logo_url, status
+                    contact_phone, contact_email, address, logo_url, sync_token, status
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Active')
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Active')
                 """,
                 (
                     store_id,
@@ -2820,6 +2870,7 @@ def publish_online_store():
                     str(store_payload.get("contact_email") or store_payload.get("contactEmail") or "").strip(),
                     str(store_payload.get("address") or "").strip(),
                     str(store_payload.get("logo_url") or store_payload.get("logoUrl") or "").strip(),
+                    sync_token,
                 ),
             )
 
@@ -2885,7 +2936,13 @@ def publish_online_store():
         products = get_online_store_products(conn, store_row["id"])
 
     log_auth_event("online_store.published", context, {"products": len(normalized_products), "slug": next_slug})
-    return jsonify({"store": serialize_online_store(store_row), "products": products, "published_count": len(normalized_products)})
+    sync_result = sync_online_store_public_catalog(store_row, products)
+    return jsonify({
+        "store": serialize_online_store(store_row),
+        "products": products,
+        "published_count": len(normalized_products),
+        "sync": sync_result,
+    })
 
 
 @app.route("/api/public/stores/<store_slug>", methods=["GET"])

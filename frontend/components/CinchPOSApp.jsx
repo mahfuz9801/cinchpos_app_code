@@ -3395,7 +3395,11 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         products: selectedSellOnlineProducts
       });
       setOnlineStoreProfile(payload.store || null);
-      showMessage(`Online store published with ${payload.published_count || selectedSellOnlineProducts.length} products.`);
+      if (payload.sync?.status === "failed") {
+        showMessage(`Online store saved locally, but website sync failed: ${payload.sync.error || "check connection"}`);
+      } else {
+        showMessage(`Online store published with ${payload.published_count || selectedSellOnlineProducts.length} products.`);
+      }
     } catch (error) {
       showMessage(error instanceof Error ? error.message : "Could not publish online store.");
     } finally {
