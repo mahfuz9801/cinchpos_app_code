@@ -309,8 +309,7 @@ export async function writeAccountAuthSession(authState, expiresAt = "") {
     await window.cinchposSecureStorage.set(ACCOUNT_AUTH_KEY, payload);
     return;
   }
-  window.sessionStorage.setItem(`cinchPOS:${ACCOUNT_AUTH_KEY}`, payload);
-  window.localStorage.removeItem(`cinchPOS:${ACCOUNT_AUTH_KEY}`);
+  window.localStorage.setItem(`cinchPOS:${ACCOUNT_AUTH_KEY}`, payload);
 }
 
 export async function readAccountAuthSession() {
@@ -320,7 +319,7 @@ export async function readAccountAuthSession() {
   try {
     const payload = window.cinchposSecureStorage?.get
       ? await window.cinchposSecureStorage.get(ACCOUNT_AUTH_KEY)
-      : window.sessionStorage.getItem(`cinchPOS:${ACCOUNT_AUTH_KEY}`);
+      : window.localStorage.getItem(`cinchPOS:${ACCOUNT_AUTH_KEY}`);
     if (!payload) {
       return null;
     }

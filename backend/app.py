@@ -29,6 +29,11 @@ except ImportError:  # pragma: no cover - exercised only when auth is enabled wi
     jwt = None
     PyJWKClient = None
 
+try:
+    import certifi
+except ImportError:  # pragma: no cover - fallback for minimal local runtimes
+    certifi = None
+
 app = Flask(__name__)
 
 DATABASE = os.getenv(
@@ -332,6 +337,7 @@ def account_identifier_from_payload(data):
     return (
         data.get("identifier")
         or data.get("login")
+        or data.get("contact")
         or data.get("username")
         or data.get("email")
         or data.get("phone")
@@ -441,6 +447,38 @@ def generate_customer_account_id(conn):
         if not exists:
             return candidate
     raise RuntimeError("Could not generate a unique customer id.")
+
+
+def username_seed_from_value(value):
+    seed = re.sub(r"[^a-z0-9._-]+", "-", normalize_username(value)).strip("._-")
+    seed = re.sub(r"[-._]{2,}", "-", seed)
+    if not seed:
+        seed = f"shop-{secrets.randbelow(10000):04d}"
+    if not re.match(r"^[a-z0-9]", seed):
+        seed = f"shop-{seed}"
+    seed = seed[:24].strip("._-") or "shop"
+    if len(seed) < 4:
+        seed = f"{seed}-{secrets.randbelow(10000):04d}"[:24].strip("._-")
+    return seed if CUSTOMER_ID_PATTERN.match(seed) else f"shop-{secrets.randbelow(10000):04d}"
+
+
+def generate_account_username(conn, business_name="", email="", phone=""):
+    base = username_seed_from_value(
+        business_name
+        or (str(email).split("@", 1)[0] if email else "")
+        or phone
+        or "shop"
+    )
+    candidate = base
+    suffix = 2
+    while conn.execute(
+        "SELECT 1 FROM customer_accounts WHERE username = ?",
+        (candidate,),
+    ).fetchone():
+        suffix_text = str(suffix)
+        candidate = f"{base[: max(4, 32 - len(suffix_text) - 1)]}-{suffix_text}".strip("._-")
+        suffix += 1
+    return candidate
 
 
 def migrate_customer_account_usernames(conn):
@@ -1633,6 +1671,13 @@ def serialize_online_product(row):
     }
 
 
+def open_public_sync_request(request_obj, timeout=12):
+    if certifi:
+        context = ssl.create_default_context(cafile=certifi.where())
+        return urlrequest.urlopen(request_obj, timeout=timeout, context=context)
+    return urlrequest.urlopen(request_obj, timeout=timeout)
+
+
 def sync_online_store_public_catalog(store_row, products):
     if app.config.get("TESTING"):
         return {"status": "skipped", "reason": "testing"}
@@ -1657,7 +1702,7 @@ def sync_online_store_public_catalog(store_row, products):
         method="POST",
     )
     try:
-        with urlrequest.urlopen(request_obj, timeout=12) as response:
+        with open_public_sync_request(request_obj, timeout=12) as response:
             body = response.read().decode("utf-8")
             response_payload = json_loads(body, {})
             return {
@@ -2103,11 +2148,6 @@ def auth_password_rules():
 @app.route("/api/auth/register", methods=["POST"])
 def register_customer_account():
     data = request.get_json() or {}
-    try:
-        username = validate_username(account_username_from_payload(data))
-    except ValueError as exc:
-        return jsonify({"error": str(exc)}), 400
-
     password = str(data.get("password") or "")
     confirm_password = str(data.get("confirm_password") or data.get("confirmPassword") or password)
     if password != confirm_password:
@@ -2117,39 +2157,53 @@ def register_customer_account():
         return jsonify({"error": " ".join(errors), "password_errors": errors}), 400
 
     business_name = (data.get("business_name") or data.get("businessName") or "").strip()
-    email = normalize_account_email(data.get("email"))
-    phone = normalize_account_phone(data.get("phone"))
+    contact = str(data.get("contact") or data.get("identifier") or "").strip()
+    email = normalize_account_email(data.get("email") or (contact if "@" in contact else ""))
+    phone = normalize_account_phone(data.get("phone") or (contact if "@" not in contact else ""))
     if not business_name:
         return jsonify({"error": "Business name is required."}), 400
-    if not email or "@" not in email:
-        return jsonify({"error": "A valid email id is required."}), 400
-    if not phone or len(phone) != 10:
-        return jsonify({"error": "A valid 10 digit phone number is required."}), 400
+    if email and "@" not in email:
+        return jsonify({"error": "Enter a valid email id."}), 400
+    if phone and len(phone) != 10:
+        return jsonify({"error": "Enter a valid 10 digit phone number."}), 400
+    if not email and not phone:
+        return jsonify({"error": "Email id or phone number is required."}), 400
     display_name = business_name
     account_id = f"acct_{secrets.token_hex(12)}"
-    business_id = safe_identifier(username, "biz")
-    warehouse_id = f"{business_id}_main"
 
     with closing(get_connection()) as conn:
         ensure_auth_schema(conn)
         migrate_customer_account_usernames(conn)
-        if conn.execute(
+        requested_username = account_username_from_payload(data)
+        try:
+            username = validate_username(requested_username) if requested_username else generate_account_username(
+                conn,
+                business_name,
+                email,
+                phone,
+            )
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+
+        if requested_username and conn.execute(
             "SELECT 1 FROM customer_accounts WHERE username = ?",
             (username,),
         ).fetchone():
             return jsonify({"error": "This username is already registered."}), 409
-        if conn.execute(
+        if email and conn.execute(
             "SELECT 1 FROM customer_accounts WHERE lower(email) = ?",
             (email,),
         ).fetchone():
             return jsonify({"error": "This email id is already registered."}), 409
-        if conn.execute(
+        if phone and conn.execute(
             "SELECT 1 FROM customer_accounts WHERE phone = ?",
             (phone,),
         ).fetchone():
             return jsonify({"error": "This phone number is already registered."}), 409
 
         customer_id = generate_customer_account_id(conn)
+        business_id = safe_identifier(username, "biz")
+        warehouse_id = f"{business_id}_main"
         conn.execute(
             """
             INSERT INTO businesses (id, name, owner_user_id, status)
@@ -2228,24 +2282,18 @@ def register_customer_account():
 @app.route("/api/auth/login", methods=["POST"])
 def login_customer_account():
     data = request.get_json() or {}
-    username = normalize_username(account_username_from_payload(data))
+    identifier = str(account_identifier_from_payload(data) or "").strip()
     password = str(data.get("password") or "")
-    if not username or not password:
-        return jsonify({"error": "Username and password are required."}), 400
+    if not identifier or not password:
+        return jsonify({"error": "Email id or phone number and password are required."}), 400
 
     with closing(get_connection()) as conn:
         ensure_auth_schema(conn)
         migrate_customer_account_usernames(conn)
-        account_row = conn.execute(
-            """
-            SELECT * FROM customer_accounts
-            WHERE username = ? OR (username = '' AND customer_id = ?)
-            """,
-            (username, username),
-        ).fetchone()
+        account_row = find_account_for_login_identifier(conn, identifier)
         now_iso = datetime.now(UTC).isoformat()
         if not account_row or account_row["status"] != "Active":
-            return jsonify({"error": "Invalid username or password."}), 401
+            return jsonify({"error": "Invalid login detail or password."}), 401
         if account_row["locked_until"] and account_row["locked_until"] > now_iso:
             return jsonify({"error": "Account is temporarily locked. Please try again later."}), 423
         if not verify_password(password, account_row["password_hash"]):
@@ -2265,7 +2313,7 @@ def login_customer_account():
                 (next_failed_count, locked_until, account_row["id"]),
             )
             conn.commit()
-            return jsonify({"error": "Invalid username or password."}), 401
+            return jsonify({"error": "Invalid login detail or password."}), 401
         conn.execute(
             """
             UPDATE customer_accounts
@@ -2282,7 +2330,7 @@ def login_customer_account():
 
     context = build_account_auth_context(account_row, session_id)
     g.auth_context = context
-    log_auth_event("customer_account.login", context, {"username": username, "customer_id": context.get("customer_id")})
+    log_auth_event("customer_account.login", context, {"identifier": identifier, "customer_id": context.get("customer_id")})
     return jsonify(
         {
             "token": token,

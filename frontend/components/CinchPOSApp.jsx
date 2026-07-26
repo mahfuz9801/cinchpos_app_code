@@ -1206,6 +1206,8 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
   const [authFormMode, setAuthFormMode] = useState("login");
   const [authForm, setAuthForm] = useState({
     customerId: "",
+    identifier: "",
+    contact: "",
     password: "",
     confirmPassword: "",
     name: "",
@@ -2223,14 +2225,13 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         setAuthState(cachedAuthState);
         setAccount(accountFromAuthState(cachedAuthState));
         setAuthTokenProvider(async () => cachedAuthState.token);
-        const refreshedState = await syncAuthContext(null, { silent: true });
-        if (refreshedState?.authenticated && !cancelled) {
-          try {
-            const snapshot = await getWorkspaceSnapshot();
+        try {
+          const snapshot = await getWorkspaceSnapshot();
+          if (!cancelled) {
             applyWorkspaceSnapshotPayload(snapshot?.payload);
-          } catch {
-            // Local workspace remains available if the cloud snapshot cannot be pulled.
           }
+        } catch {
+          // Keep the saved account session active; the next API call can reconnect when the service is ready.
         }
         setAuthBusy(false);
         return;
@@ -2418,48 +2419,56 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     if (authBusy) {
       return;
     }
-    const username = cleanText(authForm.customerId).toLowerCase();
     const password = String(authForm.password || "");
-    const email = cleanText(authForm.email).toLowerCase();
-    const phone = normalizePhone(authForm.phone).slice(-10);
     const businessName = cleanText(authForm.businessName);
-    if (!username || !password) {
-      showMessage("Enter username and password.");
-      return;
-    }
     if (authFormMode === "register") {
-      if (!businessName || !email || !phone) {
-        showMessage("Add business name, phone number, and email id.");
+      const contact = cleanText(authForm.contact || authForm.email || authForm.phone);
+      const isEmail = contact.includes("@");
+      const email = isEmail ? contact.toLowerCase() : "";
+      const phone = isEmail ? "" : normalizePhone(contact).slice(-10);
+      if (!businessName || !contact || !password) {
+        showMessage("Add business name, email id or phone number, and password.");
         return;
       }
-      if (phone.length !== 10) {
-        showMessage("Phone number must be 10 digits.");
-        return;
-      }
-      if (!email.includes("@")) {
+      if (isEmail && !email.includes("@")) {
         showMessage("Enter a valid email id.");
         return;
       }
-      if (password !== String(authForm.confirmPassword || "")) {
-        showMessage("Password and confirmation do not match.");
+      if (!isEmail && phone.length !== 10) {
+        showMessage("Phone number must be 10 digits.");
         return;
       }
+      setAuthBusy(true);
+      try {
+        const payload = await registerCinchAccount({
+          business_name: businessName,
+          contact,
+          email,
+          phone,
+          password
+        });
+        await activateCinchAccountSession(payload, {
+          persistInitialSnapshot: true,
+          successMessage: "CinchPOS account created."
+        });
+      } catch (error) {
+        showMessage(error instanceof Error ? error.message : "Could not create account.");
+      } finally {
+        setAuthBusy(false);
+      }
+      return;
+    }
+
+    const identifier = cleanText(authForm.identifier || authForm.otpIdentifier || authForm.customerId);
+    if (!identifier || !password) {
+      showMessage("Enter email id or phone number and password.");
+      return;
     }
     setAuthBusy(true);
     try {
-      const payload = authFormMode === "register"
-        ? await registerCinchAccount({
-            username,
-            password,
-            confirm_password: authForm.confirmPassword,
-            email,
-            phone,
-            business_name: businessName
-          })
-        : await loginCinchAccount({ username, password });
+      const payload = await loginCinchAccount({ identifier, password });
       await activateCinchAccountSession(payload, {
-        persistInitialSnapshot: authFormMode === "register",
-        successMessage: authFormMode === "register" ? "CinchPOS account created." : "Logged in successfully."
+        successMessage: "Logged in successfully."
       });
     } catch (error) {
       showMessage(error instanceof Error ? error.message : "Login failed.");
@@ -2472,7 +2481,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     if (authBusy) {
       return;
     }
-    const identifier = cleanText(authForm.otpIdentifier);
+    const identifier = cleanText(authForm.identifier || authForm.otpIdentifier || authForm.contact);
     if (!identifier) {
       showMessage("Enter your email id or phone number.");
       return;
@@ -2485,6 +2494,8 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       });
       setAuthForm((current) => ({
         ...current,
+        identifier,
+        otpIdentifier: identifier,
         otpSent: true,
         otpCode: payload.dev_otp || "",
         otpMessage: payload.message || "OTP sent. Enter it below."
@@ -2498,11 +2509,11 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
   }
 
   async function verifyCinchOtp(event) {
-    event.preventDefault();
+    event?.preventDefault?.();
     if (authBusy) {
       return;
     }
-    const identifier = cleanText(authForm.otpIdentifier);
+    const identifier = cleanText(authForm.identifier || authForm.otpIdentifier || authForm.contact);
     const otp = normalizePhone(authForm.otpCode);
     if (!identifier || !otp) {
       showMessage("Enter your email id or phone number and OTP.");
@@ -3394,9 +3405,15 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         },
         products: selectedSellOnlineProducts
       });
-      setOnlineStoreProfile(payload.store || null);
-      if (payload.sync?.status === "failed") {
-        showMessage(`Online store saved locally, but website sync failed: ${payload.sync.error || "check connection"}`);
+      const synced = payload.sync?.status === "synced";
+      setOnlineStoreProfile(payload.store ? {
+        ...payload.store,
+        public_url: synced ? (payload.sync?.store_url || payload.store.public_url) : "",
+        sync_status: payload.sync?.status || "unknown",
+        sync_error: payload.sync?.error || payload.sync?.reason || ""
+      } : null);
+      if (!synced) {
+        showMessage(`Online store saved locally, but public website sync is not ready: ${payload.sync?.error || payload.sync?.reason || "check connection"}`);
       } else {
         showMessage(`Online store published with ${payload.published_count || selectedSellOnlineProducts.length} products.`);
       }
@@ -5537,34 +5554,14 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         {SettingsForm()}
       </Modal>
 
-      <Modal open={activeModal === "login"} title={authFormMode === "register" ? "Create Your CinchPOS Account" : "Login to CinchPOS"} subtitle="Use a unique username to protect and access this workspace." cardClass="auth-modal-card" onClose={closeModal}>
+      <Modal open={activeModal === "login"} title="CinchPOS Account" subtitle="Login or create your shop account." cardClass="auth-modal-card" onClose={closeModal}>
         <div className="auth-panel">
-          <div className="auth-hero-card">
-            <div className="auth-brand-row">
+          <div className="auth-workspace-card">
+            <div className="auth-simple-head">
               <AppLogo />
               <div>
-                <span>Secure Store Workspace</span>
-                <strong>{APP_NAME}</strong>
-              </div>
-            </div>
-            <h3>{authFormMode === "register" ? "Create a shop account." : "Welcome back."}</h3>
-            <p>{authFormMode === "register" ? "Only the essentials are needed: business name, phone, email, unique username, and password." : "Login with username and password, or use an OTP sent to the registered email id or phone number."}</p>
-            <div className="auth-trust-row">
-              <span>Unique username</span>
-              <span>Private workspace</span>
-              <span>Password hashed</span>
-            </div>
-          </div>
-          <div className="auth-workspace-card">
-            <div className="auth-status-card">
-              <span className={`record-chip ${authState.authenticated ? "success" : ""}`}>{authState.authenticated ? "Session Active" : "Signed Out"}</span>
-              <h3>{authState.authenticated ? cleanText(authState.name, "Operator") : "Account Access"}</h3>
-              <p>{authState.authenticated ? (authState.email || authState.phone || authState.username || authState.customerId || "CinchPOS account active") : "Choose your own username. CinchPOS will generate the customer ID automatically."}</p>
-              <div className="auth-meta-grid">
-                <span>Username <strong>{authState.username || "Not logged in"}</strong></span>
-                <span>Customer ID <strong>{authState.customerId || "Auto generated"}</strong></span>
-                <span>Role <strong>{authState.role}</strong></span>
-                <span>Mode <strong>{authState.offline ? "Offline cache" : "Cloud session"}</strong></span>
+                <span>{authFormMode === "register" ? "Create Account" : "Login"}</span>
+                <p>{authFormMode === "register" ? "Business name, one contact detail, and a strong password are enough." : "Use your email id or phone number with password, or login with OTP."}</p>
               </div>
             </div>
             <div className="auth-mode-tabs" role="tablist" aria-label="Account action">
@@ -5576,20 +5573,11 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                 <label>Business Name
                   <input type="text" value={authForm.businessName} onChange={(event) => updateAuthForm("businessName", event.target.value)} placeholder="Store or company name" required />
                 </label>
-                <label>Phone Number
-                  <input type="tel" autoComplete="tel-national" inputMode="numeric" value={authForm.phone} onChange={(event) => updateAuthForm("phone", event.target.value)} placeholder="10 digit phone number" required />
-                </label>
-                <label>Email ID
-                  <input type="email" autoComplete="email" value={authForm.email} onChange={(event) => updateAuthForm("email", event.target.value)} placeholder="support email or owner email" required />
-                </label>
-                <label>Username
-                  <input type="text" autoComplete="username" value={authForm.customerId} onChange={(event) => updateAuthForm("customerId", event.target.value)} placeholder="for example: ardh-sainik" required />
+                <label>Email ID or Phone Number
+                  <input type="text" autoComplete="email tel" value={authForm.contact} onChange={(event) => updateAuthForm("contact", event.target.value)} placeholder="owner email or 10 digit phone" required />
                 </label>
                 <label>Password
                   <input type="password" autoComplete="new-password" value={authForm.password} onChange={(event) => updateAuthForm("password", event.target.value)} placeholder="Password" required />
-                </label>
-                <label>Re-enter Password
-                  <input type="password" autoComplete="new-password" value={authForm.confirmPassword} onChange={(event) => updateAuthForm("confirmPassword", event.target.value)} placeholder="Repeat password" required />
                 </label>
                 <div className="password-rules">
                   <span>8+ characters</span>
@@ -5604,49 +5592,31 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                 </div>
               </form>
             ) : (
-              <div className="auth-login-grid">
-                <form className="auth-method-card" onSubmit={submitCinchAccountAuth}>
-                  <div>
-                    <strong>Username + Password</strong>
-                    <span>Best for regular desktop login.</span>
-                  </div>
-                  <label>Username
-                    <input type="text" autoComplete="username" value={authForm.customerId} onChange={(event) => updateAuthForm("customerId", event.target.value)} placeholder="your unique username" required />
-                  </label>
-                  <label>Password
-                    <input type="password" autoComplete="current-password" value={authForm.password} onChange={(event) => updateAuthForm("password", event.target.value)} placeholder="Password" required />
-                  </label>
-                  <button type="submit" className="button button-primary" disabled={authBusy}>{authBusy ? "Checking..." : "Login"}</button>
-                </form>
-                <form className="auth-method-card" onSubmit={verifyCinchOtp}>
-                  <div>
-                    <strong>Email / Phone OTP</strong>
-                    <span>Use the email id or phone number linked to this account.</span>
-                  </div>
-                  <label>Email ID or Phone Number
-                    <input type="text" autoComplete="email tel" value={authForm.otpIdentifier} onChange={(event) => updateAuthForm("otpIdentifier", event.target.value)} placeholder="email id or phone number" required />
-                  </label>
-                  <div className="auth-otp-row">
-                    <button type="button" className="button button-secondary" onClick={requestCinchOtp} disabled={authBusy}>{authBusy ? "Sending..." : (authForm.otpSent ? "Resend OTP" : "Send OTP")}</button>
-                    <input type="text" inputMode="numeric" value={authForm.otpCode} onChange={(event) => updateAuthForm("otpCode", event.target.value)} placeholder="Enter OTP" />
-                  </div>
-                  {authForm.otpMessage ? <p className="auth-otp-note">{authForm.otpMessage}</p> : null}
-                  <button type="submit" className="button button-primary" disabled={authBusy || !authForm.otpSent}>{authBusy ? "Verifying..." : "Verify OTP & Login"}</button>
-                </form>
-              </div>
+              <form className="auth-form auth-form-single" onSubmit={submitCinchAccountAuth}>
+                <label>Email ID or Phone Number
+                  <input type="text" autoComplete="email tel" value={authForm.identifier} onChange={(event) => updateAuthForm("identifier", event.target.value)} placeholder="registered email or phone" required />
+                </label>
+                <label>Password
+                  <input type="password" autoComplete="current-password" value={authForm.password} onChange={(event) => updateAuthForm("password", event.target.value)} placeholder="Password" />
+                </label>
+                <button type="submit" className="button button-primary" disabled={authBusy}>{authBusy ? "Checking..." : "Login"}</button>
+                <div className="auth-divider"><span>or login with OTP</span></div>
+                <div className="auth-otp-row">
+                  <button type="button" className="button button-secondary" onClick={requestCinchOtp} disabled={authBusy}>{authBusy ? "Sending..." : (authForm.otpSent ? "Resend OTP" : "Send OTP")}</button>
+                  <input type="text" inputMode="numeric" value={authForm.otpCode} onChange={(event) => updateAuthForm("otpCode", event.target.value)} placeholder="Enter OTP" />
+                  <button type="button" className="button button-primary" onClick={verifyCinchOtp} disabled={authBusy || !authForm.otpSent}>{authBusy ? "Verifying..." : "Verify OTP"}</button>
+                </div>
+                {authForm.otpMessage ? <p className="auth-otp-note">{authForm.otpMessage}</p> : null}
+              </form>
             )}
-            <div className="auth-checklist">
-              <article><strong>Cloud workspace</strong><span>Data is separated by username, generated customer ID, and business workspace.</span></article>
-              <article><strong>Password safety</strong><span>Passwords are hashed on the backend and never saved in the app.</span></article>
-              <article><strong>Logout privacy</strong><span>Signed-out users cannot see billing screens.</span></article>
-              <article><strong>Cross-device access</strong><span>Use the same hosted backend to access the same workspace elsewhere.</span></article>
-            </div>
-          </div>
-          <div className="modal-actions">
-            <button type="button" className="button button-secondary" onClick={() => syncAuthContext(clerkClient)}>Refresh Session</button>
-            <button type="button" className="button button-secondary" onClick={pullCloudWorkspace} disabled={!authState.authenticated || cloudSyncBusy}>Pull Cloud Data</button>
-            <button type="button" className="button button-secondary" onClick={signOutOfAuth} disabled={!authState.authenticated || authBusy}>Logout</button>
-            <button type="button" className="button button-primary" onClick={closeModal}>Done</button>
+            <p className="auth-simple-note">CinchPOS keeps the customer ID hidden and generated automatically. Your password is never stored in the app.</p>
+            {authState.authenticated ? (
+              <div className="modal-actions auth-form-actions">
+                <button type="button" className="button button-secondary" onClick={pullCloudWorkspace} disabled={cloudSyncBusy}>Pull Cloud Data</button>
+                <button type="button" className="button button-secondary" onClick={signOutOfAuth} disabled={authBusy}>Logout</button>
+                <button type="button" className="button button-primary" onClick={closeModal}>Done</button>
+              </div>
+            ) : null}
           </div>
         </div>
       </Modal>
@@ -7186,7 +7156,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                 <span className="account-avatar">{account.loggedIn ? cleanText(account.name, "Operator").charAt(0).toUpperCase() : "?"}</span>
                 <div>
                   <strong>{account.loggedIn ? cleanText(account.name, "Operator") : "Not logged in"}</strong>
-                  <span>{account.loggedIn ? (account.contact || authState.username || authState.customerId || `${authState.role} access`) : "Login with a CinchPOS username to sync this workspace."}</span>
+                  <span>{account.loggedIn ? (account.contact || authState.email || authState.phone || authState.customerId || `${authState.role} access`) : "Login with your email id or phone number to sync this workspace."}</span>
                 </div>
               </div>
               <div className="account-actions">
@@ -7197,7 +7167,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
             </div>
             <div className="settings-metric-grid">
               <article className="settings-metric"><strong>{authState.role}</strong><span>Role</span></article>
-              <article className="settings-metric"><strong>{authState.username || "Not linked"}</strong><span>Username</span></article>
+              <article className="settings-metric"><strong>{authState.email || authState.phone || "Not linked"}</strong><span>Login Detail</span></article>
               <article className="settings-metric"><strong>{authState.customerId || "Auto generated"}</strong><span>Customer ID</span></article>
               <article className="settings-metric"><strong>{authState.warehouseId}</strong><span>Warehouse</span></article>
               <article className="settings-metric"><strong>{authState.offline ? "Offline" : "Cloud"}</strong><span>Session Mode</span></article>
