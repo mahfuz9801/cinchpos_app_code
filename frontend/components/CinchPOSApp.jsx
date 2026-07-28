@@ -12,6 +12,7 @@ import {
   getDashboard,
   getInvoices,
   getOnlineStoreProfile,
+  getRecoverableLocalBillingData,
   getTrend,
   getWorkspaceSnapshot,
   isApiNetworkError,
@@ -20,6 +21,7 @@ import {
   logoutCinchAccount,
   publishOnlineStore,
   recordPayment,
+  recoverLocalBillingData,
   registerCinchAccount,
   requestCinchAccountOtp,
   saveWorkspaceSnapshot,
@@ -2362,6 +2364,38 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     setRealInvoices(invoices || []);
     setCustomers(customerRows || []);
   }, [trendEndDate, trendStartDate, trendView]);
+
+  const recoverPreviousLocalBilling = useCallback(async () => {
+    if (!authState.authenticated || authState.offline) {
+      showMessage("Login as the owner before recovering previous local billing data.");
+      return false;
+    }
+    setCloudSyncBusy(true);
+    try {
+      const preview = await getRecoverableLocalBillingData();
+      const localCounts = preview?.local_counts || {};
+      const recoverableTotal = Number(localCounts.customers || 0) + Number(localCounts.invoices || 0) + Number(localCounts.payments || 0);
+      if (!preview?.recoverable || recoverableTotal <= 0) {
+        showMessage("No previous local invoices or customers were found to recover.");
+        return false;
+      }
+      const confirmed = window.confirm(
+        `Recover ${Number(localCounts.invoices || 0)} invoice(s), ${Number(localCounts.customers || 0)} customer(s), and ${Number(localCounts.payments || 0)} payment record(s) from the previous local workspace into this account? CinchPOS will make a database backup first.`
+      );
+      if (!confirmed) {
+        return false;
+      }
+      const result = await recoverLocalBillingData();
+      await loadDashboard();
+      showMessage(`${result.message || "Previous local billing data recovered."} Recovered ${Number(result.recovered?.invoices || 0)} invoice(s).`);
+      return true;
+    } catch (error) {
+      showMessage(error instanceof Error ? error.message : "Could not recover previous billing data.");
+      return false;
+    } finally {
+      setCloudSyncBusy(false);
+    }
+  }, [authState.authenticated, authState.offline, loadDashboard, showMessage]);
 
   useEffect(() => {
     let cancelled = false;
@@ -7269,6 +7303,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
               <div className="account-actions">
                 <button className="button button-primary" type="button" hidden={account.loggedIn} onClick={() => openModal("login")}>Login or Create Account</button>
                 <button className="button button-secondary" type="button" hidden={!account.loggedIn} disabled={cloudSyncBusy} onClick={pullCloudWorkspace}>Pull Cloud Data</button>
+                <button className="button button-secondary" type="button" hidden={!account.loggedIn} disabled={cloudSyncBusy} onClick={recoverPreviousLocalBilling}>Recover Previous Bills</button>
                 <button className="button button-secondary" type="button" hidden={!account.loggedIn} onClick={signOutOfAuth}>Logout</button>
               </div>
             </div>

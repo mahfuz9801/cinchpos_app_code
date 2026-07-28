@@ -1648,6 +1648,35 @@ def serialize_payment(row):
     }
 
 
+def count_billing_records_for_business(conn, business_id):
+    return {
+        "customers": conn.execute(
+            "SELECT COUNT(*) AS total FROM customers WHERE business_id = ?",
+            (business_id,),
+        ).fetchone()["total"],
+        "invoices": conn.execute(
+            "SELECT COUNT(*) AS total FROM invoices WHERE business_id = ?",
+            (business_id,),
+        ).fetchone()["total"],
+        "payments": conn.execute(
+            "SELECT COUNT(*) AS total FROM payments WHERE business_id = ?",
+            (business_id,),
+        ).fetchone()["total"],
+    }
+
+
+def create_database_backup(reason="recovery"):
+    database_path = os.path.abspath(DATABASE)
+    backup_dir = os.path.join(os.path.dirname(database_path), "backups")
+    os.makedirs(backup_dir, exist_ok=True)
+    timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+    safe_reason = re.sub(r"[^a-zA-Z0-9_-]+", "-", str(reason or "backup")).strip("-") or "backup"
+    backup_path = os.path.join(backup_dir, f"database-before-{safe_reason}-{timestamp}.db")
+    with closing(sqlite3.connect(database_path)) as source_conn, closing(sqlite3.connect(backup_path)) as backup_conn:
+        source_conn.backup(backup_conn)
+    return backup_path
+
+
 def slugify_store_name(value):
     slug = re.sub(r"[^a-z0-9]+", "-", str(value or "").strip().lower()).strip("-")
     return slug[:48].strip("-") or "store"
@@ -2908,6 +2937,88 @@ def save_workspace_snapshot():
         conn.commit()
     log_auth_event("workspace_snapshot.saved", context, {"keys": sorted(payload.keys())[:30]})
     return jsonify({"business_id": business_id, "updated_by": context["user_id"], "ok": True})
+
+
+@app.route("/api/workspace/recover-local-billing", methods=["GET"])
+@require_permission("business:read")
+def get_recoverable_local_billing_data():
+    business_id = current_business_id()
+    with closing(get_connection()) as conn:
+        ensure_auth_schema(conn)
+        local_counts = count_billing_records_for_business(conn, DEFAULT_BUSINESS_ID)
+        current_counts = count_billing_records_for_business(conn, business_id)
+    return jsonify(
+        {
+            "source_business_id": DEFAULT_BUSINESS_ID,
+            "target_business_id": business_id,
+            "recoverable": business_id != DEFAULT_BUSINESS_ID and any(local_counts.values()),
+            "local_counts": local_counts,
+            "current_counts": current_counts,
+        }
+    )
+
+
+@app.route("/api/workspace/recover-local-billing", methods=["POST"])
+@require_permission("business:write")
+def recover_local_billing_data():
+    context = current_auth_context()
+    target_business_id = current_business_id()
+    if not is_owner_context(context):
+        return jsonify({"error": "Only the owner can recover previous local billing data."}), 403
+    if target_business_id == DEFAULT_BUSINESS_ID:
+        return jsonify({"error": "You are already viewing the previous local workspace."}), 400
+
+    with closing(get_connection()) as conn:
+        ensure_auth_schema(conn)
+        source_counts = count_billing_records_for_business(conn, DEFAULT_BUSINESS_ID)
+        if not any(source_counts.values()):
+            return jsonify(
+                {
+                    "message": "No previous local billing data was found.",
+                    "source_business_id": DEFAULT_BUSINESS_ID,
+                    "target_business_id": target_business_id,
+                    "recovered": source_counts,
+                    "backup_path": "",
+                }
+            )
+
+        conn.commit()
+        backup_path = create_database_backup("local-billing-recovery")
+        conn.execute(
+            "UPDATE customers SET business_id = ? WHERE business_id = ?",
+            (target_business_id, DEFAULT_BUSINESS_ID),
+        )
+        conn.execute(
+            "UPDATE invoices SET business_id = ? WHERE business_id = ?",
+            (target_business_id, DEFAULT_BUSINESS_ID),
+        )
+        conn.execute(
+            "UPDATE payments SET business_id = ? WHERE business_id = ?",
+            (target_business_id, DEFAULT_BUSINESS_ID),
+        )
+        conn.commit()
+        target_counts = count_billing_records_for_business(conn, target_business_id)
+
+    log_auth_event(
+        "workspace.local_billing_recovered",
+        context,
+        {
+            "source_business_id": DEFAULT_BUSINESS_ID,
+            "target_business_id": target_business_id,
+            "recovered": source_counts,
+            "backup_path": backup_path,
+        },
+    )
+    return jsonify(
+        {
+            "message": "Previous local billing data recovered.",
+            "source_business_id": DEFAULT_BUSINESS_ID,
+            "target_business_id": target_business_id,
+            "recovered": source_counts,
+            "current_counts": target_counts,
+            "backup_path": backup_path,
+        }
+    )
 
 
 @app.route("/api/online-store/profile", methods=["GET"])

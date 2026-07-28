@@ -178,6 +178,62 @@ class CinchPOSAPITestCase(unittest.TestCase):
         self.assertTrue(login_payload["token"].startswith("cinch_"))
         self.assertEqual(login_payload["context"]["username"], "testshop")
 
+    def test_account_owner_can_recover_previous_local_billing_data(self):
+        local_customer = self.create_customer(name="Old Local Customer", phone="+919111111111")
+        local_invoice_response = self.create_invoice(local_customer["id"], amount=300.0)
+        self.assertEqual(local_invoice_response.status_code, 201)
+        local_invoice = local_invoice_response.get_json()
+        payment_response = self.client.post(
+            "/api/payments",
+            json={
+                "invoice_id": local_invoice["id"],
+                "amount": 125.0,
+                "paid_on": self.backend.today_value().isoformat(),
+                "method": "Cash",
+                "notes": "Previous local payment",
+            },
+        )
+        self.assertEqual(payment_response.status_code, 201)
+
+        register_response = self.client.post(
+            "/api/auth/register",
+            json={
+                "username": "recover-shop",
+                "password": "Strong#123",
+                "confirm_password": "Strong#123",
+                "email": "recover@example.com",
+                "business_name": "Recover Shop",
+            },
+        )
+        self.assertEqual(register_response.status_code, 201)
+        auth_headers = {"Authorization": f"Bearer {register_response.get_json()['token']}"}
+
+        hidden_invoices_response = self.client.get("/api/invoices", headers=auth_headers)
+        self.assertEqual(hidden_invoices_response.status_code, 200)
+        self.assertEqual(hidden_invoices_response.get_json(), [])
+
+        preview_response = self.client.get("/api/workspace/recover-local-billing", headers=auth_headers)
+        self.assertEqual(preview_response.status_code, 200)
+        preview = preview_response.get_json()
+        self.assertTrue(preview["recoverable"])
+        self.assertEqual(preview["local_counts"]["customers"], 1)
+        self.assertEqual(preview["local_counts"]["invoices"], 1)
+        self.assertEqual(preview["local_counts"]["payments"], 1)
+
+        recover_response = self.client.post("/api/workspace/recover-local-billing", headers=auth_headers, json={})
+        self.assertEqual(recover_response.status_code, 200)
+        recovered = recover_response.get_json()
+        self.assertEqual(recovered["recovered"]["customers"], 1)
+        self.assertEqual(recovered["recovered"]["invoices"], 1)
+        self.assertEqual(recovered["recovered"]["payments"], 1)
+        self.assertTrue(os.path.isfile(recovered["backup_path"]))
+
+        restored_invoices_response = self.client.get("/api/invoices", headers=auth_headers)
+        self.assertEqual(restored_invoices_response.status_code, 200)
+        restored_invoices = restored_invoices_response.get_json()
+        self.assertEqual(len(restored_invoices), 1)
+        self.assertEqual(restored_invoices[0]["invoice_number"], local_invoice["invoice_number"])
+
     def test_duplicate_invoice_number_returns_conflict(self):
         customer = self.create_customer()
         first = self.create_invoice(customer["id"], amount=250.0, invoice_number="INV-DUP")

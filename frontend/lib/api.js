@@ -257,6 +257,17 @@ export function saveWorkspaceSnapshot(payload) {
   });
 }
 
+export function getRecoverableLocalBillingData() {
+  return fetchJSON("/api/workspace/recover-local-billing");
+}
+
+export function recoverLocalBillingData() {
+  return fetchJSON("/api/workspace/recover-local-billing", {
+    method: "POST",
+    body: JSON.stringify({})
+  });
+}
+
 export function getOnlineStoreProfile() {
   return fetchJSON("/api/online-store/profile");
 }
