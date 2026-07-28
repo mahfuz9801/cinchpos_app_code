@@ -188,8 +188,22 @@ class CinchPOSAPITestCase(unittest.TestCase):
         self.assertEqual(first.status_code, 201)
         self.assertEqual(duplicate.status_code, 409)
         self.assertEqual(
-            duplicate.get_json()["error"], "Invoice number already exists."
+            duplicate.get_json()["error"],
+            "Invoice number already exists. Leave it blank to auto-generate the next bill number.",
         )
+
+    def test_auto_invoice_numbers_do_not_collide(self):
+        customer = self.create_customer()
+        first = self.create_invoice(customer["id"], amount=250.0)
+        second = self.create_invoice(customer["id"], amount=125.0)
+
+        self.assertEqual(first.status_code, 201)
+        self.assertEqual(second.status_code, 201)
+        first_payload = first.get_json()
+        second_payload = second.get_json()
+        self.assertNotEqual(first_payload["invoice_number"], second_payload["invoice_number"])
+        self.assertTrue(first_payload["invoice_number"].startswith("INV-"))
+        self.assertTrue(second_payload["invoice_number"].startswith("INV-"))
 
     def test_customer_update_endpoint_overwrites_contact_fields(self):
         customer = self.create_customer(name="Legacy Name", phone="+919999111122")

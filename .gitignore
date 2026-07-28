@@ -1,4 +1,10 @@
 .DS_Store
+.env
+*.env
+backend/.env
+frontend/.env.local
+.runtime/
+_desktop-cleanup-archive/
 *.dmg
 *.zip
 *.exe
@@ -11,8 +17,10 @@ frontend/node_modules
 frontend/out
 
 backend/.venv
+backend/build
 backend/__pycache__
 backend/dist
+backend/database.db
 backend/*.spec
 
 frontend/tests/.tmp

@@ -4,6 +4,7 @@ const fs = require("fs");
 const https = require("https");
 const http = require("http");
 const net = require("net");
+const os = require("os");
 const path = require("path");
 const { pathToFileURL } = require("url");
 
@@ -111,11 +112,17 @@ function getApiHealthUrl() {
   return `${getApiBaseUrl()}/api/health`;
 }
 
+function getDeviceBootId() {
+  const bootEpochMinute = Math.floor((Date.now() - os.uptime() * 1000) / 60000);
+  return `${process.platform}:${bootEpochMinute}`;
+}
+
 function getRuntimeConfigPayload() {
   return JSON.stringify({
     appUrl: getAppUrl(),
     apiBaseUrl: getApiBaseUrl(),
-    backendPort: runtimeConfig.backendPort
+    backendPort: runtimeConfig.backendPort,
+    deviceBootId: getDeviceBootId()
   });
 }
 
@@ -218,7 +225,8 @@ function registerRuntimeConfigBridge() {
   ipcMain.handle("cinchpos:get-runtime-config", async () => ({
     appUrl: getAppUrl(),
     apiBaseUrl: getApiBaseUrl(),
-    backendPort: runtimeConfig.backendPort
+    backendPort: runtimeConfig.backendPort,
+    deviceBootId: getDeviceBootId()
   }));
 }
 

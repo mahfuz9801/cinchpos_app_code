@@ -5989,6 +5989,75 @@ body[data-preview-watermark="off"] .pos-preview-scroll::before {
     grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
+.employee-access-panel {
+    display: grid;
+    gap: 8px;
+    padding: 10px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    background: var(--surface-soft);
+}
+
+.employee-permission-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+}
+
+.employee-permission-head strong,
+.employee-permission-head span {
+    display: block;
+}
+
+.employee-permission-head span {
+    margin-top: 2px;
+    color: var(--muted);
+    font-size: 0.78rem;
+}
+
+.employee-permission-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+}
+
+.employee-permission-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 6px;
+    max-height: 174px;
+    overflow: auto;
+    padding-right: 2px;
+}
+
+.employee-permission-toggle {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    min-height: 34px;
+    padding: 7px 8px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    background: var(--surface);
+    color: var(--text);
+    font-size: 0.8rem;
+    cursor: pointer;
+}
+
+.employee-permission-toggle.active {
+    border-color: var(--green);
+    background: var(--green-soft);
+    color: var(--green-dark);
+}
+
+.employee-permission-toggle input {
+    inline-size: 14px;
+    block-size: 14px;
+    accent-color: var(--green-dark);
+}
+
 .employee-table-shell {
     overflow: auto;
     border: 1px solid var(--line);

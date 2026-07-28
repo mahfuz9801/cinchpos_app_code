@@ -1202,6 +1202,9 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
   const [authState, setAuthState] = useState(() => makeSignedOutAuthState({ configured: true, required: true }));
   const [authBusy, setAuthBusy] = useState(false);
   const [authRoles, setAuthRoles] = useState([]);
+  const [authPermissionCatalog, setAuthPermissionCatalog] = useState({});
+  const [employeeAccessRole, setEmployeeAccessRole] = useState("salesman");
+  const [employeePermissionDraft, setEmployeePermissionDraft] = useState(() => permissionsForRole("salesman"));
   const [clerkClient, setClerkClient] = useState(null);
   const [authFormMode, setAuthFormMode] = useState("login");
   const [authForm, setAuthForm] = useState({
@@ -1403,6 +1406,58 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
   const storeLogoSource = settings.storeLogo || settings.storeLogoUrl || "";
   const can = useCallback((permission) => !authState.required || hasPermission(authState, permission), [authState]);
   const canAccessView = useCallback((viewId) => !authState.required || hasPermission(authState, viewPermissionMap[viewId]), [authState]);
+  const canManageEmployeeAccess = can("roles:manage");
+  const defaultPermissionCatalog = useMemo(() => ({
+    "billing:read": "View POS billing",
+    "billing:write": "Create and complete bills",
+    "invoices:read": "View invoices",
+    "invoices:write": "Create and update invoices",
+    "payments:write": "Record payments",
+    "inventory:read": "View inventory",
+    "inventory:write": "Update inventory",
+    "purchases:read": "View purchase records",
+    "purchases:write": "Manage purchase records",
+    "sales:read": "View sales reports",
+    "reports:read": "View dashboard and reports",
+    "employees:read": "View employees",
+    "employees:write": "Manage employees",
+    "customers:read": "View customers",
+    "customers:write": "Manage customers",
+    "suppliers:read": "View suppliers",
+    "suppliers:write": "Manage suppliers",
+    "business:read": "View business settings",
+    "business:write": "Manage businesses",
+    "warehouses:read": "View warehouses",
+    "warehouses:write": "Manage warehouses",
+    "roles:manage": "Manage roles and permissions",
+    "ai:use": "Use smart tools",
+    "support:use": "Use support"
+  }), []);
+  const permissionCatalog = useMemo(() => ({
+    ...defaultPermissionCatalog,
+    ...(authPermissionCatalog || {})
+  }), [authPermissionCatalog, defaultPermissionCatalog]);
+  const employeePermissionOptions = useMemo(() => Object.entries(permissionCatalog), [permissionCatalog]);
+  const getPermissionLabel = useCallback((permission) => permissionCatalog[permission] || cleanText(permission).replace(/[:_]/g, " "), [permissionCatalog]);
+  const getRoleDefaultPermissions = useCallback((roleKey) => {
+    const normalizedRole = cleanText(roleKey, "employee").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "") || "employee";
+    const apiRole = authRoles.find((role) => role.role_key === normalizedRole || role.key === normalizedRole);
+    return Array.isArray(apiRole?.permissions) && apiRole.permissions.length
+      ? apiRole.permissions
+      : permissionsForRole(normalizedRole);
+  }, [authRoles]);
+  const updateEmployeeAccessRole = useCallback((roleKey) => {
+    const normalizedRole = cleanText(roleKey, "salesman").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "") || "salesman";
+    setEmployeeAccessRole(normalizedRole);
+    setEmployeePermissionDraft(getRoleDefaultPermissions(normalizedRole));
+  }, [getRoleDefaultPermissions]);
+  const toggleEmployeePermission = useCallback((permission) => {
+    setEmployeePermissionDraft((current) => (
+      current.includes(permission)
+        ? current.filter((entry) => entry !== permission)
+        : [...current, permission]
+    ));
+  }, []);
   const currentSummary = summary || {
     monthly_revenue: 0,
     outstanding_payments: 0,
@@ -2277,8 +2332,15 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       return;
     }
     getAuthRoles()
-      .then((rows) => setAuthRoles(Array.isArray(rows) ? rows : []))
-      .catch(() => setAuthRoles([]));
+      .then((payload) => {
+        const roles = Array.isArray(payload) ? payload : (Array.isArray(payload?.roles) ? payload.roles : []);
+        setAuthRoles(roles);
+        setAuthPermissionCatalog(payload?.permissions && typeof payload.permissions === "object" ? payload.permissions : {});
+      })
+      .catch(() => {
+        setAuthRoles([]);
+        setAuthPermissionCatalog({});
+      });
   }, [can, workspaceLoaded]);
 
   const loadDashboard = useCallback(async () => {
@@ -2573,6 +2635,8 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       setAuthState(signedOutState);
       setAccount(defaultAccount);
       setAuthTokenProvider(async () => "");
+      setActiveView("dashboardView");
+      setRenderedViews({ dashboardView: true });
       setActiveModal("login");
       showMessage("Signed out of this device.");
     } catch (error) {
@@ -3129,7 +3193,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       const { record: savedCustomer, usedWalkInCustomer } = await ensurePOSCustomer(formId);
       const invoice = await createInvoice({
         customer_id: savedCustomer.id,
-        invoice_number: buildClientInvoiceNumber(issuedOn),
+        auto_invoice_number: true,
         amount: summaryRows.total,
         issued_on: issuedOn,
         due_on: defaultDueDate,
@@ -3430,7 +3494,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     const data = Object.fromEntries(new FormData(form).entries());
     const issuedOn = cleanText(data.issued_on, todayISO());
     const dueOn = cleanText(data.due_on, defaultDueDate);
-    const invoiceNumber = cleanText(data.invoice_number) || buildClientInvoiceNumber(issuedOn);
+    const invoiceNumber = cleanText(data.invoice_number);
     const invoiceNotes = cleanText(data.notes, settings.invoiceNotes);
     const invoiceAmount = Number(data.amount || 0);
     const paymentType = cleanText(data.payment_type, "pending");
@@ -3440,7 +3504,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     try {
       const invoice = await createInvoice({
         customer_id: data.customer_id,
-        invoice_number: invoiceNumber,
+        ...(invoiceNumber ? { invoice_number: invoiceNumber } : { auto_invoice_number: true }),
         amount: data.amount,
         issued_on: issuedOn,
         due_on: dueOn,
@@ -3458,7 +3522,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       const selectedCustomer = customers.find((customer) => String(customer.id || "") === String(data.customer_id || ""));
       saveInvoiceDetail(invoice, {
         source: "quick-invoice",
-        invoiceNumber,
+        invoiceNumber: invoice.invoice_number || invoiceNumber,
         issuedOn,
         dueOn,
         customer: selectedCustomer || {},
@@ -3587,13 +3651,13 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     const requestedPaidAmount = paymentStatus === "full"
       ? summaryRows.total
       : (paymentStatus === "partial" ? Math.min(summaryRows.total, Math.max(0, Number(invoiceBuilderDraft.paymentAmount || 0))) : 0);
-    const invoiceNumber = cleanText(invoiceBuilderDraft.invoiceNumber) || buildClientInvoiceNumber(issuedOn);
+    const invoiceNumber = cleanText(invoiceBuilderDraft.invoiceNumber);
 
     try {
       const savedCustomer = await resolveInvoiceBuilderCustomer();
       const savedInvoice = await createInvoice({
         customer_id: savedCustomer.id,
-        invoice_number: invoiceNumber,
+        ...(invoiceNumber ? { invoice_number: invoiceNumber } : { auto_invoice_number: true }),
         amount: summaryRows.total,
         issued_on: issuedOn,
         due_on: dueOn,
@@ -3634,7 +3698,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         source: "standard-invoice",
         template: invoiceBuilderDraft.template,
         layout: invoiceBuilderDraft.layout,
-        invoiceNumber,
+        invoiceNumber: savedInvoice.invoice_number || invoiceNumber,
         issuedOn,
         dueOn,
         customer: {
@@ -3855,14 +3919,18 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         readFileAsDataURL(panFile)
       ]);
       const employeeEmail = cleanText(data.email).toLowerCase();
-      const roleKey = cleanText(data.role_key, "cashier").toLowerCase().replace(/\s+/g, "_");
+      const roleKey = cleanText(data.role_key || employeeAccessRole, "salesman").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "") || "salesman";
+      const permissionSet = Array.from(new Set(
+        (employeePermissionDraft.length ? employeePermissionDraft : getRoleDefaultPermissions(roleKey))
+          .filter((permission) => permissionCatalog[permission] || permission === "*")
+      ));
       let inviteResult = null;
       if (employeeEmail && can("employees:write")) {
         inviteResult = await inviteEmployeeAccount({
           email: employeeEmail,
           name: cleanText(data.name),
           role: roleKey,
-          permissions: permissionsForRole(roleKey)
+          permissions: permissionSet
         }).catch((error) => ({ status: "failed", error: error.message }));
       }
       setEmployees((current) => [{
@@ -3874,8 +3942,8 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         phone: cleanText(data.phone),
         address: cleanText(data.address),
         salary: Number(data.salary || 0),
-        permissions: cleanText(data.permissions, "Billing"),
-        permissionSet: permissionsForRole(roleKey),
+        permissions: permissionSet.map(getPermissionLabel).join(", "),
+        permissionSet,
         authStatus: inviteResult?.status || (employeeEmail ? "Pending invite" : "Local record"),
         invitationId: inviteResult?.id || "",
         aadharFileName: aadharFile ? aadharFile.name : "",
@@ -3886,6 +3954,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         createdAt: new Date().toISOString()
       }, ...current]);
       form.reset();
+      updateEmployeeAccessRole("salesman");
       showMessage(employeeEmail ? "Employee saved and auth invitation prepared." : "Employee saved.");
     } catch (error) {
       showMessage(error.message || "Could not save employee documents.");
@@ -6296,15 +6365,27 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
   function EmployeeView({ active }) {
     const activeEmployees = employees.filter((employee) => cleanText(employee.status, "Active") === "Active").length;
     const attendanceMarked = employees.filter((employee) => (employee.attendance || []).some((entry) => entry.date === todayISO())).length;
-    const employeeRoleOptions = authRoles.length
-      ? authRoles
-      : [
-          { role_key: "cashier", name: "Cashier" },
-          { role_key: "manager", name: "Manager" },
-          { role_key: "warehouse_staff", name: "Warehouse Staff" },
-          { role_key: "accountant", name: "Accountant" },
-          { role_key: "employee", name: "Employee" }
-        ];
+    const suggestedRoles = [
+      { role_key: "salesman", name: "Salesman" },
+      { role_key: "store_manager", name: "Store Manager" },
+      { role_key: "stock_manager", name: "Stock Manager" },
+      { role_key: "cashier", name: "Cashier" },
+      { role_key: "manager", name: "Manager" },
+      { role_key: "warehouse_manager", name: "Warehouse Manager" },
+      { role_key: "accountant", name: "Accountant" },
+      { role_key: "employee", name: "Employee" }
+    ];
+    const roleOptionMap = new Map();
+    [...suggestedRoles, ...authRoles.filter((role) => (role.role_key || role.key) !== "owner")].forEach((role) => {
+      const key = role.role_key || role.key;
+      if (key) {
+        roleOptionMap.set(key, { role_key: key, name: role.name || key.replace(/_/g, " ") });
+      }
+    });
+    const employeeRoleOptions = Array.from(roleOptionMap.values());
+    const permissionSummary = employeePermissionDraft.includes("*")
+      ? "All modules"
+      : `${employeePermissionDraft.length} module permission${employeePermissionDraft.length === 1 ? "" : "s"}`;
     return (
       <section id="employeeView" className={`app-view ${active ? "active" : ""}`} data-title="Manage Employee">
         <div className="employee-dashboard">
@@ -6320,14 +6401,40 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                 <label>Employee Name<input name="name" type="text" placeholder="Employee name" required /></label>
                 <label>Role<input name="role" type="text" placeholder="Counter Staff" required /></label>
                 <label>Email<input name="email" type="email" placeholder="employee@example.com" /></label>
-                <label>Access Role<select name="role_key">{employeeRoleOptions.map((role) => <option key={role.role_key} value={role.role_key}>{role.name || role.role_key}</option>)}</select></label>
+                <label>Access Role<select name="role_key" value={employeeAccessRole} onChange={(event) => updateEmployeeAccessRole(event.target.value)}>{employeeRoleOptions.map((role) => <option key={role.role_key} value={role.role_key}>{role.name || role.role_key}</option>)}</select></label>
                 <label>Phone<input name="phone" type="tel" placeholder="Phone number" /></label>
                 <label>Status<select name="status"><option>Active</option><option>Inactive</option></select></label>
                 <label>Monthly Salary<input name="salary" type="number" min="0" step="0.01" placeholder="0.00" /></label>
-                <label>Permissions<select name="permissions"><option>Billing</option><option>Billing + Inventory</option><option>Manager</option><option>Accounts</option></select></label>
                 <label>Aadhaar Card<input name="aadhar_file" type="file" accept="image/*,.pdf" /></label>
                 <label>PAN Card<input name="pan_file" type="file" accept="image/*,.pdf" /></label>
                 <label className="module-span-2">Address<textarea name="address" rows="2" placeholder="Employee address"></textarea></label>
+                <div className="employee-access-panel module-span-2">
+                  <div className="employee-permission-head">
+                    <div>
+                      <strong>Feature Access</strong>
+                      <span>{canManageEmployeeAccess ? `Owner control active: ${permissionSummary}` : "Only the owner can customize module access."}</span>
+                    </div>
+                    <div className="employee-permission-actions">
+                      <button type="button" className="button button-secondary file-action" disabled={!canManageEmployeeAccess} onClick={() => setEmployeePermissionDraft(getRoleDefaultPermissions(employeeAccessRole))}>Role Default</button>
+                      <button type="button" className="button button-secondary file-action" disabled={!canManageEmployeeAccess} onClick={() => setEmployeePermissionDraft([])}>Lock All</button>
+                    </div>
+                  </div>
+                  <div className="employee-permission-grid">
+                    {employeePermissionOptions.map(([permission, label]) => (
+                      <label key={permission} className={`employee-permission-toggle ${employeePermissionDraft.includes(permission) || employeePermissionDraft.includes("*") ? "active" : ""}`}>
+                        <input
+                          type="checkbox"
+                          name="permission_set"
+                          value={permission}
+                          checked={employeePermissionDraft.includes(permission) || employeePermissionDraft.includes("*")}
+                          disabled={!canManageEmployeeAccess || employeePermissionDraft.includes("*")}
+                          onChange={() => toggleEmployeePermission(permission)}
+                        />
+                        <span>{label}</span>
+                      </label>
+                    ))}
+                  </div>
+                </div>
               </div>
               <div className="modal-actions"><button type="submit" className="button button-primary">Save Employee</button></div>
             </form>
@@ -6345,7 +6452,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                     return (
                       <tr key={employee.id}>
                         <td><strong>{employee.name}</strong><span>{employee.address || "Address not added"}</span></td>
-                        <td>{employee.role}<span>{employee.roleKey || employee.permissions || "Billing"}</span></td>
+                        <td>{employee.role}<span>{employee.roleKey || "employee"} | {(employee.permissionSet || []).length || 0} access rules</span></td>
                         <td>{employee.phone || "No phone"}<span>{employee.email || "No email"} | {employee.authStatus || "Local record"}</span></td>
                         <td>{currency(employee.salary || 0)}</td>
                         <td><span className="record-chip">{employee.status}</span></td>

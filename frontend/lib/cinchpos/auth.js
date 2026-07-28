@@ -7,6 +7,18 @@ const OFFLINE_AUTH_KEY = "offline-auth-session";
 const ACCOUNT_AUTH_KEY = "account-auth-session";
 let clerkClientPromise = null;
 
+async function getDesktopDeviceBootId() {
+  if (typeof window === "undefined" || !window.cinchposDesktop?.getRuntimeConfig) {
+    return "";
+  }
+  try {
+    const config = await window.cinchposDesktop.getRuntimeConfig();
+    return config?.deviceBootId || "";
+  } catch {
+    return "";
+  }
+}
+
 export const rolePermissionMatrix = {
   owner: ["*"],
   admin: ["*"],
@@ -27,8 +39,50 @@ export const rolePermissionMatrix = {
     "suppliers:read",
     "suppliers:write",
     "warehouses:read",
-    "support:read",
-    "support:write"
+    "support:use"
+  ],
+  store_manager: [
+    "billing:read",
+    "billing:write",
+    "invoices:read",
+    "invoices:write",
+    "payments:write",
+    "inventory:read",
+    "inventory:write",
+    "purchases:read",
+    "purchases:write",
+    "sales:read",
+    "reports:read",
+    "employees:read",
+    "employees:write",
+    "customers:read",
+    "customers:write",
+    "suppliers:read",
+    "suppliers:write",
+    "warehouses:read",
+    "support:use"
+  ],
+  salesman: [
+    "billing:read",
+    "billing:write",
+    "invoices:read",
+    "payments:write",
+    "customers:read",
+    "customers:write",
+    "inventory:read",
+    "support:use"
+  ],
+  stock_manager: [
+    "inventory:read",
+    "inventory:write",
+    "warehouses:read",
+    "warehouses:write",
+    "purchases:read",
+    "purchases:write",
+    "suppliers:read",
+    "suppliers:write",
+    "reports:read",
+    "support:use"
   ],
   cashier: [
     "billing:read",
@@ -37,7 +91,8 @@ export const rolePermissionMatrix = {
     "payments:write",
     "customers:read",
     "customers:write",
-    "inventory:read"
+    "inventory:read",
+    "support:use"
   ],
   warehouse_manager: [
     "inventory:read",
@@ -48,11 +103,12 @@ export const rolePermissionMatrix = {
     "purchases:write",
     "suppliers:read",
     "suppliers:write",
-    "reports:read"
+    "reports:read",
+    "support:use"
   ],
-  warehouse_staff: ["inventory:read", "inventory:write", "warehouses:read", "purchases:read"],
-  accountant: ["invoices:read", "payments:write", "purchases:read", "sales:read", "reports:read", "customers:read"],
-  employee: ["billing:read", "inventory:read", "customers:read", "support:write"]
+  warehouse_staff: ["inventory:read", "inventory:write", "warehouses:read", "support:use"],
+  accountant: ["invoices:read", "invoices:write", "payments:write", "purchases:read", "purchases:write", "sales:read", "reports:read", "customers:read", "support:use"],
+  employee: ["billing:read", "inventory:read", "customers:read", "support:use"]
 };
 
 export const viewPermissionMap = {
@@ -248,8 +304,11 @@ export async function writeOfflineAuthSession(authState, grant = {}) {
   if (typeof window === "undefined" || !authState?.authenticated) {
     return;
   }
+  const deviceBootId = await getDesktopDeviceBootId();
   const payload = JSON.stringify({
     savedAt: new Date().toISOString(),
+    deviceBootId,
+    devicePolicy: "logout-on-device-restart",
     grant,
     authState: {
       ...authState,
@@ -276,6 +335,11 @@ export async function readOfflineAuthSession() {
       return null;
     }
     const parsed = JSON.parse(payload);
+    const currentDeviceBootId = await getDesktopDeviceBootId();
+    if (parsed.deviceBootId && currentDeviceBootId && parsed.deviceBootId !== currentDeviceBootId) {
+      await clearOfflineAuthSession();
+      return null;
+    }
     return parsed?.authState ? parsed : null;
   } catch {
     return null;
@@ -296,9 +360,12 @@ export async function writeAccountAuthSession(authState, expiresAt = "") {
   if (typeof window === "undefined" || !authState?.authenticated || !authState?.token) {
     return;
   }
+  const deviceBootId = await getDesktopDeviceBootId();
   const payload = JSON.stringify({
     savedAt: new Date().toISOString(),
     expiresAt,
+    deviceBootId,
+    devicePolicy: "logout-on-device-restart",
     authState: {
       ...authState,
       offline: false,
@@ -325,6 +392,11 @@ export async function readAccountAuthSession() {
     }
     const parsed = JSON.parse(payload);
     if (!parsed?.authState?.token) {
+      return null;
+    }
+    const currentDeviceBootId = await getDesktopDeviceBootId();
+    if (parsed.deviceBootId && currentDeviceBootId && parsed.deviceBootId !== currentDeviceBootId) {
+      await clearAccountAuthSession();
       return null;
     }
     return parsed;

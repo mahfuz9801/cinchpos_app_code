@@ -34,6 +34,27 @@ try:
 except ImportError:  # pragma: no cover - fallback for minimal local runtimes
     certifi = None
 
+def load_env_file(env_path):
+    if not env_path or not os.path.isfile(env_path):
+        return
+    try:
+        with open(env_path, "r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip().strip("\"'")
+                if key and key not in os.environ:
+                    os.environ[key] = value
+    except OSError:
+        return
+
+
+load_env_file(os.path.join(os.path.dirname(__file__), ".env"))
+load_env_file(os.getenv("CINCHPOS_ENV_FILE", "").strip())
+
 app = Flask(__name__)
 
 DATABASE = os.getenv(
@@ -68,11 +89,11 @@ OTP_EXPIRY_MINUTES = int(os.getenv("CINCHPOS_OTP_EXPIRY_MINUTES", "10"))
 OTP_RESEND_SECONDS = int(os.getenv("CINCHPOS_OTP_RESEND_SECONDS", "60"))
 OTP_MAX_ATTEMPTS = int(os.getenv("CINCHPOS_OTP_MAX_ATTEMPTS", "5"))
 EMAIL_OTP_FROM = os.getenv("CINCHPOS_EMAIL_FROM", "support@cinchpos.in").strip()
-SMTP_HOST = os.getenv("CINCHPOS_SMTP_HOST", "").strip()
-SMTP_PORT = int(os.getenv("CINCHPOS_SMTP_PORT", "587"))
+SMTP_HOST = os.getenv("CINCHPOS_SMTP_HOST", "smtpout.secureserver.net").strip()
+SMTP_PORT = int(os.getenv("CINCHPOS_SMTP_PORT", "465"))
 SMTP_USERNAME = os.getenv("CINCHPOS_SMTP_USERNAME", EMAIL_OTP_FROM).strip()
 SMTP_PASSWORD = os.getenv("CINCHPOS_SMTP_PASSWORD", "").strip()
-SMTP_SECURITY = os.getenv("CINCHPOS_SMTP_SECURITY", "starttls").strip().lower()
+SMTP_SECURITY = os.getenv("CINCHPOS_SMTP_SECURITY", "ssl").strip().lower()
 SMS_WEBHOOK_URL = os.getenv("CINCHPOS_SMS_WEBHOOK_URL", "").strip()
 PUBLIC_STORE_BASE_URL = os.getenv("CINCHPOS_PUBLIC_STORE_BASE_URL", "https://cinchpos.in").strip().rstrip("/")
 PUBLIC_STORE_SYNC_URL = os.getenv("CINCHPOS_PUBLIC_STORE_SYNC_URL", f"{PUBLIC_STORE_BASE_URL}/api/online-store/sync").strip()
@@ -176,6 +197,49 @@ ROLE_PERMISSION_MATRIX = {
         "warehouses:read",
         "support:use",
     ),
+    "store_manager": (
+        "billing:read",
+        "billing:write",
+        "invoices:read",
+        "invoices:write",
+        "payments:write",
+        "inventory:read",
+        "inventory:write",
+        "purchases:read",
+        "purchases:write",
+        "sales:read",
+        "reports:read",
+        "employees:read",
+        "employees:write",
+        "customers:read",
+        "customers:write",
+        "suppliers:read",
+        "suppliers:write",
+        "warehouses:read",
+        "support:use",
+    ),
+    "salesman": (
+        "billing:read",
+        "billing:write",
+        "invoices:read",
+        "payments:write",
+        "customers:read",
+        "customers:write",
+        "inventory:read",
+        "support:use",
+    ),
+    "stock_manager": (
+        "inventory:read",
+        "inventory:write",
+        "purchases:read",
+        "purchases:write",
+        "warehouses:read",
+        "warehouses:write",
+        "suppliers:read",
+        "suppliers:write",
+        "reports:read",
+        "support:use",
+    ),
     "cashier": (
         "billing:read",
         "billing:write",
@@ -224,6 +288,9 @@ ROLE_LABELS = {
     "owner": "Owner",
     "admin": "Admin",
     "manager": "Manager",
+    "store_manager": "Store Manager",
+    "salesman": "Salesman",
+    "stock_manager": "Stock Manager",
     "cashier": "Cashier",
     "warehouse_manager": "Warehouse Manager",
     "warehouse_staff": "Warehouse Staff",
@@ -248,7 +315,9 @@ def add_cors_headers(response):
     )
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, HEAD"
     response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
     if request.path.startswith("/api/"):
         response.headers["Cache-Control"] = "no-store"
         response.headers["Pragma"] = "no-cache"
@@ -1063,7 +1132,8 @@ def get_request_auth_context(required=False):
 
 
 def has_permission(context, permission):
-    return not permission or permission in context.get("permissions", [])
+    permissions = context.get("permissions", [])
+    return not permission or "*" in permissions or permission in permissions
 
 
 def log_auth_event(event_type, context=None, detail=None):
@@ -1811,7 +1881,22 @@ def refresh_invoice_status(conn, invoice_id):
 def generate_invoice_number(conn, issued_on):
     issued_date = parse_date(issued_on, "issued_on")
     prefix = issued_date.strftime("INV-%Y%m%d")
-    suffix = 1
+    rows = conn.execute(
+        """
+        SELECT invoice_number
+        FROM invoices
+        WHERE invoice_number LIKE ?
+        ORDER BY invoice_number DESC
+        """,
+        (f"{prefix}-%",),
+    ).fetchall()
+    max_suffix = 0
+    pattern = re.compile(rf"^{re.escape(prefix)}-(\d+)$")
+    for row in rows:
+        match = pattern.match(row["invoice_number"] or "")
+        if match:
+            max_suffix = max(max_suffix, int(match.group(1)))
+    suffix = max_suffix + 1
     while True:
         candidate = f"{prefix}-{suffix:03d}"
         existing = conn.execute(
@@ -2600,6 +2685,10 @@ def list_warehouses():
 @require_permission("employees:read")
 def list_roles():
     with closing(get_connection()) as conn:
+        ensure_auth_schema(conn)
+        ensure_roles_for_business(conn, DEFAULT_BUSINESS_ID)
+        ensure_roles_for_business(conn, current_business_id())
+        conn.commit()
         rows = conn.execute(
             """
             SELECT business_id, role_key, name, is_custom, permissions_json
@@ -2662,7 +2751,11 @@ def invite_employee():
     email = (data.get("email") or "").strip().lower()
     name = (data.get("name") or "").strip()
     role_key = normalize_role_key(data.get("role") or data.get("role_key") or "employee")
-    permissions = normalize_permissions(data.get("permissions") or permissions_for_role(role_key))
+    default_permissions = normalize_permissions(permissions_for_role(role_key))
+    requested_permissions = normalize_permissions(data.get("permissions") or default_permissions)
+    if set(requested_permissions) != set(default_permissions) and not has_permission(context, "roles:manage"):
+        return jsonify({"error": "Only the owner or a role manager can customize employee access."}), 403
+    permissions = requested_permissions
     if not email or "@" not in email:
         return jsonify({"error": "A valid employee email is required."}), 400
     clerk_result = create_clerk_invitation(email, role_key, context["business_id"])
@@ -3348,36 +3441,44 @@ def create_invoice():
         if not customer:
             return jsonify({"error": "Customer not found."}), 404
 
-        invoice_number = (data.get("invoice_number") or "").strip()
-        if not invoice_number:
-            invoice_number = generate_invoice_number(conn, issued_on)
+        requested_invoice_number = (data.get("invoice_number") or "").strip()
+        auto_invoice_number = not requested_invoice_number or bool(data.get("auto_invoice_number"))
 
         status = compute_invoice_status(amount, 0, due_on)
-        try:
-            cursor = conn.execute(
-                """
-                INSERT INTO invoices (
-                    customer_id, invoice_number, amount, total_paid, status,
-                    issued_on, due_on, notes, business_id, warehouse_id
+        cursor = None
+        invoice_number = requested_invoice_number
+        for _attempt in range(50):
+            invoice_number = generate_invoice_number(conn, issued_on) if auto_invoice_number else requested_invoice_number
+            try:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO invoices (
+                        customer_id, invoice_number, amount, total_paid, status,
+                        issued_on, due_on, notes, business_id, warehouse_id
+                    )
+                    VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        customer_id,
+                        invoice_number,
+                        amount,
+                        status,
+                        issued_on,
+                        due_on,
+                        notes,
+                        current_business_id(),
+                        current_warehouse_id(),
+                    ),
                 )
-                VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    customer_id,
-                    invoice_number,
-                    amount,
-                    status,
-                    issued_on,
-                    due_on,
-                    notes,
-                    current_business_id(),
-                    current_warehouse_id(),
-                ),
-            )
-        except sqlite3.IntegrityError as exc:
-            if "invoice_number" in str(exc).lower():
-                return jsonify({"error": "Invoice number already exists."}), 409
-            raise
+                break
+            except sqlite3.IntegrityError as exc:
+                if "invoice_number" not in str(exc).lower():
+                    raise
+                if not auto_invoice_number:
+                    return jsonify({"error": "Invoice number already exists. Leave it blank to auto-generate the next bill number."}), 409
+                continue
+        if cursor is None:
+            return jsonify({"error": "Could not generate a unique invoice number. Please try again."}), 409
         conn.commit()
         row = conn.execute(
             """
