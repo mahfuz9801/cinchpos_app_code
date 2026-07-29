@@ -7856,14 +7856,17 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                       <p className="record-meta">Modern ERP workspace with Flask API billing and Next.js frontend.</p>
                     </div>
                   </div>
-                  <span className="record-chip">Desktop Ready</span>
+                  <div className="record-chip-row">
+                    <span className="record-chip">Desktop Ready</span>
+                    <span className="record-chip">Version {desktopUpdateState.currentVersion || "development"}</span>
+                  </div>
                 </div>
                 <div className="record-meta-grid"><span>Next.js Frontend</span><span>Flask Billing API</span><span>Local Workspace Storage</span><span>{appPlatform}</span></div>
               </article>
               <article className="record-card">
                 <div className="record-top">
                   <div>
-                    <h3>App Updates</h3>
+                    <h3>Software Update</h3>
                     <p className="record-meta">{desktopUpdateState.message || "Check for the latest CinchPOS desktop release."}</p>
                   </div>
                   <span className={`record-chip ${updateStatus === "available" || updateStatus === "downloaded" ? "warning" : ""}`}>

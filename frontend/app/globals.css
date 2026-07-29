@@ -894,6 +894,13 @@ body[data-appearance="dark"] .record-card {
     margin-top: 9px;
 }
 
+.record-chip-row {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+}
+
 .record-meta-grid span,
 .record-chip {
     display: inline-flex;
