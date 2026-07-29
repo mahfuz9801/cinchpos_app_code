@@ -5136,12 +5136,14 @@ body[data-preview-watermark="off"] .pos-preview-scroll::before {
 .thermal-receipt {
     display: block;
     width: 100%;
-    overflow: hidden;
+    max-width: none;
+    overflow: visible;
     color: #000000;
     background: #ffffff;
     font-family: Arial, Helvetica, sans-serif;
     font-weight: 700;
     letter-spacing: 0;
+    font-variant-numeric: tabular-nums;
     print-color-adjust: exact;
     -webkit-print-color-adjust: exact;
 }
@@ -5152,13 +5154,13 @@ body[data-preview-watermark="off"] .pos-preview-scroll::before {
 }
 
 .thermal-receipt--58 {
-    font-size: 8.2px;
-    line-height: 1.14;
+    font-size: 8.8px;
+    line-height: 1.16;
 }
 
 .thermal-receipt--80 {
-    font-size: 9.4px;
-    line-height: 1.16;
+    font-size: 10.2px;
+    line-height: 1.17;
 }
 
 .thermal-receipt p,
@@ -5240,14 +5242,14 @@ body[data-preview-watermark="off"] .pos-preview-scroll::before {
 .thermal-item-head,
 .thermal-item-row {
     display: grid;
-    grid-template-columns: 12px minmax(0, 1fr) 30px 27px 31px 36px 38px;
+    grid-template-columns: 12px minmax(0, 1.2fr) 32px 28px 30px 38px 40px;
     column-gap: 2px;
     align-items: start;
 }
 
 .thermal-receipt--58 .thermal-item-head,
 .thermal-receipt--58 .thermal-item-row {
-    grid-template-columns: 10px minmax(0, 1fr) 23px 20px 25px 28px 31px;
+    grid-template-columns: 10px minmax(0, 1.1fr) 23px 22px 24px 29px 31px;
     column-gap: 1px;
 }
 
@@ -5255,7 +5257,7 @@ body[data-preview-watermark="off"] .pos-preview-scroll::before {
     padding: 2px 0;
     border-top: 1px dashed #000000;
     border-bottom: 1px dashed #000000;
-    font-size: 0.92em;
+    font-size: 0.9em;
     font-weight: 900;
     line-height: 1.08;
 }

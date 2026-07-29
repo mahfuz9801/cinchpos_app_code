@@ -77,6 +77,8 @@ const RETRYABLE_WINDOW_ERROR_CODES = new Set([-102, -105, -106, -118, -300]);
 const BACKEND_DATA_DIR_NAME = "backend-data";
 const SECURE_STORAGE_DIR_NAME = "secure-storage";
 const PRINT_JOBS_DIR_NAME = "print-jobs";
+const CSS_PX_PER_INCH = 96;
+const MICRONS_PER_INCH = 25400;
 
 app.setName(APP_NAME);
 if (process.platform === "win32") {
@@ -228,6 +230,44 @@ function registerRuntimeConfigBridge() {
     backendPort: runtimeConfig.backendPort,
     deviceBootId: getDeviceBootId()
   }));
+}
+
+function clampPrintMicrons(value, min, max) {
+  const number = Number(value || 0);
+  if (!Number.isFinite(number)) {
+    return min;
+  }
+  return Math.max(min, Math.min(max, Math.round(number)));
+}
+
+async function getMeasuredThermalPageSize(printWindow, fallbackPageSize = {}) {
+  if (!printWindow || printWindow.isDestroyed()) {
+    return fallbackPageSize;
+  }
+  try {
+    const measurement = await printWindow.webContents.executeJavaScript(`
+      (() => {
+        const target = document.querySelector(".print-content") || document.body || document.documentElement;
+        const body = document.body || target;
+        const html = document.documentElement || target;
+        const width = Math.max(target.scrollWidth || 0, body.scrollWidth || 0, html.scrollWidth || 0, target.getBoundingClientRect().width || 0);
+        const height = Math.max(target.scrollHeight || 0, body.scrollHeight || 0, html.scrollHeight || 0, target.getBoundingClientRect().height || 0);
+        return { width, height };
+      })()
+    `);
+    const fallbackWidth = Number(fallbackPageSize.width || 80000);
+    const widthMicrons = clampPrintMicrons(fallbackWidth, 50000, 82000);
+    const measuredHeight = Number(measurement && measurement.height ? measurement.height : 0);
+    const heightMicrons = clampPrintMicrons(
+      (measuredHeight / CSS_PX_PER_INCH) * MICRONS_PER_INCH + 7000,
+      120000,
+      12000000
+    );
+    return { width: widthMicrons, height: heightMicrons };
+  } catch (error) {
+    console.warn(`CinchPOS thermal print measurement failed: ${error.message || error}`);
+    return fallbackPageSize;
+  }
 }
 
 function cloneUpdateState() {
@@ -791,9 +831,13 @@ function registerPrintBridge() {
 
       const printOptions = {
         silent: false,
-        printBackground: true
+        printBackground: true,
+        margins: { marginType: "none" },
+        scaleFactor: clampPrintMicrons(payload.scaleFactor || 100, 70, 130)
       };
-      if (payload.pageSize) {
+      if (payload.isThermal && payload.pageSize && typeof payload.pageSize === "object") {
+        printOptions.pageSize = await getMeasuredThermalPageSize(printWindow, payload.pageSize);
+      } else if (payload.pageSize) {
         printOptions.pageSize = payload.pageSize;
       }
 
