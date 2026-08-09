@@ -1208,6 +1208,13 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
   const [trendView, setTrendView] = useState("weekly");
   const [trendStartDate, setTrendStartDate] = useState("");
   const [trendEndDate, setTrendEndDate] = useState("");
+  const [salesReportFilters, setSalesReportFilters] = useState({
+    startDate: "",
+    endDate: "",
+    status: "all",
+    content: "full",
+    format: "csv"
+  });
   const [inventorySearch, setInventorySearch] = useState("");
   const [inventorySort, setInventorySort] = useState("nameAsc");
   const [inventoryItems, setInventoryItems] = useState([]);
@@ -6294,49 +6301,122 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     const totalCollections = allInvoices.reduce((total, invoice) => total + invoicePaidAmount(invoice), 0);
     const totalOutstanding = allInvoices.reduce((total, invoice) => total + invoiceOutstandingAmount(invoice), 0);
     const averageInvoiceValue = allInvoices.length ? allInvoices.reduce((total, invoice) => total + Number(invoice.amount || 0), 0) / allInvoices.length : 0;
-    const downloadSalesReport = () => {
+    const reportStartDate = cleanText(salesReportFilters.startDate);
+    const reportEndDate = cleanText(salesReportFilters.endDate);
+    const reportStatus = cleanText(salesReportFilters.status, "all").toLowerCase();
+    const reportContent = cleanText(salesReportFilters.content, "full");
+    const reportFormat = cleanText(salesReportFilters.format, "csv").toLowerCase();
+    const invoiceDateISO = (invoice) => cleanText(invoice.issued_on || invoice.issuedOn || invoice.date).slice(0, 10);
+    const customReportInvoices = allInvoices.filter((invoice) => {
+      const invoiceDate = invoiceDateISO(invoice);
+      const invoiceStatus = getInvoicePaymentStatus(invoice).toLowerCase();
+      const matchesStart = !reportStartDate || (invoiceDate && invoiceDate >= reportStartDate);
+      const matchesEnd = !reportEndDate || (invoiceDate && invoiceDate <= reportEndDate);
+      const matchesStatus = reportStatus === "all" || invoiceStatus === reportStatus;
+      return matchesStart && matchesEnd && matchesStatus;
+    });
+    const customReportSummary = {
+      invoiceCount: customReportInvoices.length,
+      totalAmount: customReportInvoices.reduce((total, invoice) => total + Number(invoice.amount || 0), 0),
+      collected: customReportInvoices.reduce((total, invoice) => total + invoicePaidAmount(invoice), 0),
+      outstanding: customReportInvoices.reduce((total, invoice) => total + invoiceOutstandingAmount(invoice), 0),
+      paid: customReportInvoices.filter((invoice) => getInvoicePaymentStatus(invoice) === "Paid").length,
+      unpaid: customReportInvoices.filter((invoice) => getInvoicePaymentStatus(invoice) === "Unpaid").length,
+      overdue: customReportInvoices.filter((invoice) => getInvoicePaymentStatus(invoice) === "Overdue").length
+    };
+    const downloadCustomizedSalesReport = () => {
+      if (reportStartDate && reportEndDate && reportStartDate > reportEndDate) {
+        showMessage("Select a valid report date range.");
+        return;
+      }
+      const reportRows = customReportInvoices.map((invoice, index) => ({
+        serialNo: index + 1,
+        invoiceNumber: invoice.invoice_number || invoice.invoiceNumber || "",
+        date: invoiceDateISO(invoice),
+        customer: cleanText(invoice.customer_name || invoice.customerName, DEFAULT_WALK_IN_CUSTOMER_NAME),
+        phone: getInvoicePhone(invoice),
+        amount: Number(invoice.amount || 0).toFixed(2),
+        paid: invoicePaidAmount(invoice).toFixed(2),
+        outstanding: invoiceOutstandingAmount(invoice).toFixed(2),
+        status: getInvoicePaymentStatus(invoice)
+      }));
+      const filterSummary = {
+        generatedOn: new Date().toLocaleString("en-IN"),
+        business: businessName,
+        startDate: reportStartDate || "All dates",
+        endDate: reportEndDate || "All dates",
+        status: reportStatus === "all" ? "All statuses" : reportStatus,
+        content: reportContent,
+        stockValue: Number(inventoryStockValue || 0).toFixed(2),
+        ...customReportSummary
+      };
+      if (reportFormat === "json") {
+        const blob = new Blob([JSON.stringify({
+          title: "CinchPOS Custom Sales Report",
+          summary: filterSummary,
+          trend: reportContent === "summary" ? [] : trend,
+          invoices: reportContent === "summary" ? [] : reportRows
+        }, null, 2)], { type: "application/json;charset=utf-8" });
+        const url = window.URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = `${makeDownloadFileName(`${businessName}-${reportStartDate || "all"}-${reportEndDate || todayISO()}`, "cinchpos-custom-sales-report")}.json`;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        window.setTimeout(() => window.URL.revokeObjectURL(url), 800);
+        showMessage("Custom sales report downloaded.");
+        return;
+      }
       const lines = [
-        csvRow(["CinchPOS Sales Report"]),
-        csvRow(["Generated On", new Date().toLocaleString("en-IN")]),
-        csvRow(["Business", businessName]),
+        csvRow(["CinchPOS Custom Sales Report"]),
+        csvRow(["Generated On", filterSummary.generatedOn]),
+        csvRow(["Business", filterSummary.business]),
+        csvRow(["Date Range", filterSummary.startDate, filterSummary.endDate]),
+        csvRow(["Payment Status", filterSummary.status]),
         "",
         csvRow(["Summary"]),
-        csvRow(["Stock Value", inventoryStockValue]),
-        csvRow(["Total Collected", totalCollections]),
-        csvRow(["Outstanding", totalOutstanding || currentSummary.outstanding_payments]),
-        csvRow(["Average Invoice", averageInvoiceValue]),
-        csvRow(["Paid Invoices", paidInvoices]),
-        csvRow(["Unpaid Invoices", pendingInvoices]),
-        csvRow(["Overdue Invoices", overdueInvoices]),
-        "",
-        csvRow(["Trend", trendView]),
-        csvRow(["Label", "Value"]),
-        ...trend.map((point) => csvRow([point.label, point.value])),
-        "",
-        csvRow(["Invoices"]),
-        csvRow(["Serial No.", "Invoice Number", "Date", "Customer", "Phone", "Amount", "Paid", "Outstanding", "Status"]),
-        ...allInvoices.map((invoice, index) => csvRow([
-          index + 1,
-          invoice.invoice_number || invoice.invoiceNumber || "",
-          invoice.issued_on || invoice.issuedOn || "",
-          cleanText(invoice.customer_name || invoice.customerName, DEFAULT_WALK_IN_CUSTOMER_NAME),
-          getInvoicePhone(invoice),
-          Number(invoice.amount || 0).toFixed(2),
-          invoicePaidAmount(invoice).toFixed(2),
-          invoiceOutstandingAmount(invoice).toFixed(2),
-          getInvoicePaymentStatus(invoice)
-        ]))
+        csvRow(["Stock Value", filterSummary.stockValue]),
+        csvRow(["Invoice Count", filterSummary.invoiceCount]),
+        csvRow(["Total Sales Amount", customReportSummary.totalAmount.toFixed(2)]),
+        csvRow(["Total Collected", customReportSummary.collected.toFixed(2)]),
+        csvRow(["Outstanding", customReportSummary.outstanding.toFixed(2)]),
+        csvRow(["Paid Invoices", customReportSummary.paid]),
+        csvRow(["Unpaid Invoices", customReportSummary.unpaid]),
+        csvRow(["Overdue Invoices", customReportSummary.overdue])
       ];
+      if (reportContent !== "summary") {
+        lines.push(
+          "",
+          csvRow(["Trend", trendView]),
+          csvRow(["Label", "Value"]),
+          ...trend.map((point) => csvRow([point.label, point.value])),
+          "",
+          csvRow(["Invoices"]),
+          csvRow(["Serial No.", "Invoice Number", "Date", "Customer", "Phone", "Amount", "Paid", "Outstanding", "Status"]),
+          ...reportRows.map((invoice) => csvRow([
+            invoice.serialNo,
+            invoice.invoiceNumber,
+            invoice.date,
+            invoice.customer,
+            invoice.phone,
+            invoice.amount,
+            invoice.paid,
+            invoice.outstanding,
+            invoice.status
+          ]))
+        );
+      }
       const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8" });
       const url = window.URL.createObjectURL(blob);
       const link = document.createElement("a");
       link.href = url;
-      link.download = `${makeDownloadFileName(`${businessName}-${todayISO()}`, "cinchpos-sales-report")}.csv`;
+      link.download = `${makeDownloadFileName(`${businessName}-${reportStartDate || "all"}-${reportEndDate || todayISO()}`, "cinchpos-custom-sales-report")}.csv`;
       document.body.appendChild(link);
       link.click();
       link.remove();
       window.setTimeout(() => window.URL.revokeObjectURL(url), 800);
-      showMessage("Sales report downloaded.");
+      showMessage("Custom sales report downloaded.");
     };
     return (
       <section id="salesReportView" className={`app-view ${active ? "active" : ""}`} data-title="Sales Report">
@@ -6348,9 +6428,20 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
             </div>
             <div className="panel-actions">
               <button className="button button-secondary" type="button" onClick={() => setActiveView("invoicesView")}>Open Invoices</button>
-              <button className="button button-primary" type="button" onClick={downloadSalesReport}>Download Report</button>
+              <button className="button button-primary" type="button" onClick={downloadCustomizedSalesReport}>Download Custom Report</button>
             </div>
           </div>
+          <section className="sales-report-customizer" aria-label="Custom sales report filters">
+            <div>
+              <strong>Custom Report</strong>
+              <span>{customReportInvoices.length} matching invoice(s)</span>
+            </div>
+            <label>From<input type="date" value={salesReportFilters.startDate} onChange={(event) => setSalesReportFilters((current) => ({ ...current, startDate: event.target.value }))} /></label>
+            <label>To<input type="date" value={salesReportFilters.endDate} onChange={(event) => setSalesReportFilters((current) => ({ ...current, endDate: event.target.value }))} /></label>
+            <label>Status<select value={salesReportFilters.status} onChange={(event) => setSalesReportFilters((current) => ({ ...current, status: event.target.value }))}><option value="all">All</option><option value="paid">Paid</option><option value="unpaid">Unpaid</option><option value="overdue">Overdue</option></select></label>
+            <label>Content<select value={salesReportFilters.content} onChange={(event) => setSalesReportFilters((current) => ({ ...current, content: event.target.value }))}><option value="full">Summary + Invoices</option><option value="summary">Summary only</option></select></label>
+            <label>Format<select value={salesReportFilters.format} onChange={(event) => setSalesReportFilters((current) => ({ ...current, format: event.target.value }))}><option value="csv">CSV</option><option value="json">JSON</option></select></label>
+          </section>
 	          <div className="sales-report-grid">
 	            <article className="sales-report-card">
 	              <span>Stock Value</span>
@@ -7875,6 +7966,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         const updateBusy = updateStatus === "checking" || updateStatus === "downloading";
         const canDownloadUpdate = updateStatus === "available";
         const canInstallUpdate = Boolean(desktopUpdateState.canInstall || updateStatus === "downloaded");
+        const updateApplyLabel = desktopUpdateState.source === "manifest" ? "Open Manual Update" : "Restart & Update";
         return (
           <section className="settings-section">
             <h4>App Info</h4>
@@ -7925,7 +8017,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                 <div className="settings-action-row">
                   <button type="button" className="button button-secondary" disabled={updateBusy} onClick={() => runDesktopUpdateAction("check")}>Check for Updates</button>
                   {canDownloadUpdate ? <button type="button" className="button button-primary" onClick={() => runDesktopUpdateAction("download")}>Download Update</button> : null}
-                  {canInstallUpdate ? <button type="button" className="button button-primary" onClick={() => runDesktopUpdateAction("install")}>Install Update</button> : null}
+                  {canInstallUpdate ? <button type="button" className="button button-primary" onClick={() => runDesktopUpdateAction("install")}>{updateApplyLabel}</button> : null}
                   {updateStatus === "downloading" ? <button type="button" className="button button-secondary" onClick={() => runDesktopUpdateAction("cancelDownload")}>Cancel</button> : null}
                 </div>
               </article>

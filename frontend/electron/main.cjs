@@ -306,8 +306,8 @@ async function promptForAvailableUpdate(info = {}) {
     type: "info",
     title: "CinchPOS update available",
     message: `CinchPOS ${version} is available.`,
-    detail: "This update includes the latest billing, printing, inventory, and layout fixes. You can update now or continue billing and update later from Settings.",
-    buttons: ["Update Now", "Later"],
+    detail: "Download the update in the background. After it is ready, CinchPOS only needs a restart to apply it.",
+    buttons: ["Download Update", "Later"],
     defaultId: 0,
     cancelId: 1,
     noLink: true
@@ -334,9 +334,9 @@ async function promptForDownloadedUpdate(info = {}) {
   const result = await dialog.showMessageBox(mainWindow, {
     type: "question",
     title: "CinchPOS update ready",
-    message: `CinchPOS ${version} is ready to install.`,
-    detail: "Install when the billing counter is free. CinchPOS will restart to finish the update.",
-    buttons: ["Restart & Install", "Later"],
+    message: `CinchPOS ${version} is ready.`,
+    detail: "Restart CinchPOS when the billing counter is free. The update will be applied during restart.",
+    buttons: ["Restart & Update", "Later"],
     defaultId: 0,
     cancelId: 1,
     noLink: true
@@ -347,7 +347,7 @@ async function promptForDownloadedUpdate(info = {}) {
       console.warn(`CinchPOS update install prompt failed: ${error.message || error}`);
       setUpdateState({
         status: "error",
-        message: `Could not start the installer. ${error.message || error}`
+        message: `Could not restart for update. ${error.message || error}`
       });
     });
   }
@@ -513,7 +513,7 @@ async function downloadFallbackInstaller() {
 
   return setUpdateState({
     status: "downloaded",
-    message: "Update downloaded. Install it when the billing counter is free.",
+    message: "Manual update package downloaded. Restart update was not available for this package.",
     progress: { percent: 100, transferred, total },
     downloadPath: filePath,
     canInstall: true,
@@ -585,7 +585,7 @@ function configureAutoUpdater() {
   autoUpdater.on("update-downloaded", (info) => {
     setUpdateState({
       status: "downloaded",
-      message: "Update downloaded. Restart CinchPOS to install it.",
+      message: "Update downloaded. Restart CinchPOS to apply it.",
       updateInfo: info,
       progress: { percent: 100 },
       canInstall: true,
@@ -699,7 +699,7 @@ async function installUpdate() {
     }
     setUpdateState({
       status: "installing",
-      message: "Installer opened. Close CinchPOS before completing the update.",
+      message: "Manual update package opened. This is only used when restart update is unavailable.",
       canInstall: true,
       source: "manifest"
     });

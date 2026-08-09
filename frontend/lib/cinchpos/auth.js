@@ -7,6 +7,14 @@ const OFFLINE_AUTH_KEY = "offline-auth-session";
 const ACCOUNT_AUTH_KEY = "account-auth-session";
 let clerkClientPromise = null;
 
+function storedSessionExpired(value) {
+  if (!value) {
+    return false;
+  }
+  const expiresAt = Date.parse(String(value));
+  return Number.isFinite(expiresAt) && expiresAt <= Date.now();
+}
+
 async function getDesktopDeviceBootId() {
   if (typeof window === "undefined" || !window.cinchposDesktop?.getRuntimeConfig) {
     return "";
@@ -305,10 +313,12 @@ export async function writeOfflineAuthSession(authState, grant = {}) {
     return;
   }
   const deviceBootId = await getDesktopDeviceBootId();
+  const expiresAt = grant?.expires_at || grant?.expiresAt || "";
   const payload = JSON.stringify({
     savedAt: new Date().toISOString(),
+    expiresAt,
     deviceBootId,
-    devicePolicy: "logout-on-device-restart",
+    devicePolicy: "persistent-until-expiry-or-logout",
     grant,
     authState: {
       ...authState,
@@ -335,8 +345,7 @@ export async function readOfflineAuthSession() {
       return null;
     }
     const parsed = JSON.parse(payload);
-    const currentDeviceBootId = await getDesktopDeviceBootId();
-    if (parsed.deviceBootId && currentDeviceBootId && parsed.deviceBootId !== currentDeviceBootId) {
+    if (storedSessionExpired(parsed.expiresAt || parsed.grant?.expires_at || parsed.grant?.expiresAt)) {
       await clearOfflineAuthSession();
       return null;
     }
@@ -365,7 +374,7 @@ export async function writeAccountAuthSession(authState, expiresAt = "") {
     savedAt: new Date().toISOString(),
     expiresAt,
     deviceBootId,
-    devicePolicy: "logout-on-device-restart",
+    devicePolicy: "persistent-until-expiry-or-logout",
     authState: {
       ...authState,
       offline: false,
@@ -394,8 +403,7 @@ export async function readAccountAuthSession() {
     if (!parsed?.authState?.token) {
       return null;
     }
-    const currentDeviceBootId = await getDesktopDeviceBootId();
-    if (parsed.deviceBootId && currentDeviceBootId && parsed.deviceBootId !== currentDeviceBootId) {
+    if (storedSessionExpired(parsed.expiresAt)) {
       await clearAccountAuthSession();
       return null;
     }
