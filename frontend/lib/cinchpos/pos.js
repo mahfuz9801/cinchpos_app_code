@@ -29,11 +29,52 @@ export function makePOSInstance(formId) {
   };
 }
 
-export function makeInitialPOSState() {
+function inferPOSFormId(instance, fallback = "posForm") {
+  const source = instance?.activeBillId || instance?.bills?.[0]?.id || fallback;
+  const match = String(source).match(/^(.*)-bill-\d+$/);
+  return match?.[1] || fallback;
+}
+
+export function normalizePOSInstance(instance, formId = inferPOSFormId(instance)) {
+  const fallback = makePOSInstance(formId);
+  const sourceBills = Array.isArray(instance?.bills) && instance.bills.length ? instance.bills : fallback.bills;
+  const activeIndex = Math.max(0, sourceBills.findIndex((bill) => bill.id === instance?.activeBillId));
+  const bills = sourceBills.map((bill, index) => {
+    const number = index + 1;
+    return {
+      ...bill,
+      id: `${formId}-bill-${number}`,
+      label: `Bill ${number}`,
+      items: Array.isArray(bill.items) ? bill.items : [],
+      customer: { ...defaultPOSCustomer, ...(bill.customer || {}) }
+    };
+  });
+
   return {
+    ...fallback,
+    ...(instance || {}),
+    bills,
+    activeBillId: bills[activeIndex]?.id || bills[0].id,
+    counter: bills.length,
+    itemQuery: instance?.itemQuery || "",
+    matches: Array.isArray(instance?.matches) ? instance.matches : [],
+    matchMode: instance?.matchMode || "",
+    matchMessage: instance?.matchMessage || ""
+  };
+}
+
+export function normalizePOSState(posState = {}) {
+  return {
+    posForm: normalizePOSInstance(posState.posForm, "posForm"),
+    workspacePosForm: normalizePOSInstance(posState.workspacePosForm, "workspacePosForm")
+  };
+}
+
+export function makeInitialPOSState() {
+  return normalizePOSState({
     posForm: makePOSInstance("posForm"),
     workspacePosForm: makePOSInstance("workspacePosForm")
-  };
+  });
 }
 
 export function getPOSBillSummary(items) {
@@ -289,43 +330,57 @@ export function addInventoryItemToPOSInstance(instance, item) {
 }
 
 export function createNextPOSBillInstance(instance, formId) {
-  const nextCounter = Number(instance.counter || instance.bills?.length || 0) + 1;
+  const currentInstance = normalizePOSInstance(instance, formId);
+  const nextCounter = currentInstance.bills.length + 1;
   const bill = makeBill(formId, nextCounter);
   return {
-    ...instance,
+    ...currentInstance,
     counter: nextCounter,
     activeBillId: bill.id,
     itemQuery: "",
     matches: [],
     matchMode: "",
     matchMessage: "",
-    bills: [...(instance.bills || []), bill]
+    bills: [...currentInstance.bills, bill]
   };
 }
 
 export function deletePOSBillFromInstance(instance, billId) {
-  const currentBills = instance.bills || [];
+  const formId = inferPOSFormId(instance);
+  const currentInstance = normalizePOSInstance(instance, formId);
+  const currentBills = currentInstance.bills || [];
   if (currentBills.length <= 1) {
-    return { didDelete: false, deletedBill: null, nextInstance: instance };
+    return { didDelete: false, deletedBill: null, nextInstance: currentInstance };
   }
 
   const billToDelete = currentBills.find((openBill) => openBill.id === billId) || null;
   const deleteIndex = currentBills.findIndex((openBill) => openBill.id === billId);
   const remainingBills = currentBills.filter((openBill) => openBill.id !== billId);
   const fallbackBill = remainingBills[Math.max(0, deleteIndex - 1)] || remainingBills[0];
-  const deletedActiveBill = instance.activeBillId === billId;
+  const deletedActiveBill = currentInstance.activeBillId === billId;
+  const nextActiveSourceId = deletedActiveBill ? fallbackBill.id : currentInstance.activeBillId;
+  const nextActiveIndex = Math.max(0, remainingBills.findIndex((openBill) => openBill.id === nextActiveSourceId));
+  const renumberedBills = remainingBills.map((openBill, index) => {
+    const number = index + 1;
+    return {
+      ...openBill,
+      id: `${formId}-bill-${number}`,
+      label: `Bill ${number}`
+    };
+  });
 
   return {
     didDelete: true,
     deletedBill: billToDelete,
     nextInstance: {
-      ...instance,
-      bills: remainingBills,
-      activeBillId: deletedActiveBill ? fallbackBill.id : instance.activeBillId,
-      itemQuery: deletedActiveBill ? "" : instance.itemQuery,
-      matches: deletedActiveBill ? [] : instance.matches,
-      matchMode: deletedActiveBill ? "" : instance.matchMode,
-      matchMessage: deletedActiveBill ? "" : instance.matchMessage
+      ...currentInstance,
+      bills: renumberedBills,
+      activeBillId: renumberedBills[nextActiveIndex]?.id || renumberedBills[0].id,
+      counter: renumberedBills.length,
+      itemQuery: deletedActiveBill ? "" : currentInstance.itemQuery,
+      matches: deletedActiveBill ? [] : currentInstance.matches,
+      matchMode: deletedActiveBill ? "" : currentInstance.matchMode,
+      matchMessage: deletedActiveBill ? "" : currentInstance.matchMessage
     }
   };
 }

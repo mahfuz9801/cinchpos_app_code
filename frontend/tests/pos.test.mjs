@@ -9,7 +9,8 @@ import {
   findInventoryMatches,
   findInventoryItemsByBarcode,
   getPOSBillSummary,
-  makePOSInstance
+  makePOSInstance,
+  normalizePOSState
 } from "../lib/cinchpos/pos.js";
 
 const inventoryItems = [
@@ -93,6 +94,37 @@ test("deletePOSBillFromInstance switches focus to a remaining bill", () => {
   assert.equal(result.didDelete, true);
   assert.equal(result.nextInstance.bills.length, 2);
   assert.notEqual(result.nextInstance.activeBillId, activeBillId);
+});
+
+test("deletePOSBillFromInstance renumbers remaining bill tabs", () => {
+  let instance = makePOSInstance("workspacePosForm");
+  instance = createNextPOSBillInstance(instance, "workspacePosForm");
+  instance = createNextPOSBillInstance(instance, "workspacePosForm");
+  instance = createNextPOSBillInstance(instance, "workspacePosForm");
+
+  const result = deletePOSBillFromInstance(instance, "workspacePosForm-bill-1");
+  const nextInstance = createNextPOSBillInstance(result.nextInstance, "workspacePosForm");
+
+  assert.deepEqual(result.nextInstance.bills.map((bill) => bill.label), ["Bill 1", "Bill 2", "Bill 3"]);
+  assert.deepEqual(result.nextInstance.bills.map((bill) => bill.id), ["workspacePosForm-bill-1", "workspacePosForm-bill-2", "workspacePosForm-bill-3"]);
+  assert.equal(nextInstance.bills.at(-1).label, "Bill 4");
+});
+
+test("normalizePOSState resets persisted single bill labels to Bill 1", () => {
+  const state = normalizePOSState({
+    workspacePosForm: {
+      bills: [{ id: "workspacePosForm-bill-6", label: "Bill 6", items: [], customer: { phone: "9999999999" } }],
+      activeBillId: "workspacePosForm-bill-6",
+      counter: 6
+    }
+  });
+
+  assert.equal(state.workspacePosForm.bills.length, 1);
+  assert.equal(state.workspacePosForm.bills[0].id, "workspacePosForm-bill-1");
+  assert.equal(state.workspacePosForm.bills[0].label, "Bill 1");
+  assert.equal(state.workspacePosForm.activeBillId, "workspacePosForm-bill-1");
+  assert.equal(state.workspacePosForm.counter, 1);
+  assert.equal(state.workspacePosForm.bills[0].customer.phone, "9999999999");
 });
 
 test("getPOSBillSummary totals quantity, taxable value, GST, and grand total", () => {

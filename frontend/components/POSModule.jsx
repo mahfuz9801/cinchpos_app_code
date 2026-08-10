@@ -203,6 +203,8 @@ export default function POSModule({ customers = [], onRefresh, showMessage, onCl
   }, []);
 
   const activeBill = bills.find((bill) => bill.id === activeBillId) || bills[0];
+  const activeBillIndex = Math.max(0, bills.findIndex((bill) => bill.id === activeBill?.id));
+  const activeBillDisplayLabel = `Bill ${activeBillIndex + 1}`;
   const items = activeBill?.items || [];
   const summary = useMemo(() => getPOSBillSummary(items), [items]);
   const paidAmount = form.payment_type === "partial"
@@ -518,11 +520,12 @@ export default function POSModule({ customers = [], onRefresh, showMessage, onCl
                 </div>
               </div>
               <div className="pos-bill-tabs" aria-label="Open bills">
-                {bills.map((bill) => {
+                {bills.map((bill, billIndex) => {
                   const billSummary = getPOSBillSummary(bill.items);
+                  const billDisplayLabel = `Bill ${billIndex + 1}`;
                   return (
                     <button key={bill.id} type="button" className={`bill-tab ${bill.id === activeBillId ? "active" : ""}`} onClick={() => setActiveBillId(bill.id)}>
-                      {bill.label} <span>{currency(billSummary.total)}</span>
+                      {billDisplayLabel} <span>{currency(billSummary.total)}</span>
                     </button>
                   );
                 })}
@@ -533,7 +536,7 @@ export default function POSModule({ customers = [], onRefresh, showMessage, onCl
               <div className="pos-preview-head">
                 <div>
                   <h3>Bill Preview</h3>
-                  <p className="pos-helper">{activeBill?.label || "Bill 1"} is ready.</p>
+                  <p className="pos-helper">{activeBillDisplayLabel} is ready.</p>
                 </div>
                 <div className="pos-total">
                   <span>Grand Total</span>

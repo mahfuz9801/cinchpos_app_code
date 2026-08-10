@@ -102,6 +102,7 @@ import {
   makeBill,
   makeInitialPOSState,
   makePOSInstance,
+  normalizePOSState,
   removePOSLineItem,
   updatePOSLineItemsPrice,
   updatePOSLineItemsQuantity
@@ -1968,7 +1969,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     setSellOnlineCatalog(readStoredJSON(storageKeys.sellOnline, {}));
     setInvoiceDetails(readStoredJSON(storageKeys.invoiceDetails, {}));
     setSupportRequests(readStoredJSON(storageKeys.supportRequests, []));
-    setPosState(readStoredJSON(storageKeys.pos, makeInitialPOSState()));
+    setPosState(normalizePOSState(readStoredJSON(storageKeys.pos, makeInitialPOSState())));
     setTrendView(readStoredValue(storageKeys.trendView, "weekly"));
     setTrendStartDate(readStoredValue(storageKeys.trendStart, ""));
     setTrendEndDate(readStoredValue(storageKeys.trendEnd, ""));
@@ -2052,7 +2053,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       setSupportRequests(payload.supportRequests);
     }
     if (payload.posState && typeof payload.posState === "object") {
-      setPosState(payload.posState);
+      setPosState(normalizePOSState(payload.posState));
     }
     return true;
   }, []);
@@ -2931,13 +2932,13 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
   }
 
   function deletePOSBill(formId, billId) {
-    const { didDelete, deletedBill } = deletePOSBillFromInstance(getPOSInstance(formId), billId);
+    const { didDelete } = deletePOSBillFromInstance(getPOSInstance(formId), billId);
     if (!didDelete) {
       showMessage("Keep at least one bill open.");
       return;
     }
     updatePOSInstance(formId, (current) => deletePOSBillFromInstance(current, billId).nextInstance);
-    showMessage(`${deletedBill?.label || "Bill"} deleted.`);
+    showMessage("Bill deleted.");
   }
 
   function resetActivePOSBill(formId) {
@@ -4776,7 +4777,9 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       : posSummary.total;
     const unpaidAmount = Math.max(0, posSummary.total - paidAmount);
     const hasCustomerDraft = Boolean(cleanText(customer.name) || cleanText(customer.email) || cleanText(customer.address) || cleanText(customer.phone));
-    const meta = `${bill.label} | ${cleanText(customer.name, hasCustomerDraft ? "Customer draft" : DEFAULT_WALK_IN_CUSTOMER_NAME)} | ${customer.phone?.length === 10 ? formatIndianPhone(customer.phone) : formatIndianPhone(DEFAULT_WALK_IN_CUSTOMER_PHONE)} | ${posSummary.quantity} item(s)`;
+    const activeBillIndex = Math.max(0, (instance.bills || []).findIndex((openBill) => openBill.id === bill.id));
+    const activeBillDisplayLabel = `Bill ${activeBillIndex + 1}`;
+    const meta = `${activeBillDisplayLabel} | ${cleanText(customer.name, hasCustomerDraft ? "Customer draft" : DEFAULT_WALK_IN_CUSTOMER_NAME)} | ${customer.phone?.length === 10 ? formatIndianPhone(customer.phone) : formatIndianPhone(DEFAULT_WALK_IN_CUSTOMER_PHONE)} | ${posSummary.quantity} item(s)`;
     const showUppercaseKeyboard = keyboardCaps || keyboardShift;
     const keyboardLetterRows = [
       ["q", "w", "e", "r", "t", "y", "u", "i", "o", "p"],
@@ -4958,15 +4961,16 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                   </div>
                 </div>
                 <div className="pos-bill-tabs" aria-label="Open bills">
-                  {instance.bills.map((openBill) => {
+                  {instance.bills.map((openBill, billIndex) => {
                     const openBillTotal = getPOSBillSummary(openBill.items || []).total;
+                    const openBillDisplayLabel = `Bill ${billIndex + 1}`;
                     return (
                       <div key={openBill.id} className={`bill-tab-group ${openBill.id === instance.activeBillId ? "active" : ""}`}>
                         <button type="button" className="bill-tab" onClick={() => switchPOSBill(formId, openBill.id)}>
-                          {openBill.label}
+                          {openBillDisplayLabel}
                           <span>{currency(openBillTotal)}</span>
                         </button>
-                        <button type="button" className="bill-delete" aria-label={`Delete ${openBill.label}`} title={`Delete ${openBill.label}`} disabled={instance.bills.length <= 1} onClick={() => deletePOSBill(formId, openBill.id)}>&times;</button>
+                        <button type="button" className="bill-delete" aria-label={`Delete ${openBillDisplayLabel}`} title={`Delete ${openBillDisplayLabel}`} disabled={instance.bills.length <= 1} onClick={() => deletePOSBill(formId, openBill.id)}>&times;</button>
                       </div>
                     );
                   })}
