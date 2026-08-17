@@ -103,10 +103,13 @@ export function buildPOSLineItem(item) {
   const breakup = getInventoryGSTBreakup(inclusivePrice, gstRate);
   const savedDiscount = Number(item.discountPercent || item.discount_percent || item.discount || 0);
   const sourceId = item.id || `${normalizeKey(itemName)}-${normalizeKey(barcode)}`;
+  const inventoryItemId = cleanText(item.id);
 
   return {
     id: `${sourceId}-${Date.now()}`,
     key: String(sourceId),
+    inventoryItemId,
+    itemId: inventoryItemId,
     itemName,
     barcode,
     hsn: cleanText(item.hsn || item.hsnSac || item.hsn_sac || item.sac),

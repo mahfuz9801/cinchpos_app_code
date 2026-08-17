@@ -81,6 +81,15 @@ test("addInventoryItemToPOSInstance increments quantity instead of duplicating t
   assert.equal(bill.items[0].quantity, 2);
 });
 
+test("addInventoryItemToPOSInstance keeps inventory ids on bill line items", () => {
+  let instance = makePOSInstance("posForm");
+  instance = addInventoryItemToPOSInstance(instance, inventoryItems[0]);
+  const lineItem = instance.bills[0].items[0];
+
+  assert.equal(lineItem.inventoryItemId, "item-1");
+  assert.equal(lineItem.itemId, "item-1");
+});
+
 test("deletePOSBillFromInstance switches focus to a remaining bill", () => {
   let instance = makePOSInstance("posForm");
   instance = createNextPOSBillInstance(instance, "posForm");

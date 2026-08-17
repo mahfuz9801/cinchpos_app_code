@@ -31,6 +31,7 @@ import {
   verifyCinchAccountOtp
 } from "@/lib/api";
 import {
+  applyInventorySaleDeductions,
   calculateDiscountPercent,
   getInventoryBarcodeLabel,
   getInventoryGSTBreakup,
@@ -125,6 +126,7 @@ import {
   summarizeInventoryImport,
   transferSourceProfiles
 } from "@/lib/cinchpos/transfer";
+import { mergePurchaseCollections } from "@/lib/cinchpos/purchases";
 import {
   AppLogo,
   Empty,
@@ -211,7 +213,7 @@ function buildSmartInventoryReview(items = []) {
       barcodeGroups.set(normalizedBarcode, known);
     });
 
-    if (stock <= 0 || !barcodes.length || price <= 0) {
+    if (stock <= 0 || price <= 0) {
       cleanupCandidates.push(summaryEntry);
     }
     if (stock <= reorderLevel) {
@@ -320,9 +322,6 @@ function buildSmartInventoryReview(items = []) {
     const reasons = [];
     if (entry.stock <= 0) {
       reasons.push("zero or negative stock");
-    }
-    if (!entry.barcodes.length) {
-      reasons.push("no barcode");
     }
     if (entry.price <= 0) {
       reasons.push("missing price");
@@ -439,8 +438,23 @@ function toMicrons(mm) {
   return Math.max(1000, Math.round(Number(mm || 0) * 1000));
 }
 
-function getThermalReceiptHeightMm(itemCount = 0, { hasLogo = false, hasFooter = false, hasNotes = false } = {}) {
-  const estimatedHeight = 118 + Number(itemCount || 0) * 15 + (hasLogo ? 13 : 0) + (hasNotes ? 34 : 0) + (hasFooter ? 18 : 0);
+function getThermalReceiptHeightMm(itemsOrCount = 0, { hasLogo = false, hasFooter = false, hasNotes = false } = {}) {
+  const items = Array.isArray(itemsOrCount) ? itemsOrCount : [];
+  const itemCount = items.length || Number(itemsOrCount || 0);
+  const itemHeight = items.length
+    ? items.reduce((total, item) => {
+      const textLength = [
+        item?.itemName,
+        item?.description,
+        item?.batch,
+        item?.barcode,
+        item?.hsn || item?.hsnSac || item?.hsn_sac || item?.sac
+      ].map((value) => cleanText(value)).join(" ").length;
+      const wrappedLines = Math.max(0, Math.ceil((textLength - 28) / 26));
+      return total + 16 + wrappedLines * 4;
+    }, 0)
+    : itemCount * 18;
+  const estimatedHeight = 128 + itemHeight + (hasLogo ? 16 : 0) + (hasNotes ? 42 : 0) + (hasFooter ? 22 : 0);
   return Math.max(180, Math.min(12000, estimatedHeight));
 }
 
@@ -451,7 +465,7 @@ function getElectronPrintPageSize(profile, payload = {}) {
   const widthMm = Number(String(profile.pageWidth || "80mm").replace(/[^\d.]/g, "")) || 80;
   return {
     width: toMicrons(widthMm),
-    height: toMicrons(getThermalReceiptHeightMm(payload.items?.length || 0, {
+    height: toMicrons(getThermalReceiptHeightMm(payload.items || [], {
       hasLogo: Boolean(payload.logo),
       hasFooter: Boolean(payload.printFooter),
       hasNotes: Boolean(payload.notes || payload.paymentTerms || payload.terms)
@@ -886,10 +900,11 @@ function makeInvoiceBuilderDraft(overrides = {}) {
 function buildInvoiceBuilderLineFromInventory(item = {}) {
   const inclusivePrice = Number(item.inclusivePrice || item.inclusive_price || item.price || 0);
   const mrp = Number(item.mrp || inclusivePrice || 0);
+  const barcodes = getInventoryItemBarcodes(item);
   return makeInvoiceBuilderLine({
     itemId: cleanText(item.id),
     itemName: getInventoryItemName(item),
-    barcode: getInventoryBarcodeLabel(item),
+    barcode: barcodes[0] || "",
     quantity: 1,
     mrp,
     inclusivePrice,
@@ -1229,7 +1244,6 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
   const [bankAccount, setBankAccount] = useState(null);
   const [purchaseRecords, setPurchaseRecords] = useState([]);
   const [expenseRecords, setExpenseRecords] = useState([]);
-  const [purchaseBills, setPurchaseBills] = useState([]);
   const [storeDocuments, setStoreDocuments] = useState([]);
   const [employees, setEmployees] = useState([]);
   const [settings, setSettings] = useState(defaultSettings);
@@ -1534,7 +1548,6 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     inventory: inventoryItems.length,
     lowStock: inventoryItems.filter((item) => Number(item.stock || 0) <= 5).length,
     purchases: purchaseRecords.length,
-    purchaseBills: purchaseBills.length,
     expenses: expenseRecords.length,
     employees: employees.length,
     documents: storeDocuments.length,
@@ -1549,7 +1562,6 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     expenseRecords.length,
     inventoryItems,
     outstandingInvoices.length,
-    purchaseBills.length,
     purchaseRecords.length,
     managedBusinesses.length,
     managedWarehouses.length,
@@ -1961,9 +1973,15 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     setAccount({ ...defaultAccount, ...readStoredJSON(storageKeys.account, defaultAccount) });
     setInventoryItems(readStoredJSON(storageKeys.inventory, []));
     setBankAccount(readStoredJSON(storageKeys.bank, null));
-    setPurchaseRecords(readStoredJSON(storageKeys.purchases, []));
+    const storedPurchaseRecords = readStoredJSON(storageKeys.purchases, []);
+    const legacyPurchaseBills = readStoredJSON(storageKeys.purchaseBills, []);
+    const mergedPurchaseRecords = mergePurchaseCollections(storedPurchaseRecords, legacyPurchaseBills);
+    setPurchaseRecords(mergedPurchaseRecords);
+    if (legacyPurchaseBills.length) {
+      writeStoredJSON(storageKeys.purchases, mergedPurchaseRecords, { immediate: true });
+      writeStoredJSON(storageKeys.purchaseBills, [], { immediate: true });
+    }
     setExpenseRecords(readStoredJSON(storageKeys.expenses, []));
-    setPurchaseBills(readStoredJSON(storageKeys.purchaseBills, []));
     setStoreDocuments(readStoredJSON(storageKeys.documents, []));
     setEmployees(readStoredJSON(storageKeys.employees, []));
     setSellOnlineCatalog(readStoredJSON(storageKeys.sellOnline, {}));
@@ -1989,7 +2007,6 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     bankAccount,
     purchaseRecords,
     expenseRecords,
-    purchaseBills,
     storeDocuments,
     employees,
     sellOnlineCatalog,
@@ -2004,7 +2021,6 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     inventoryItems,
     invoiceDetails,
     posState,
-    purchaseBills,
     purchaseRecords,
     sellOnlineCatalog,
     settings,
@@ -2028,14 +2044,11 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     if ("bankAccount" in payload) {
       setBankAccount(payload.bankAccount || null);
     }
-    if (Array.isArray(payload.purchaseRecords)) {
-      setPurchaseRecords(payload.purchaseRecords);
+    if (Array.isArray(payload.purchaseRecords) || Array.isArray(payload.purchaseBills)) {
+      setPurchaseRecords(mergePurchaseCollections(payload.purchaseRecords, payload.purchaseBills));
     }
     if (Array.isArray(payload.expenseRecords)) {
       setExpenseRecords(payload.expenseRecords);
-    }
-    if (Array.isArray(payload.purchaseBills)) {
-      setPurchaseBills(payload.purchaseBills);
     }
     if (Array.isArray(payload.storeDocuments)) {
       setStoreDocuments(payload.storeDocuments);
@@ -2123,12 +2136,6 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     }
     writeStoredJSON(storageKeys.expenses, expenseRecords);
   }, [expenseRecords, workspaceLoaded]);
-  useEffect(() => {
-    if (!workspaceLoaded) {
-      return;
-    }
-    writeStoredJSON(storageKeys.purchaseBills, purchaseBills);
-  }, [purchaseBills, workspaceLoaded]);
   useEffect(() => {
     if (!workspaceLoaded) {
       return;
@@ -2972,11 +2979,19 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     return { record: newCustomer, usedWalkInCustomer: false };
   }
 
+  function deductSoldInventory(soldItems = []) {
+    const result = applyInventorySaleDeductions(inventoryItems, soldItems);
+    if (result.deductions.length) {
+      setInventoryItems(result.items);
+    }
+    return result;
+  }
+
   function printPOSBill(payload) {
     const printProfile = getPrintProfile(payload.paperSize, payload.printLayout);
     const printPageWidth = printProfile.pageWidth;
     const isInvoicePrint = printProfile.layout === "invoice";
-    const thermalPageHeight = `${getThermalReceiptHeightMm(payload.items?.length || 0, {
+    const thermalPageHeight = `${getThermalReceiptHeightMm(payload.items || [], {
       hasLogo: Boolean(payload.logo),
       hasFooter: Boolean(payload.printFooter),
       hasNotes: Boolean(payload.notes || payload.paymentTerms || payload.terms)
@@ -2987,7 +3002,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     const calibration = normalizePrintCalibration(payload.printCalibration);
     const printPadding = getPrintPadding(printProfile, calibration, isInvoicePrint);
     const printScale = isInvoicePrint ? calibration.scale / 100 : 1;
-    const printScaleFactor = Math.max(70, Math.min(130, Math.round(calibration.scale || 100)));
+    const printScaleFactor = isInvoicePrint ? Math.max(70, Math.min(130, Math.round(calibration.scale || 100))) : 100;
     const printableSummary = calculatePrintPayloadSummary(payload.items, payload.summary);
     const printRows = payload.items.map((item) => `
       <tr>
@@ -3306,6 +3321,8 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         summary: { ...summaryRows },
         items: items.map((item, index) => ({
           serial: index + 1,
+          itemId: item.itemId || item.inventoryItemId || "",
+          inventoryItemId: item.inventoryItemId || item.itemId || "",
           itemName: item.itemName,
           barcode: item.barcode,
           hsn: cleanText(item.hsn || item.hsnSac || item.hsn_sac || item.sac),
@@ -3350,6 +3367,8 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         notes: settings.invoiceNotes || "",
         summary: { ...summaryRows },
         items: printPayload.items.map((item) => ({
+          itemId: item.itemId || item.inventoryItemId || "",
+          inventoryItemId: item.inventoryItemId || item.itemId || "",
           itemName: item.itemName,
           barcode: item.barcode,
           hsn: item.hsn,
@@ -3366,6 +3385,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
           lineTotal: item.lineTotal
         }))
       });
+      const stockResult = deductSoldInventory(items);
       resetActivePOSBill(formId);
       await loadDashboard();
       if (closePOSModal) {
@@ -3374,7 +3394,10 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       if (printAfter) {
         printPOSBill(printPayload);
       }
-      showMessage(unpaidAmount > 0 ? `POS billing completed. Unpaid amount: ${currency(unpaidAmount)}.` : "POS billing completed.");
+      const stockMessage = stockResult.deductions.length
+        ? ` Stock updated for ${stockResult.deductions.length} item(s).`
+        : "";
+      showMessage(`${unpaidAmount > 0 ? `POS billing completed. Unpaid amount: ${currency(unpaidAmount)}.` : "POS billing completed."}${stockMessage}`);
     } catch (error) {
       showMessage(error.message);
     }
@@ -3788,6 +3811,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         summary: summaryRows,
         items: storedLines
       });
+      deductSoldInventory(storedLines);
       await loadDashboard();
       closeModal();
       showMessage(requestedPaidAmount > 0 ? "Standard invoice created and payment recorded." : "Standard invoice created.");
@@ -3819,33 +3843,42 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     showMessage("Saved inventory cleared.");
   }
 
-  function submitPurchase(event) {
+  async function submitPurchase(event) {
     event.preventDefault();
     const form = event.currentTarget;
     const data = Object.fromEntries(new FormData(form).entries());
     const supplier = cleanText(data.supplier);
     const item = cleanText(data.item);
     const amount = Number(data.amount || 0);
+    const file = form.elements.bill_file?.files?.[0];
 
     if (!supplier || !item || amount <= 0) {
       showMessage("Add supplier, item, and a valid amount before saving purchase.");
       return;
     }
 
-    setPurchaseRecords((current) => [{
-      id: String(Date.now()),
-      supplier,
-      item,
-      billNumber: cleanText(data.bill_number),
-      purchaseDate: data.purchase_date || todayISO(),
-      amount,
-      paymentStatus: cleanText(data.payment_status, "Pending"),
-      notes: cleanText(data.notes),
-      createdAt: new Date().toISOString()
-    }, ...current]);
-    form.reset();
-    form.elements.purchase_date.value = todayISO();
-    showMessage("Purchase saved.");
+    try {
+      const fileData = await readFileAsDataURL(file);
+      setPurchaseRecords((current) => [{
+        id: String(Date.now()),
+        supplier,
+        item,
+        billNumber: cleanText(data.bill_number),
+        purchaseDate: data.purchase_date || todayISO(),
+        amount,
+        gstAmount: Math.max(0, Number(data.gst_amount || 0)),
+        paymentStatus: cleanText(data.payment_status, "Pending"),
+        notes: cleanText(data.notes),
+        fileName: file?.name || "",
+        fileData,
+        createdAt: new Date().toISOString()
+      }, ...current]);
+      form.reset();
+      form.elements.purchase_date.value = todayISO();
+      showMessage("Purchase saved.");
+    } catch (error) {
+      showMessage(error.message || "Could not save the purchase.");
+    }
   }
 
   function submitExpense(event) {
@@ -3865,32 +3898,6 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     form.reset();
     form.elements.expense_date.value = todayISO();
     showMessage("Expense saved.");
-  }
-
-  async function submitPurchaseBill(event) {
-    event.preventDefault();
-    const form = event.currentTarget;
-    const data = Object.fromEntries(new FormData(form).entries());
-    const file = form.elements.bill_file.files[0];
-    try {
-      const fileData = await readFileAsDataURL(file);
-      setPurchaseBills((current) => [{
-        id: String(Date.now()),
-        supplier: cleanText(data.supplier),
-        billNumber: cleanText(data.bill_number),
-        billDate: data.bill_date || todayISO(),
-        amount: Number(data.amount || 0),
-        gstAmount: Number(data.gst_amount || 0),
-        fileName: file ? file.name : "",
-        fileData,
-        createdAt: new Date().toISOString()
-      }, ...current]);
-      form.reset();
-      form.elements.bill_date.value = todayISO();
-      showMessage("Purchase bill saved.");
-    } catch (error) {
-      showMessage(error.message || "Could not save the purchase bill.");
-    }
   }
 
   async function submitBank(event) {
@@ -5896,8 +5903,8 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       const nextReorderLevel = Math.max(0, Number(draft.reorder_level || 0));
       const nextMaxStockLevel = Math.max(nextReorderLevel + 1, Number(draft.max_stock_level || 0) || (nextReorderLevel + 1));
       const nextBarcodes = normalizeInventoryBarcodes(barcodeInputs);
-      if (!itemName || !nextBarcodes.length || nextMrp <= 0 || nextInclusivePrice <= 0) {
-        showMessage("Add item name, barcode, MRP, and selling price greater than zero.");
+      if (!itemName || nextMrp <= 0 || nextInclusivePrice <= 0) {
+        showMessage("Add item name, MRP, and selling price greater than zero. Barcode is optional.");
         return;
       }
       if (nextInclusivePrice > nextMrp) {
@@ -5909,7 +5916,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         ...(selectedInventoryItem || {}),
         id: selectedInventoryItem?.id ? String(selectedInventoryItem.id) : String(Date.now()),
         itemName,
-        barcode: nextBarcodes[0],
+        barcode: nextBarcodes[0] || "",
         barcodes: nextBarcodes,
         category: cleanText(draft.category),
         hsn: cleanText(draft.hsn),
@@ -5939,7 +5946,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       const savedBarcodes = getInventoryItemBarcodes(nextItem);
       setBarcodeInputs(savedBarcodes.length ? savedBarcodes : [""]);
       setDraft(buildInventoryDraft(nextItem));
-      showMessage(selectedInventoryItem ? "Inventory item updated." : "Inventory item saved with barcode, stock, pricing, and date details.");
+      showMessage(selectedInventoryItem ? "Inventory item updated." : "Inventory item saved with stock, pricing, and date details.");
     }
     if (!active) {
       return <section id="inventoryView" className="app-view" data-title="Inventory"></section>;
@@ -5972,7 +5979,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                 <div className="barcode-entry-list">
                   {barcodeInputs.map((barcode, index) => (
                     <div className="barcode-entry" key={`barcode-${index}`}>
-                      <label>{index === 0 ? "Barcode" : `Barcode ${index + 1}`}<input name="barcode" type="text" inputMode="numeric" placeholder={index === 0 ? "Scan or enter barcode" : "Additional barcode"} required={index === 0} value={barcode} onChange={(event) => updateBarcodeInput(index, event.target.value)} /></label>
+                      <label>{index === 0 ? "Barcode" : `Barcode ${index + 1}`}<input name="barcode" type="text" inputMode="numeric" placeholder={index === 0 ? "Optional barcode" : "Additional barcode"} value={barcode} onChange={(event) => updateBarcodeInput(index, event.target.value)} /></label>
                       {barcodeInputs.length > 1 ? <button className="button button-secondary barcode-remove-button" type="button" onClick={() => setBarcodeInputs((current) => current.filter((_, barcodeIndex) => barcodeIndex !== index))}>Remove</button> : null}
                     </div>
                   ))}
@@ -6233,7 +6240,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     return (
       <section id="purchaseView" className={`app-view ${active ? "active" : ""}`} data-title="Purchase">
         <section className="panel purchase-entry-panel">
-          <div className="panel-header"><div><h2>Purchase</h2><div className="panel-subtitle">Supplier purchases, inward stock, and payment status.</div></div></div>
+          <div className="panel-header"><div><h2>Purchase</h2><div className="panel-subtitle">Record the supplier purchase and attach its bill in one place.</div></div></div>
           <form id="purchaseForm" className="workspace-form purchase-form" noValidate onSubmit={submitPurchase}>
             <div className="module-grid purchase-grid">
               <label>Supplier<input name="supplier" type="text" placeholder="Supplier name" required /></label>
@@ -6241,33 +6248,36 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
               <label>Bill Number<input name="bill_number" type="text" placeholder="Optional" /></label>
               <label>Purchase Date<input name="purchase_date" type="date" defaultValue={todayISO()} required /></label>
               <label>Amount<input name="amount" type="number" min="0.01" step="0.01" placeholder="0.00" required /></label>
+              <label>GST Amount<input name="gst_amount" type="number" min="0" step="0.01" placeholder="0.00" /></label>
               <label>Payment Status<select name="payment_status"><option>Paid</option><option>Pending</option><option>Partial</option></select></label>
+              <label>Supplier Bill<input name="bill_file" type="file" accept="image/*,.pdf" /></label>
             </div>
             <label className="purchase-notes-field">Notes<input name="notes" type="text" placeholder="Optional" /></label>
             <div className="modal-actions purchase-actions"><button type="submit" className="button button-primary">Save Purchase</button></div>
           </form>
         </section>
         <section className="panel">
-          <div className="panel-header"><div><h2>Purchase Records</h2><div className="panel-subtitle">Recent supplier purchases saved in this workspace.</div></div></div>
-          <div id="purchaseList" className="record-list">{purchaseRecords.length ? purchaseRecords.map((purchase) => <article className="record-card" key={purchase.id}><div className="record-top"><div><h3>{purchase.supplier}</h3><p className="record-meta">{purchase.item} | Bill {purchase.billNumber || "Not added"} | {purchase.purchaseDate}</p></div><strong className="record-amount">{currency(purchase.amount)}</strong></div><div className="record-meta-grid"><span>{purchase.paymentStatus}</span><span>{purchase.notes || "No notes"}</span></div></article>) : <Empty>No purchases saved yet. Supplier purchases will appear here.</Empty>}</div>
-        </section>
-        <section className="panel">
-          <div className="panel-header"><div><h2>Purchase Bills</h2><div className="panel-subtitle">Keep supplier bill copies with amount and GST details.</div></div></div>
-          <form id="purchaseBillForm" className="workspace-form" onSubmit={submitPurchaseBill}>
-            <div className="module-grid">
-              <label>Supplier<input name="supplier" type="text" placeholder="Supplier name" required /></label>
-              <label>Bill Number<input name="bill_number" type="text" placeholder="Bill or invoice number" required /></label>
-              <label>Bill Date<input name="bill_date" type="date" defaultValue={todayISO()} required /></label>
-              <label>Bill Amount<input name="amount" type="number" min="0.01" step="0.01" placeholder="0.00" required /></label>
-              <label>GST Amount<input name="gst_amount" type="number" min="0" step="0.01" placeholder="0.00" /></label>
-              <label>Bill File<input name="bill_file" type="file" accept="image/*,.pdf" /></label>
-            </div>
-            <div className="modal-actions"><button type="submit" className="button button-primary">Save Bill</button></div>
-          </form>
-        </section>
-        <section className="panel">
-          <div className="panel-header"><div><h2>Saved Purchase Bills</h2><div className="panel-subtitle">Supplier bills stored in this device workspace.</div></div></div>
-          <div id="purchaseBillList" className="record-list">{purchaseBills.length ? purchaseBills.map((bill) => <article className="record-card" key={bill.id}><div className="record-top"><div><h3>{bill.supplier}</h3><p className="record-meta">Bill {bill.billNumber} | {bill.billDate}</p></div><strong className="record-amount">{currency(bill.amount)}</strong></div><div className="record-meta-grid"><span>GST {currency(bill.gstAmount)}</span><span>{bill.fileName || "No file attached"}</span></div><div className="record-actions"><FileAction record={bill} label="Download Bill" /></div></article>) : <Empty>No purchase bills stored yet. Upload supplier bill copies here.</Empty>}</div>
+          <div className="panel-header"><div><h2>Purchase Records</h2><div className="panel-subtitle">Every supplier purchase, payment status, GST amount, and attached bill.</div></div></div>
+          <div id="purchaseList" className="record-list">
+            {purchaseRecords.length ? purchaseRecords.map((purchase) => (
+              <article className="record-card" key={purchase.id}>
+                <div className="record-top">
+                  <div>
+                    <h3>{purchase.supplier}</h3>
+                    <p className="record-meta">{purchase.item || "Item not added"} | Bill {purchase.billNumber || "Not added"} | {purchase.purchaseDate || "Date not added"}</p>
+                  </div>
+                  <strong className="record-amount">{currency(purchase.amount)}</strong>
+                </div>
+                <div className="record-meta-grid">
+                  <span>{purchase.paymentStatus || "Status not recorded"}</span>
+                  <span>GST {currency(purchase.gstAmount)}</span>
+                  <span>{purchase.notes || "No notes"}</span>
+                  <span>{purchase.fileName || "No bill attached"}</span>
+                </div>
+                <div className="record-actions"><FileAction record={purchase} label="Download Bill" /></div>
+              </article>
+            )) : <Empty>No purchases saved yet. Supplier purchases will appear here.</Empty>}
+          </div>
         </section>
       </section>
     );
@@ -7008,7 +7018,6 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       ["Inventory", workspaceStats.inventory],
       ["Sell Online", workspaceStats.sellOnline],
       ["Purchases", workspaceStats.purchases],
-      ["Purchase Bills", workspaceStats.purchaseBills],
       ["Expenses", workspaceStats.expenses],
       ["Employees", workspaceStats.employees],
       ["Documents", workspaceStats.documents]
@@ -7328,7 +7337,6 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
           bankAccount,
           purchaseRecords,
           expenseRecords,
-          purchaseBills,
           storeDocuments,
           employees,
           sellOnlineCatalog,
@@ -7365,9 +7373,8 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         setAccount({ ...defaultAccount, ...(snapshot.account || {}) });
         setInventoryItems(Array.isArray(snapshot.inventory) ? snapshot.inventory : []);
         setBankAccount(snapshot.bankAccount ?? null);
-        setPurchaseRecords(Array.isArray(snapshot.purchaseRecords) ? snapshot.purchaseRecords : []);
+        setPurchaseRecords(mergePurchaseCollections(snapshot.purchaseRecords, snapshot.purchaseBills));
         setExpenseRecords(Array.isArray(snapshot.expenseRecords) ? snapshot.expenseRecords : []);
-        setPurchaseBills(Array.isArray(snapshot.purchaseBills) ? snapshot.purchaseBills : []);
         setStoreDocuments(Array.isArray(snapshot.storeDocuments) ? snapshot.storeDocuments : []);
         setEmployees(Array.isArray(snapshot.employees) ? snapshot.employees : []);
         setSellOnlineCatalog(snapshot.sellOnlineCatalog && typeof snapshot.sellOnlineCatalog === "object" ? snapshot.sellOnlineCatalog : {});
@@ -7393,7 +7400,6 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       setBankAccount(null);
       setPurchaseRecords([]);
       setExpenseRecords([]);
-      setPurchaseBills([]);
       setStoreDocuments([]);
       setEmployees([]);
       setPosState(makeInitialPOSState());

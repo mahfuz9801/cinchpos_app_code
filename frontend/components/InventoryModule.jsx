@@ -81,16 +81,23 @@ export default function InventoryModule({ showMessage }) {
 
   function handleSubmit(event) {
     event.preventDefault();
+    const itemName = form.item_name.trim();
+    const nextMrp = Number(form.mrp || 0);
+    const nextInclusivePrice = Number(form.inclusive_price || 0);
     const barcodes = normalizeInventoryBarcodes(form.barcode);
-    if (!barcodes.length) {
-      showMessage("Add at least one barcode.");
+    if (!itemName || nextMrp <= 0 || nextInclusivePrice <= 0) {
+      showMessage("Add item name, MRP, and selling price greater than zero. Barcode is optional.");
+      return;
+    }
+    if (nextInclusivePrice > nextMrp) {
+      showMessage("Selling price should not be higher than MRP.");
       return;
     }
 
     const nextItem = {
       id: `${Date.now()}`,
-      itemName: form.item_name.trim(),
-      barcode: barcodes[0],
+      itemName,
+      barcode: barcodes[0] || "",
       barcodes,
       category: form.category.trim(),
       hsn: form.hsn.trim(),
@@ -98,8 +105,8 @@ export default function InventoryModule({ showMessage }) {
       expiryDate: form.expiry_date || "",
       stock: Number(form.stock || 0),
       unit: form.unit,
-      mrp: Number(form.mrp || 0),
-      inclusivePrice: Number(form.inclusive_price || 0),
+      mrp: nextMrp,
+      inclusivePrice: nextInclusivePrice,
       gstRate: Number(form.gst_rate || 0),
       discountPercent,
       taxableValue: gst.taxableValue,
@@ -153,7 +160,7 @@ export default function InventoryModule({ showMessage }) {
                 <div className="barcode-entry barcode-entry-single">
                   <label>
                     Barcodes
-                    <input name="barcode" type="text" inputMode="numeric" placeholder="Separate multiple barcodes with space" required value={form.barcode} onChange={(event) => updateField("barcode", event.target.value)} />
+                    <input name="barcode" type="text" inputMode="numeric" placeholder="Optional. Separate multiple barcodes with space" value={form.barcode} onChange={(event) => updateField("barcode", event.target.value)} />
                   </label>
                 </div>
               </div>

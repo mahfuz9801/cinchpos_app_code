@@ -247,7 +247,7 @@ async function getMeasuredThermalPageSize(printWindow, fallbackPageSize = {}) {
   try {
     const measurement = await printWindow.webContents.executeJavaScript(`
       (() => {
-        const target = document.querySelector(".print-content") || document.body || document.documentElement;
+        const target = document.querySelector(".thermal-receipt") || document.querySelector(".print-content") || document.body || document.documentElement;
         const body = document.body || target;
         const html = document.documentElement || target;
         const width = Math.max(target.scrollWidth || 0, body.scrollWidth || 0, html.scrollWidth || 0, target.getBoundingClientRect().width || 0);
@@ -259,7 +259,7 @@ async function getMeasuredThermalPageSize(printWindow, fallbackPageSize = {}) {
     const widthMicrons = clampPrintMicrons(fallbackWidth, 50000, 82000);
     const measuredHeight = Number(measurement && measurement.height ? measurement.height : 0);
     const heightMicrons = clampPrintMicrons(
-      (measuredHeight / CSS_PX_PER_INCH) * MICRONS_PER_INCH + 7000,
+      (measuredHeight / CSS_PX_PER_INCH) * MICRONS_PER_INCH + 15000,
       120000,
       12000000
     );
@@ -833,7 +833,7 @@ function registerPrintBridge() {
         silent: false,
         printBackground: true,
         margins: { marginType: "none" },
-        scaleFactor: clampPrintMicrons(payload.scaleFactor || 100, 70, 130)
+        scaleFactor: payload.isThermal ? 100 : clampPrintMicrons(payload.scaleFactor || 100, 70, 130)
       };
       if (payload.isThermal && payload.pageSize && typeof payload.pageSize === "object") {
         printOptions.pageSize = await getMeasuredThermalPageSize(printWindow, payload.pageSize);

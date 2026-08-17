@@ -2816,13 +2816,7 @@ body[data-appearance="dark"] .inventory-smart-button strong {
 }
 
 .purchase-grid {
-    grid-template-columns:
-        minmax(116px, 1fr)
-        minmax(116px, 1fr)
-        minmax(108px, 0.86fr)
-        minmax(126px, 0.9fr)
-        minmax(108px, 0.82fr)
-        minmax(124px, 0.92fr);
+    grid-template-columns: repeat(4, minmax(140px, 1fr));
     gap: 7px;
 }
 
@@ -4743,14 +4737,8 @@ textarea {
     }
 
     #purchaseView .purchase-grid {
-        grid-template-columns:
-            minmax(116px, 1fr)
-            minmax(116px, 1fr)
-            minmax(108px, 0.86fr)
-            minmax(126px, 0.9fr)
-            minmax(108px, 0.82fr)
-            minmax(124px, 0.92fr);
-        min-width: 760px;
+        grid-template-columns: repeat(4, minmax(140px, 1fr));
+        min-width: 720px;
     }
 
     #expensesView .module-grid {
