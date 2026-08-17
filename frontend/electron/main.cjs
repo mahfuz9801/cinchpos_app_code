@@ -7,6 +7,7 @@ const net = require("net");
 const os = require("os");
 const path = require("path");
 const { pathToFileURL } = require("url");
+const { getThermalPrintGeometry } = require("./thermal-print.cjs");
 
 let autoUpdater = null;
 try {
@@ -77,8 +78,6 @@ const RETRYABLE_WINDOW_ERROR_CODES = new Set([-102, -105, -106, -118, -300]);
 const BACKEND_DATA_DIR_NAME = "backend-data";
 const SECURE_STORAGE_DIR_NAME = "secure-storage";
 const PRINT_JOBS_DIR_NAME = "print-jobs";
-const CSS_PX_PER_INCH = 96;
-const MICRONS_PER_INCH = 25400;
 
 app.setName(APP_NAME);
 if (process.platform === "win32") {
@@ -242,31 +241,37 @@ function clampPrintMicrons(value, min, max) {
 
 async function getMeasuredThermalPageSize(printWindow, fallbackPageSize = {}) {
   if (!printWindow || printWindow.isDestroyed()) {
-    return fallbackPageSize;
+    return getThermalPrintGeometry({}, fallbackPageSize).pageSize;
   }
   try {
     const measurement = await printWindow.webContents.executeJavaScript(`
       (() => {
-        const target = document.querySelector(".thermal-receipt") || document.querySelector(".print-content") || document.body || document.documentElement;
-        const body = document.body || target;
-        const html = document.documentElement || target;
-        const width = Math.max(target.scrollWidth || 0, body.scrollWidth || 0, html.scrollWidth || 0, target.getBoundingClientRect().width || 0);
-        const height = Math.max(target.scrollHeight || 0, body.scrollHeight || 0, html.scrollHeight || 0, target.getBoundingClientRect().height || 0);
-        return { width, height };
+        const target = document.querySelector(".thermal-receipt") || document.querySelector(".print-content");
+        if (!target) {
+          return { width: 0, height: 0 };
+        }
+        const rect = target.getBoundingClientRect();
+        const bodyStyle = document.body ? getComputedStyle(document.body) : null;
+        const verticalPadding =
+          Number.parseFloat(bodyStyle?.paddingTop || "0") +
+          Number.parseFloat(bodyStyle?.paddingBottom || "0");
+        return {
+          width: Math.max(target.scrollWidth || 0, rect.width || 0),
+          height: Math.max(target.scrollHeight || 0, rect.height || 0) + verticalPadding
+        };
       })()
     `);
-    const fallbackWidth = Number(fallbackPageSize.width || 80000);
-    const widthMicrons = clampPrintMicrons(fallbackWidth, 50000, 82000);
-    const measuredHeight = Number(measurement && measurement.height ? measurement.height : 0);
-    const heightMicrons = clampPrintMicrons(
-      (measuredHeight / CSS_PX_PER_INCH) * MICRONS_PER_INCH + 15000,
-      120000,
-      12000000
-    );
-    return { width: widthMicrons, height: heightMicrons };
+    const geometry = getThermalPrintGeometry(measurement, fallbackPageSize);
+    if (geometry.paginated) {
+      console.info(
+        `CinchPOS thermal receipt uses ${geometry.estimatedPageCount} fixed-scale print segments ` +
+        `(${Math.round(geometry.contentHeightMicrons / 1000)}mm content).`
+      );
+    }
+    return geometry.pageSize;
   } catch (error) {
     console.warn(`CinchPOS thermal print measurement failed: ${error.message || error}`);
-    return fallbackPageSize;
+    return getThermalPrintGeometry({}, fallbackPageSize).pageSize;
   }
 }
 

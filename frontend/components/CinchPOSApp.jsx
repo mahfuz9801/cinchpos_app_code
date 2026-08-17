@@ -73,6 +73,11 @@ import {
   storageKeys
 } from "@/lib/cinchpos/constants";
 import {
+  buildGstr1Workbook,
+  makeGstr1ReportFileName,
+  writeGstr1Workbook
+} from "@/lib/cinchpos/gstr1Report";
+import {
   accountFromAuthState,
   clearAccountAuthSession,
   clearOfflineAuthSession,
@@ -381,6 +386,8 @@ const PRINT_PAPER_PROFILES = {
   Letter: { label: "Letter Standard Bill", pageWidth: "216mm", pageSize: "letter", margin: "10mm", layout: "invoice" }
 };
 
+const MAX_THERMAL_PAGE_HEIGHT_MM = 280;
+
 const THERMAL_RECEIPT_CSS = `
   .thermal-receipt { display: block; width: 100%; max-width: none; overflow: visible; color: #000; background: #fff; font-family: Arial, Helvetica, sans-serif; font-weight: 700; letter-spacing: 0; -webkit-print-color-adjust: exact; print-color-adjust: exact; break-inside: auto; page-break-inside: auto; font-variant-numeric: tabular-nums; }
   .thermal-receipt * { box-sizing: border-box; color: #000; }
@@ -455,7 +462,7 @@ function getThermalReceiptHeightMm(itemsOrCount = 0, { hasLogo = false, hasFoote
     }, 0)
     : itemCount * 18;
   const estimatedHeight = 128 + itemHeight + (hasLogo ? 16 : 0) + (hasNotes ? 42 : 0) + (hasFooter ? 22 : 0);
-  return Math.max(180, Math.min(12000, estimatedHeight));
+  return Math.max(180, Math.min(MAX_THERMAL_PAGE_HEIGHT_MM, estimatedHeight));
 }
 
 function getElectronPrintPageSize(profile, payload = {}) {
@@ -1229,7 +1236,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     endDate: "",
     status: "all",
     content: "full",
-    format: "csv"
+    format: "xlsx"
   });
   const [inventorySearch, setInventorySearch] = useState("");
   const [inventorySort, setInventorySort] = useState("nameAsc");
@@ -2991,12 +2998,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     const printProfile = getPrintProfile(payload.paperSize, payload.printLayout);
     const printPageWidth = printProfile.pageWidth;
     const isInvoicePrint = printProfile.layout === "invoice";
-    const thermalPageHeight = `${getThermalReceiptHeightMm(payload.items || [], {
-      hasLogo: Boolean(payload.logo),
-      hasFooter: Boolean(payload.printFooter),
-      hasNotes: Boolean(payload.notes || payload.paymentTerms || payload.terms)
-    })}mm`;
-    const printPageSize = printProfile.pageSize || `${printPageWidth} ${thermalPageHeight}`;
+    const printPageSize = printProfile.pageSize || "auto";
     const printMargin = payload.printMargin === "none" ? "0" : printProfile.margin;
     const printClass = isInvoicePrint ? "invoice-print" : "thermal-print";
     const calibration = normalizePrintCalibration(payload.printCalibration);
@@ -3082,7 +3084,9 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         <title>${safeInvoiceNumber}</title>
         <style>
           * { box-sizing: border-box; }
-          @page { size: ${printPageSize}; margin: ${isInvoicePrint ? printMargin : "0"}; }
+          ${isInvoicePrint
+            ? `@page { size: ${printPageSize}; margin: ${printMargin}; }`
+            : "@page { margin: 0; }"}
           html, body { width: ${printPageWidth}; min-height: 0; overflow: visible; }
           body { margin: 0; padding: ${printPadding}; color: #111; font-family: Arial, sans-serif; font-size: ${isInvoicePrint ? "12px" : "10.2px"}; line-height: 1.22; }
           .print-content { transform: ${isInvoicePrint ? `scale(${printScale})` : "none"}; transform-origin: top left; width: ${isInvoicePrint && printScale ? `${100 / printScale}%` : "100%"}; break-inside: auto; page-break-inside: auto; }
@@ -6319,7 +6323,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     const reportEndDate = cleanText(salesReportFilters.endDate);
     const reportStatus = cleanText(salesReportFilters.status, "all").toLowerCase();
     const reportContent = cleanText(salesReportFilters.content, "full");
-    const reportFormat = cleanText(salesReportFilters.format, "csv").toLowerCase();
+    const reportFormat = cleanText(salesReportFilters.format, "xlsx").toLowerCase();
     const invoiceDateISO = (invoice) => cleanText(invoice.issued_on || invoice.issuedOn || invoice.date).slice(0, 10);
     const customReportInvoices = allInvoices.filter((invoice) => {
       const invoiceDate = invoiceDateISO(invoice);
@@ -6364,6 +6368,39 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         stockValue: Number(inventoryStockValue || 0).toFixed(2),
         ...customReportSummary
       };
+      if (reportFormat === "xlsx") {
+        const workbook = buildGstr1Workbook({
+          businessName,
+          businessPhone: settings.businessPhone,
+          businessGstin: settings.gstin,
+          businessAddress: settings.businessAddress,
+          businessStateCode: settings.businessStateCode,
+          businessStateName: settings.businessState,
+          startDate: reportStartDate,
+          endDate: reportEndDate,
+          records: customReportInvoices.map((invoice) => ({
+            invoice,
+            detail: getInvoiceDetail(invoice)
+          }))
+        });
+        const blob = new Blob([writeGstr1Workbook(workbook)], {
+          type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        });
+        const url = window.URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = makeGstr1ReportFileName({
+          businessName,
+          startDate: reportStartDate,
+          endDate: reportEndDate
+        });
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        window.setTimeout(() => window.URL.revokeObjectURL(url), 800);
+        showMessage("GSTR-1 Excel report downloaded.");
+        return;
+      }
       if (reportFormat === "json") {
         const blob = new Blob([JSON.stringify({
           title: "CinchPOS Custom Sales Report",
@@ -6453,8 +6490,8 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
             <label>From<input type="date" value={salesReportFilters.startDate} onChange={(event) => setSalesReportFilters((current) => ({ ...current, startDate: event.target.value }))} /></label>
             <label>To<input type="date" value={salesReportFilters.endDate} onChange={(event) => setSalesReportFilters((current) => ({ ...current, endDate: event.target.value }))} /></label>
             <label>Status<select value={salesReportFilters.status} onChange={(event) => setSalesReportFilters((current) => ({ ...current, status: event.target.value }))}><option value="all">All</option><option value="paid">Paid</option><option value="unpaid">Unpaid</option><option value="overdue">Overdue</option></select></label>
-            <label>Content<select value={salesReportFilters.content} onChange={(event) => setSalesReportFilters((current) => ({ ...current, content: event.target.value }))}><option value="full">Summary + Invoices</option><option value="summary">Summary only</option></select></label>
-            <label>Format<select value={salesReportFilters.format} onChange={(event) => setSalesReportFilters((current) => ({ ...current, format: event.target.value }))}><option value="csv">CSV</option><option value="json">JSON</option></select></label>
+            <label>Content<select value={salesReportFilters.content} disabled={reportFormat === "xlsx"} onChange={(event) => setSalesReportFilters((current) => ({ ...current, content: event.target.value }))}><option value="full">{reportFormat === "xlsx" ? "Complete GSTR-1" : "Summary + Invoices"}</option><option value="summary">Summary only</option></select></label>
+            <label>Format<select value={salesReportFilters.format} onChange={(event) => setSalesReportFilters((current) => ({ ...current, format: event.target.value, ...(event.target.value === "xlsx" ? { content: "full" } : {}) }))}><option value="xlsx">GSTR-1 Excel (.xlsx)</option><option value="csv">CSV Summary</option><option value="json">JSON Data</option></select></label>
           </section>
 	          <div className="sales-report-grid">
 	            <article className="sales-report-card">
