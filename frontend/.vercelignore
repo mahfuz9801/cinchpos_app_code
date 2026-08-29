@@ -1,0 +1,13 @@
+.DS_Store
+.env
+.env.*
+.next
+.vercel
+build
+dist
+node_modules
+out
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
