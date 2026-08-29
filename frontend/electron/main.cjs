@@ -946,12 +946,30 @@ function getAppIconPath() {
   return path.join(getFrontendDir(), "build", iconName);
 }
 
+function getLoadingIconUrl() {
+  const candidates = [
+    getAppIconPath(),
+    path.join(getFrontendDir(), "public", "brand", "cinchpos-logo.png")
+  ];
+  const iconPath = candidates.find((candidate) => candidate && fs.existsSync(candidate));
+  if (!iconPath) {
+    return "";
+  }
+  try {
+    const extension = path.extname(iconPath).toLowerCase();
+    const mime = extension === ".ico" ? "image/x-icon" : "image/png";
+    return `data:${mime};base64,${fs.readFileSync(iconPath).toString("base64")}`;
+  } catch {
+    return pathToFileURL(iconPath).href;
+  }
+}
+
 function getDockIconPath() {
   return path.join(getFrontendDir(), "build", "icon.png");
 }
 
 function getLoadingScreenUrl() {
-  const appIconUrl = pathToFileURL(getAppIconPath()).href;
+  const appIconUrl = getLoadingIconUrl();
   const loadingMarkup = `<!DOCTYPE html>
 <html lang="en">
   <head>

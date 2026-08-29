@@ -1553,6 +1553,7 @@ def init_db():
     ensure_column("customers", "email", "TEXT DEFAULT ''")
     ensure_column("customers", "address", "TEXT DEFAULT ''")
     ensure_column("customers", "phone", "TEXT DEFAULT ''")
+    ensure_column("customers", "business_name", "TEXT DEFAULT ''")
     ensure_column("customers", "business_id", f"TEXT DEFAULT '{DEFAULT_BUSINESS_ID}'")
     ensure_column("invoices", "total_paid", "REAL DEFAULT 0")
     ensure_column("invoices", "status", "TEXT DEFAULT 'Pending'")
@@ -1609,6 +1610,8 @@ def serialize_customer(row):
         "email": row["email"] or "",
         "address": row["address"] or "",
         "phone": row["phone"] or "",
+        "businessName": row["business_name"] or "",
+        "business_name": row["business_name"] or "",
         "created_at": row["created_at"],
     }
 
@@ -3403,7 +3406,7 @@ def list_customers():
     with closing(get_connection()) as conn:
         rows = conn.execute(
             """
-            SELECT id, name, email, address, phone, created_at
+            SELECT id, name, email, address, phone, business_name, created_at
             FROM customers
             WHERE business_id = ?
             ORDER BY name ASC
@@ -3421,6 +3424,7 @@ def add_customer():
     email = (data.get("email") or "").strip()
     address = (data.get("address") or "").strip()
     phone = (data.get("phone") or "").strip()
+    business_name = (data.get("businessName") or data.get("business_name") or "").strip()
 
     if not name:
         return jsonify({"error": "Customer name is required."}), 400
@@ -3428,14 +3432,14 @@ def add_customer():
     with closing(get_connection()) as conn:
         cursor = conn.execute(
             """
-            INSERT INTO customers (name, email, address, phone, business_id)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO customers (name, email, address, phone, business_name, business_id)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (name, email, address, phone, current_business_id()),
+            (name, email, address, phone, business_name, current_business_id()),
         )
         conn.commit()
         customer = conn.execute(
-            "SELECT id, name, email, address, phone, created_at FROM customers WHERE id = ?",
+            "SELECT id, name, email, address, phone, business_name, created_at FROM customers WHERE id = ?",
             (cursor.lastrowid,),
         ).fetchone()
     return jsonify(serialize_customer(customer)), 201
@@ -3449,6 +3453,7 @@ def update_customer(customer_id):
     email = (data.get("email") or "").strip()
     address = (data.get("address") or "").strip()
     phone = (data.get("phone") or "").strip()
+    business_name = (data.get("businessName") or data.get("business_name") or "").strip()
 
     if not name:
         return jsonify({"error": "Customer name is required."}), 400
@@ -3464,15 +3469,15 @@ def update_customer(customer_id):
         conn.execute(
             """
             UPDATE customers
-            SET name = ?, email = ?, address = ?, phone = ?
+            SET name = ?, email = ?, address = ?, phone = ?, business_name = ?
             WHERE id = ? AND business_id = ?
             """,
-            (name, email, address, phone, customer_id, current_business_id()),
+            (name, email, address, phone, business_name, customer_id, current_business_id()),
         )
         conn.commit()
         customer = conn.execute(
             """
-            SELECT id, name, email, address, phone, created_at
+            SELECT id, name, email, address, phone, business_name, created_at
             FROM customers
             WHERE id = ? AND business_id = ?
             """,

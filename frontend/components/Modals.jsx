@@ -54,6 +54,10 @@ function CustomerModal({ open, onClose, onRefresh, showMessage }) {
           Customer Name
           <input name="name" type="text" placeholder="Northwind Labs" required />
         </label>
+        <label>
+          Business Name
+          <input name="businessName" type="text" placeholder="Optional business name" />
+        </label>
         <div className="form-grid">
           <label>
             Email

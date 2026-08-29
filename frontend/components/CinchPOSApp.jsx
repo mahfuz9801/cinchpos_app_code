@@ -159,6 +159,7 @@ function buildPOSCustomerFromRecord(customer) {
   return {
     customerId: customer.id ? String(customer.id) : "",
     name: cleanText(customer.name),
+    businessName: getCustomerBusinessName(customer),
     phone: normalizePhone(customer.phone).slice(-10),
     email: cleanText(customer.email),
     address: cleanText(customer.address)
@@ -387,6 +388,65 @@ const PRINT_PAPER_PROFILES = {
 };
 
 const MAX_THERMAL_PAGE_HEIGHT_MM = 280;
+
+const GST_INVOICE_PRINT_CSS = `
+  * { box-sizing: border-box; }
+  @page { size: A4; margin: 10mm; }
+  body { margin: 0; background: #ffffff; color: #000000; font-family: Arial, Helvetica, sans-serif; font-size: 10.5px; line-height: 1.22; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  .gst-invoice-page { width: 100%; max-width: 190mm; margin: 0 auto; border: 1.4px solid #111111; background: #ffffff; color: #000000; }
+  .gst-invoice-page h1, .gst-invoice-page h2, .gst-invoice-page h3, .gst-invoice-page p { margin: 0; }
+  .gst-business-head { padding: 8px 10px 7px; border-bottom: 1.4px solid #111111; }
+  .gst-brand { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 10px; align-items: center; }
+  .gst-logo { width: 46px; height: 46px; object-fit: contain; }
+  .gst-brand h1 { font-size: 20px; line-height: 1.05; font-weight: 800; }
+  .gst-brand p { margin-top: 2px; overflow-wrap: anywhere; }
+  .gst-header-line { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 2px; }
+  .gst-title-row { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); align-items: center; gap: 8px; padding: 4px 8px; border-bottom: 1.4px solid #111111; }
+  .gst-title-row strong { display: grid; gap: 1px; }
+  .gst-title-row h2 { font-size: 19px; line-height: 1; text-align: center; }
+  .gst-title-row strong:last-child { text-align: right; font-size: 9px; }
+  .gst-meta-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(250px, 0.75fr); border-bottom: 1.4px solid #111111; }
+  .gst-box { min-height: 82px; padding: 6px 8px; border-right: 1.4px solid #111111; }
+  .gst-box:last-child { border-right: 0; }
+  .gst-invoice-meta { display: grid; gap: 3px; align-content: start; }
+  .gst-invoice-meta p, .gst-summary-box p { display: flex; justify-content: space-between; gap: 10px; }
+  .gst-items-table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+  .gst-items-table th, .gst-items-table td { padding: 4px 5px; border-right: 1px solid #111111; border-bottom: 1px solid #111111; vertical-align: top; }
+  .gst-items-table th:last-child, .gst-items-table td:last-child { border-right: 0; }
+  .gst-items-table th { text-align: center; font-size: 9px; font-weight: 800; }
+  .gst-items-table td span { display: block; margin-top: 1px; font-size: 8.5px; }
+  .gst-items-table th:nth-child(1) { width: 7%; }
+  .gst-items-table th:nth-child(2) { width: 28%; }
+  .gst-items-table th:nth-child(3) { width: 10%; }
+  .gst-items-table th:nth-child(4) { width: 10%; }
+  .gst-items-table th:nth-child(5), .gst-items-table th:nth-child(6), .gst-items-table th:nth-child(8), .gst-items-table th:nth-child(9) { width: 11%; }
+  .gst-items-table th:nth-child(7) { width: 8%; }
+  .gst-total-row td { border-bottom: 1.4px solid #111111; font-weight: 800; }
+  .center { text-align: center; }
+  .numeric { text-align: right; }
+  .gst-bottom-grid { display: grid; grid-template-columns: minmax(0, 1.25fr) 98px minmax(220px, 0.8fr); min-height: 146px; border-bottom: 1.4px solid #111111; }
+  .gst-words, .gst-pay-box, .gst-summary-box { padding: 6px 8px; border-right: 1.4px solid #111111; }
+  .gst-summary-box { border-right: 0; }
+  .gst-tax-words { display: block; margin-top: 4px; }
+  .gst-tax-summary { margin-top: 8px; }
+  .gst-tax-summary table { width: 100%; margin-top: 4px; border-collapse: collapse; table-layout: fixed; }
+  .gst-tax-summary th, .gst-tax-summary td { padding: 3px 4px; border: 1px solid #111111; font-size: 8.8px; vertical-align: top; }
+  .gst-tax-summary th { text-align: center; font-weight: 800; }
+  .gst-terms { margin-top: 8px; padding-top: 6px; border-top: 1px solid #111111; }
+  .gst-terms p { margin-top: 3px; overflow-wrap: anywhere; }
+  .gst-sign-box { min-height: 44px; margin-top: 10px; padding-top: 5px; border-top: 1px solid #111111; }
+  .gst-customer-signature { display: grid; align-content: end; }
+  .gst-pay-box { display: grid; justify-items: center; align-content: center; gap: 6px; text-align: center; }
+  .gst-qr-placeholder { display: grid; place-items: center; width: 64px; height: 64px; border: 2px solid #111111; font-size: 14px; font-weight: 900; }
+  .gst-summary-box { display: grid; align-content: start; gap: 4px; }
+  .gst-grand { margin-top: 2px; padding-top: 4px; border-top: 1.4px solid #111111; font-size: 12px; }
+  .gst-authorised { display: grid; justify-items: center; align-content: end; gap: 4px; min-height: 78px; margin-top: 8px; padding-top: 6px; border-top: 1px solid #111111; text-align: center; }
+  .gst-authorised span { font-size: 8.5px; }
+  .gst-signature-images { display: flex; justify-content: center; align-items: end; gap: 6px; min-height: 32px; }
+  .gst-authorised img { max-width: 92px; max-height: 36px; object-fit: contain; }
+  .gst-footer { display: flex; justify-content: space-between; gap: 10px; padding: 5px 8px; font-size: 10px; }
+  @media print { body { background: #ffffff; } .gst-invoice-page { max-width: none; margin: 0; } }
+`;
 
 const THERMAL_RECEIPT_CSS = `
   .thermal-receipt { display: block; width: 100%; max-width: none; overflow: visible; color: #000; background: #fff; font-family: Arial, Helvetica, sans-serif; font-weight: 700; letter-spacing: 0; -webkit-print-color-adjust: exact; print-color-adjust: exact; break-inside: auto; page-break-inside: auto; font-variant-numeric: tabular-nums; }
@@ -800,9 +860,9 @@ function getCalibrationForSettings(settingsLike = {}) {
 
 function buildSamplePrintPayload(settingsLike, businessName, ownerName, logo = "") {
   const sampleItems = [
-    { serial: 1, itemName: "Samsung A30", barcode: "1234", description: "Samsung phone", batch: "A30-001", unit: "Pcs", quantity: 1, mrp: 12000, inclusivePrice: 10620, discountPercent: 11.5, taxableValue: 9000, gstRate: 18, gstAmount: 1620, lineTotal: 10620 },
-    { serial: 2, itemName: "Parle-G 200g", barcode: "40511209", description: "Best biscuit", batch: "PG-200", unit: "Box", quantity: 1, mrp: 400, inclusivePrice: 306, discountPercent: 23.5, taxableValue: 291.43, gstRate: 5, gstAmount: 14.57, lineTotal: 306 },
-    { serial: 3, itemName: "Puma Blue Round Neck T-Shirt", barcode: "2032", description: "Round neck T-shirt", batch: "PUMA-032", unit: "Pcs", quantity: 2, mrp: 1200, inclusivePrice: 945, discountPercent: 21.25, taxableValue: 900, gstRate: 5, gstAmount: 45, lineTotal: 1890 }
+    { serial: 1, itemName: "Samsung A30", barcode: "1234", hsn: "8517", description: "Samsung phone", batch: "A30-001", unit: "Pcs", quantity: 1, mrp: 12000, inclusivePrice: 10620, discountPercent: 11.5, taxableValue: 9000, gstRate: 18, gstAmount: 1620, lineTotal: 10620 },
+    { serial: 2, itemName: "Parle-G 200g", barcode: "40511209", hsn: "1905", description: "Best biscuit", batch: "PG-200", unit: "Box", quantity: 1, mrp: 400, inclusivePrice: 306, discountPercent: 23.5, taxableValue: 291.43, gstRate: 5, gstAmount: 14.57, lineTotal: 306 },
+    { serial: 3, itemName: "Puma Blue Round Neck T-Shirt", barcode: "2032", hsn: "6109", description: "Round neck T-shirt", batch: "PUMA-032", unit: "Pcs", quantity: 2, mrp: 1200, inclusivePrice: 945, discountPercent: 21.25, taxableValue: 900, gstRate: 5, gstAmount: 45, lineTotal: 1890 }
   ];
   const summary = calculatePrintPayloadSummary(sampleItems);
   return {
@@ -811,6 +871,9 @@ function buildSamplePrintPayload(settingsLike, businessName, ownerName, logo = "
     businessPhone: settingsLike.businessPhone || "+91 90389 56555",
     businessEmail: settingsLike.businessEmail || "store@example.com",
     businessAddress: settingsLike.businessAddress || "73/S/6, Rajkumar Mukherjee Road, Kolkata",
+    businessPan: settingsLike.businessPan || "ABCDE1234F",
+    businessState: settingsLike.businessState || "West Bengal",
+    businessStateCode: settingsLike.businessStateCode || "19",
     gstin: settingsLike.gstin || "GSTIN SAMPLE",
     receiptSettings: buildReceiptSettings(settingsLike),
     cashierName: settingsLike.printCashierName || defaultSettings.printCashierName,
@@ -830,7 +893,8 @@ function buildSamplePrintPayload(settingsLike, businessName, ownerName, logo = "
     customerEmail: "preview@example.com",
     customerAddress: "No F2, Outer Circle, Connaught Circus, New Delhi, Delhi, 110001",
     customerGstin: "07ABCCH2702H4ZZ",
-    placeOfSupply: "Karnataka",
+    placeOfSupply: settingsLike.businessState || "West Bengal",
+    placeOfSupplyCode: settingsLike.businessStateCode || "19",
     shippingDetails: "Sample Shipping Company, Plot No. 123, Industrial Area, Andheri East, Mumbai, Maharashtra, 400001",
     paymentMethod: "Cash",
     paymentType: "Full Payment",
@@ -867,10 +931,11 @@ function makeInvoiceBuilderLine(overrides = {}) {
     itemId: overrides.itemId || "",
     itemName: overrides.itemName || "",
     barcode: overrides.barcode || "",
-    quantity: overrides.quantity ?? 1,
-    mrp: overrides.mrp ?? 0,
-    inclusivePrice: overrides.inclusivePrice ?? 0,
-    discountPercent: overrides.discountPercent ?? 0,
+    hsn: overrides.hsn ?? "",
+    quantity: overrides.quantity ?? "",
+    mrp: overrides.mrp ?? "",
+    inclusivePrice: overrides.inclusivePrice ?? "",
+    discountPercent: overrides.discountPercent ?? "",
     gstRate: overrides.gstRate ?? 18
   };
 }
@@ -884,6 +949,8 @@ function makeInvoiceBuilderDraft(overrides = {}) {
     customerPhone: "",
     customerEmail: "",
     customerAddress: "",
+    customerBusinessName: "",
+    placeOfSupply: "",
     invoiceNumber: "",
     issuedOn: todayISO(),
     dueOn: todayISO(),
@@ -904,6 +971,10 @@ function makeInvoiceBuilderDraft(overrides = {}) {
   };
 }
 
+function getCustomerBusinessName(customer = {}) {
+  return cleanText(customer.businessName || customer.business_name || customer.companyName || customer.company_name || customer.firmName || customer.firm_name);
+}
+
 function buildInvoiceBuilderLineFromInventory(item = {}) {
   const inclusivePrice = Number(item.inclusivePrice || item.inclusive_price || item.price || 0);
   const mrp = Number(item.mrp || inclusivePrice || 0);
@@ -912,6 +983,7 @@ function buildInvoiceBuilderLineFromInventory(item = {}) {
     itemId: cleanText(item.id),
     itemName: getInventoryItemName(item),
     barcode: barcodes[0] || "",
+    hsn: cleanText(item.hsn || item.hsnSac || item.hsn_sac || item.sac),
     quantity: 1,
     mrp,
     inclusivePrice,
@@ -1009,115 +1081,284 @@ function csvRow(values = []) {
   return values.map(csvCell).join(",");
 }
 
-function buildInvoiceDownloadHTML(payload, detail = {}) {
-  const summary = calculatePrintPayloadSummary(payload.items, payload.summary);
-  const rows = (payload.items || []).map((item) => `
-    <tr>
-      <td>${item.serial}</td>
-      <td class="item-cell"><strong>${escapeHTML(item.itemName)}</strong><span>HSN ${escapeHTML(cleanText(item.hsn || item.hsnSac || item.hsn_sac || item.sac, "Not added"))}</span>${item.barcode ? `<span>Barcode ${escapeHTML(item.barcode)}</span>` : ""}</td>
-      <td class="numeric">${currency(item.mrp)}<span>Disc ${Number(item.discountPercent || 0).toFixed(2)}%</span></td>
-      <td class="numeric">${item.quantity}</td>
-      <td class="numeric">${currency(item.inclusivePrice)}</td>
-      <td class="numeric">${currency(item.taxableValue)}<span>Tax ${Number(item.gstRate || 0)}%</span></td>
-      <td class="numeric"><strong>${currency(item.lineTotal)}</strong></td>
-    </tr>
-  `).join("");
-  const logoMarkup = payload.logo ? `<img class="invoice-logo" src="${payload.logo}" alt="Store logo">` : "";
-  const businessContact = [payload.businessPhone, payload.businessEmail].filter(Boolean).map((value) => escapeHTML(value)).join(" | ");
+function integerToIndianWords(value = 0) {
+  const amount = Math.floor(Math.max(0, Number(value || 0)));
+  const ones = ["", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine", "Ten", "Eleven", "Twelve", "Thirteen", "Fourteen", "Fifteen", "Sixteen", "Seventeen", "Eighteen", "Nineteen"];
+  const tens = ["", "", "Twenty", "Thirty", "Forty", "Fifty", "Sixty", "Seventy", "Eighty", "Ninety"];
+  const underHundred = (number) => {
+    if (number < 20) return ones[number];
+    return `${tens[Math.floor(number / 10)]}${number % 10 ? ` ${ones[number % 10]}` : ""}`;
+  };
+  const underThousand = (number) => {
+    const hundred = Math.floor(number / 100);
+    const rest = number % 100;
+    return [hundred ? `${ones[hundred]} Hundred` : "", rest ? underHundred(rest) : ""].filter(Boolean).join(" ");
+  };
+  const parts = [
+    [Math.floor(amount / 10000000), "Crore"],
+    [Math.floor((amount % 10000000) / 100000), "Lakh"],
+    [Math.floor((amount % 100000) / 1000), "Thousand"],
+    [amount % 1000, ""]
+  ];
+  return parts.map(([number, label]) => number ? `${underThousand(number)} ${label}`.trim() : "").filter(Boolean).join(" ") || "Zero";
+}
+
+function amountToIndianWords(value = 0) {
+  const safeAmount = Math.max(0, Number(value || 0));
+  let rupees = Math.floor(safeAmount);
+  let paise = Math.round((safeAmount - rupees) * 100);
+  if (paise >= 100) {
+    rupees += 1;
+    paise = 0;
+  }
+  const rupeeWords = `${integerToIndianWords(rupees)} Rupees`;
+  const paiseWords = paise > 0 ? ` and ${integerToIndianWords(paise)} Paise` : "";
+  return `${rupeeWords}${paiseWords}`.toUpperCase();
+}
+
+function normalizeTaxLocation(value = "") {
+  return normalizeKey(value).replace(/\bstate\b/g, "").trim();
+}
+
+function isInterStateSupply(payload = {}) {
+  const placeCode = cleanText(payload.placeOfSupplyCode || payload.customerStateCode).replace(/\D/g, "");
+  const businessCode = cleanText(payload.businessStateCode).replace(/\D/g, "");
+  if (placeCode && businessCode) {
+    return placeCode !== businessCode;
+  }
+  const place = normalizeTaxLocation(payload.placeOfSupply || payload.customerState);
+  const business = normalizeTaxLocation(payload.businessState);
+  if (place && business) {
+    return place !== business && !place.includes(business) && !business.includes(place);
+  }
+  return false;
+}
+
+function buildHsnTaxSummary(items = [], payload = {}) {
+  const interState = isInterStateSupply(payload);
+  const groups = new Map();
+  items.forEach((item) => {
+    const quantity = Math.max(0, Number(item.quantity || 0));
+    const gstRate = Math.max(0, Number(item.gstRate || 0));
+    const hsn = cleanText(item.hsn || item.hsnSac || item.hsn_sac || item.sac, "-");
+    const key = `${normalizeKey(hsn)}-${gstRate}`;
+    const current = groups.get(key) || {
+      hsn,
+      gstRate,
+      taxable: 0,
+      igst: 0,
+      cgst: 0,
+      sgst: 0,
+      totalTax: 0
+    };
+    const taxable = Math.max(0, Number(item.taxableValue || 0)) * quantity;
+    const tax = Math.max(0, Number(item.gstAmount || 0)) * quantity;
+    current.taxable += taxable;
+    current.totalTax += tax;
+    if (interState) {
+      current.igst += tax;
+    } else {
+      current.cgst += tax / 2;
+      current.sgst += tax / 2;
+    }
+    groups.set(key, current);
+  });
+  return Array.from(groups.values());
+}
+
+function buildStandardGstInvoiceMarkup(payload, detail = {}, { document = false } = {}) {
+  const summary = calculatePrintPayloadSummary(payload.items || [], payload.summary);
   const businessAddress = escapeHTML(payload.businessAddress || "").replace(/\n/g, "<br>");
-  const notes = escapeHTML(detail?.notes || "").replace(/\n/g, "<br>");
-  const paymentTerms = escapeHTML(detail?.paymentTerms || "").replace(/\n/g, "<br>");
-  const terms = escapeHTML(detail?.terms || "").replace(/\n/g, "<br>");
-  const safeInvoiceNumber = escapeHTML(payload.invoiceNumber || "CinchPOS Invoice");
+  const customerAddress = escapeHTML(payload.customerAddress || detail?.customer?.address || "").replace(/\n/g, "<br>");
+  const notes = escapeHTML(detail?.notes || payload.notes || "").replace(/\n/g, "<br>");
+  const paymentTerms = escapeHTML(detail?.paymentTerms || payload.paymentTerms || "").replace(/\n/g, "<br>");
+  const terms = escapeHTML(detail?.terms || payload.terms || "").replace(/\n/g, "<br>");
+  const logoMarkup = payload.logo ? `<img class="gst-logo" src="${payload.logo}" alt="Store logo">` : "";
+  const interStateSupply = isInterStateSupply(payload);
+  const hsnTaxSummary = buildHsnTaxSummary(payload.items || [], payload);
+  const taxSplitRows = interStateSupply
+    ? [{ label: "IGST", amount: summary.gst }]
+    : [{ label: "CGST", amount: summary.gst / 2 }, { label: "SGST", amount: summary.gst / 2 }];
+  const hsnSummaryRows = hsnTaxSummary.map((entry) => interStateSupply ? `
+      <tr>
+        <td>${escapeHTML(entry.hsn)}</td>
+        <td class="numeric">${currency(entry.taxable)}</td>
+        <td class="center">${entry.gstRate.toFixed(2)}%</td>
+        <td class="numeric">${currency(entry.igst)}</td>
+        <td class="numeric">${currency(entry.totalTax)}</td>
+      </tr>
+    ` : `
+      <tr>
+        <td>${escapeHTML(entry.hsn)}</td>
+        <td class="numeric">${currency(entry.taxable)}</td>
+        <td class="center">${(entry.gstRate / 2).toFixed(2)}%</td>
+        <td class="numeric">${currency(entry.cgst)}</td>
+        <td class="center">${(entry.gstRate / 2).toFixed(2)}%</td>
+        <td class="numeric">${currency(entry.sgst)}</td>
+        <td class="numeric">${currency(entry.totalTax)}</td>
+      </tr>
+    `).join("");
+  const rows = (payload.items || []).map((item) => {
+    const quantity = Math.max(0, Number(item.quantity || 0));
+    const unitRate = Math.max(0, Number(item.taxableValue || 0));
+    const taxableTotal = unitRate * quantity;
+    const gstTotal = Math.max(0, Number(item.gstAmount || 0) * quantity);
+    const lineTotal = Math.max(0, Number(item.lineTotal || 0));
+    return `
+      <tr>
+        <td class="center">${item.serial}</td>
+        <td>
+          <strong>${escapeHTML(item.itemName)}</strong>
+          ${item.description ? `<span>${escapeHTML(item.description)}</span>` : ""}
+          ${item.barcode ? `<span>Barcode: ${escapeHTML(item.barcode)}</span>` : ""}
+        </td>
+        <td class="center">${escapeHTML(cleanText(item.hsn || item.hsnSac || item.hsn_sac || item.sac, "-"))}</td>
+        <td class="center">${quantity} ${escapeHTML(cleanText(item.unit, "Pcs"))}</td>
+        <td class="numeric">${currency(unitRate)}</td>
+        <td class="numeric">${currency(taxableTotal)}</td>
+        <td class="center">${Number(item.gstRate || 0).toFixed(2)}%</td>
+        <td class="numeric">${currency(gstTotal)}</td>
+        <td class="numeric"><strong>${currency(lineTotal)}</strong></td>
+      </tr>
+    `;
+  }).join("");
+  const gstInvoice = `
+    <main class="gst-invoice-page">
+      <header class="gst-business-head">
+        <div class="gst-brand">
+          ${logoMarkup}
+          <div>
+            <h1>${escapeHTML(payload.businessName || "Store Name")}</h1>
+            ${payload.ownerName ? `<p>${escapeHTML(payload.ownerName)}</p>` : ""}
+            ${payload.businessAddress ? `<p>${businessAddress}</p>` : ""}
+            <div class="gst-header-line">
+              ${payload.businessPhone ? `<span>Tel : ${escapeHTML(payload.businessPhone)}</span>` : ""}
+              ${payload.businessEmail ? `<span>Email : ${escapeHTML(payload.businessEmail)}</span>` : ""}
+            </div>
+          </div>
+        </div>
+      </header>
+      <section class="gst-title-row">
+        <strong><span>GSTIN : ${escapeHTML(payload.gstin || "Not added")}</span><span>PAN : ${escapeHTML(payload.businessPan || "Not added")}</span></strong>
+        <h2>TAX INVOICE</h2>
+        <strong>ORIGINAL FOR RECIPIENT</strong>
+      </section>
+      <section class="gst-meta-grid">
+        <div class="gst-box">
+          <strong>M/S</strong>
+          <p>${escapeHTML(payload.customerName || "Walk-in Customer")}</p>
+          ${payload.customerBusinessName ? `<p>${escapeHTML(payload.customerBusinessName)}</p>` : ""}
+          ${payload.customerPhone ? `<p>Phone: ${escapeHTML(payload.customerPhone)}</p>` : ""}
+          ${payload.customerEmail ? `<p>Email: ${escapeHTML(payload.customerEmail)}</p>` : ""}
+          ${customerAddress ? `<p>${customerAddress}</p>` : ""}
+          <p>GSTIN: ${escapeHTML(payload.customerGstin || detail?.customer?.gstin || "Not added")}</p>
+          <p>Place of Supply: ${escapeHTML(payload.placeOfSupply || "Not added")}</p>
+        </div>
+        <div class="gst-box gst-invoice-meta">
+          <p><strong>Invoice No.</strong><span>${escapeHTML(payload.invoiceNumber || "CinchPOS Invoice")}</span></p>
+          <p><strong>Invoice Date</strong><span>${escapeHTML(formatDate(payload.date))}</span></p>
+          ${payload.dueDate ? `<p><strong>Due Date</strong><span>${escapeHTML(formatDate(payload.dueDate))}</span></p>` : ""}
+          <p><strong>Payment</strong><span>${escapeHTML(payload.paymentMethod || "Cash")} | ${escapeHTML(payload.paymentType || "Pending")}</span></p>
+        </div>
+      </section>
+      <table class="gst-items-table">
+        <thead>
+          <tr>
+            <th>Sr. No.</th>
+            <th>Name of Product / Service</th>
+            <th>HSN / SAC</th>
+            <th>Qty</th>
+            <th>Rate</th>
+            <th>Taxable Value</th>
+            <th>GST %</th>
+            <th>GST Amount</th>
+            <th>Total</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows || `<tr><td colspan="9" class="center">No invoice items</td></tr>`}
+          <tr class="gst-total-row">
+            <td colspan="3" class="numeric"><strong>Total</strong></td>
+            <td class="center"><strong>${summary.quantity}</strong></td>
+            <td></td>
+            <td class="numeric"><strong>${currency(summary.subtotal)}</strong></td>
+            <td></td>
+            <td class="numeric"><strong>${currency(summary.gst)}</strong></td>
+            <td class="numeric"><strong>${currency(summary.total)}</strong></td>
+          </tr>
+        </tbody>
+      </table>
+      <section class="gst-bottom-grid">
+        <div class="gst-words">
+          <strong>Total in words : ${amountToIndianWords(summary.total)} ONLY</strong>
+          <strong class="gst-tax-words">Total tax in words : ${amountToIndianWords(summary.gst)} ONLY</strong>
+          <div class="gst-tax-summary">
+            <strong>HSN / SAC Wise Tax Summary</strong>
+            <table>
+              <thead>
+                ${interStateSupply ? `
+                  <tr><th>HSN/SAC</th><th>Taxable Value</th><th>IGST %</th><th>IGST Amount</th><th>Total Tax</th></tr>
+                ` : `
+                  <tr><th>HSN/SAC</th><th>Taxable Value</th><th>CGST %</th><th>CGST Amount</th><th>SGST %</th><th>SGST Amount</th><th>Total Tax</th></tr>
+                `}
+              </thead>
+              <tbody>${hsnSummaryRows || `<tr><td colspan="${interStateSupply ? 5 : 7}" class="center">No taxable items</td></tr>`}</tbody>
+            </table>
+          </div>
+          <div class="gst-terms">
+            <strong>Terms and Conditions</strong>
+            ${terms ? `<p>${terms}</p>` : ""}
+            ${paymentTerms ? `<p>${paymentTerms}</p>` : ""}
+            ${notes ? `<p><strong>Notes:</strong> ${notes}</p>` : ""}
+          </div>
+          <div class="gst-sign-box gst-customer-signature"><strong>Customer Signature</strong></div>
+        </div>
+        <div class="gst-pay-box">
+          <div class="gst-qr-placeholder">UPI</div>
+          <strong>Pay using UPI</strong>
+        </div>
+        <div class="gst-summary-box">
+          <p><span>Taxable Amount</span><strong>${currency(summary.subtotal)}</strong></p>
+          ${taxSplitRows.map((row) => `<p><span>${row.label}</span><strong>${currency(row.amount)}</strong></p>`).join("")}
+          <p><span>Total Tax</span><strong>${currency(summary.gst)}</strong></p>
+          <p><span>Total Discount</span><strong>${currency(summary.discountTotal)}</strong></p>
+          <p class="gst-grand"><span>Total Amount After Tax</span><strong>${currency(summary.total)}</strong></p>
+          <p><span>Paid Amount</span><strong>${currency(payload.paidAmount)}</strong></p>
+          <p><span>Balance Amount</span><strong>${currency(payload.unpaidAmount)}</strong></p>
+          <div class="gst-authorised gst-authorised-box">
+            <span>Certified that particulars given above are true and correct.</span>
+            <strong>For ${escapeHTML(payload.businessName || "Store Name")}</strong>
+            <div class="gst-signature-images">
+              ${payload.storeStamp ? `<img class="gst-stamp" src="${payload.storeStamp}" alt="Store stamp">` : ""}
+              ${payload.ownerSignature ? `<img class="gst-signature" src="${payload.ownerSignature}" alt="Authorised signature">` : ""}
+            </div>
+            <strong>Authorised Signatory</strong>
+          </div>
+        </div>
+      </section>
+      <footer class="gst-footer">
+        <strong>Bank / Payment:</strong> ${escapeHTML(payload.paymentMethod || "Cash")}
+        ${payload.printFooter ? `<span>${escapeHTML(payload.printFooter)}</span>` : ""}
+      </footer>
+    </main>
+  `;
+  if (!document) {
+    return gstInvoice;
+  }
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>${safeInvoiceNumber}</title>
-  <style>
-    * { box-sizing: border-box; }
-    @page { size: A4; margin: 12mm; }
-    body { margin: 0; background: #f3f6f4; color: #111; font-family: Arial, sans-serif; font-size: 12px; }
-    .invoice-page { width: 210mm; min-height: 297mm; margin: 0 auto; padding: 14mm; background: #fff; }
-    .invoice-head { display: grid; grid-template-columns: auto 1fr auto; gap: 16px; align-items: start; border-bottom: 2px solid #111; padding-bottom: 14px; }
-    .invoice-logo { width: 72px; height: 72px; object-fit: contain; }
-    h1, h2, h3, p { margin: 0; }
-    h1 { font-size: 22px; }
-    .muted { color: #555; }
-    .invoice-title { text-align: right; }
-    .invoice-title h2 { font-size: 20px; text-transform: uppercase; }
-    .meta-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin: 16px 0; }
-    .box { border: 1px solid #ccc; padding: 10px; border-radius: 6px; }
-    table { width: 100%; border-collapse: collapse; margin-top: 12px; }
-    th, td { padding: 8px 6px; border-bottom: 1px solid #ddd; text-align: left; vertical-align: top; }
-    th { background: #f2f5f3; font-size: 10px; text-transform: uppercase; }
-    th span { display: block; line-height: 1.15; }
-    td span { display: block; color: #555; font-size: 10px; margin-top: 2px; }
-    .numeric { text-align: right; }
-    .item-cell strong { display: block; }
-    .totals { max-width: 280px; margin: 14px 0 0 auto; display: grid; gap: 6px; }
-    .totals div { display: flex; justify-content: space-between; gap: 16px; }
-    .grand { border-top: 2px solid #111; padding-top: 8px; font-size: 15px; font-weight: 700; }
-    .notes { display: grid; gap: 8px; margin-top: 18px; }
-    @media print {
-      body { background: #fff; }
-      .invoice-page { margin: 0; padding: 0; width: auto; min-height: auto; }
-    }
-  </style>
+  <title>${escapeHTML(payload.invoiceNumber || "CinchPOS Invoice")}</title>
+  <style>${GST_INVOICE_PRINT_CSS}</style>
 </head>
-<body>
-  <main class="invoice-page">
-    <header class="invoice-head">
-      ${logoMarkup}
-      <section>
-        <h1>${escapeHTML(payload.businessName)}</h1>
-        ${payload.ownerName ? `<p>${escapeHTML(payload.ownerName)}</p>` : ""}
-        ${businessContact ? `<p>${businessContact}</p>` : ""}
-        ${payload.businessAddress ? `<p>${businessAddress}</p>` : ""}
-        ${payload.gstin ? `<p>GSTIN: ${escapeHTML(payload.gstin)}</p>` : ""}
-      </section>
-      <section class="invoice-title">
-        <h2>Invoice</h2>
-        <p>${safeInvoiceNumber}</p>
-        <p class="muted">${escapeHTML(formatDate(payload.date))}</p>
-      </section>
-    </header>
-    <section class="meta-grid">
-      <div class="box">
-        <h3>Bill To</h3>
-        <p>${escapeHTML(payload.customerName)}</p>
-        ${payload.customerPhone ? `<p>${escapeHTML(payload.customerPhone)}</p>` : ""}
-        ${detail?.customer?.email ? `<p>${escapeHTML(detail.customer.email)}</p>` : ""}
-        ${detail?.customer?.address ? `<p>${escapeHTML(detail.customer.address)}</p>` : ""}
-      </div>
-      <div class="box">
-        <h3>Payment</h3>
-        <p>Method: ${escapeHTML(payload.paymentMethod)}</p>
-        <p>Status: ${escapeHTML(payload.paymentType)}</p>
-        <p>Paid: ${currency(payload.paidAmount)}</p>
-        <p>Unpaid: ${currency(payload.unpaidAmount)}</p>
-      </div>
-    </section>
-    <table>
-      <thead><tr><th>#</th><th><span>Item Name</span><span>HSN</span></th><th><span>MRP</span><span>Disc</span></th><th>Qty</th><th>SP</th><th><span>Rate</span><span>Tax</span></th><th>Amt</th></tr></thead>
-      <tbody>${rows}</tbody>
-    </table>
-    <section class="totals">
-      <div><span>Total Qty</span><span>${summary.quantity}</span></div>
-      <div><span>Total Rate</span><span>${currency(summary.subtotal)}</span></div>
-      <div><span>Total GST</span><span>${currency(summary.gst)}</span></div>
-      <div><span>Total Disc</span><span>${currency(summary.discountTotal)}</span></div>
-      <div class="grand"><span>Total Amount</span><span>${currency(summary.total)}</span></div>
-    </section>
-    <section class="notes">
-      ${notes ? `<div class="box"><h3>Notes</h3><p>${notes}</p></div>` : ""}
-      ${paymentTerms ? `<div class="box"><h3>Payment Terms</h3><p>${paymentTerms}</p></div>` : ""}
-      ${terms ? `<div class="box"><h3>Terms & Conditions</h3><p>${terms}</p></div>` : ""}
-    </section>
-  </main>
-</body>
+<body>${gstInvoice}</body>
 </html>`;
+}
+
+function buildInvoiceDownloadHTML(payload, detail = {}) {
+  return buildStandardGstInvoiceMarkup(payload, detail, { document: true });
 }
 
 function PrintPreviewDocument({ payload }) {
@@ -1128,6 +1369,7 @@ function PrintPreviewDocument({ payload }) {
   const rows = payload.items || [];
   const summary = calculatePrintPayloadSummary(rows, payload.summary);
   const thermalMarkup = !isStandard ? buildThermalReceiptMarkup(payload) : "";
+  const standardMarkup = isStandard ? buildStandardGstInvoiceMarkup(payload) : "";
   return (
     <div className={`print-preview-stage ${profile.layout}`}>
       <div
@@ -1140,71 +1382,7 @@ function PrintPreviewDocument({ payload }) {
       >
         <div className={`print-preview-content ${isStandard ? "" : "thermal-preview-content"}`}>
           {isStandard ? (
-            <>
-              <div className="print-preview-head">
-                {payload.logo ? <img src={payload.logo} alt="Store logo preview" /> : null}
-                <h3>{payload.businessName}</h3>
-                {payload.ownerName ? <p>{payload.ownerName}</p> : null}
-                <p>{[payload.businessPhone, payload.businessEmail].filter(Boolean).join(" | ")}</p>
-                {payload.businessAddress ? <p>{payload.businessAddress}</p> : null}
-                {payload.gstin ? <p>GSTIN: {payload.gstin}</p> : null}
-              </div>
-              <div className="print-preview-meta">
-                <span><strong>Invoice:</strong> {payload.invoiceNumber}</span>
-                <span><strong>Date:</strong> {payload.date}</span>
-                {payload.dueDate ? <span>Due {payload.dueDate}</span> : null}
-                <span><strong>Customer:</strong> {payload.customerName} {payload.customerPhone ? `(${payload.customerPhone})` : ""}</span>
-                {payload.customerEmail ? <span>Email {payload.customerEmail}</span> : null}
-                {payload.customerAddress ? <span>Address {payload.customerAddress}</span> : null}
-                <span><strong>Payment:</strong> {payload.paymentMethod} | {payload.paymentType}</span>
-              </div>
-              <table className="print-preview-table standard grouped">
-                <thead>
-                  <tr>
-                    <th>#</th>
-                    <th><span>Item Name</span><span>HSN</span></th>
-                    <th><span>MRP</span><span>Disc</span></th>
-                    <th>Qty</th>
-                    <th>SP</th>
-                    <th><span>Rate</span><span>Tax</span></th>
-                    <th>Amt</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {rows.map((item) => (
-                    <tr key={`${item.serial}-${item.itemName}`}>
-                      <td>{item.serial}</td>
-                      <td>
-                        <strong>{item.itemName}</strong>
-                        <span>HSN {cleanText(item.hsn || item.hsnSac || item.hsn_sac || item.sac, "Not added")}</span>
-                        {item.barcode ? <span>Barcode {item.barcode}</span> : null}
-                      </td>
-                      <td>{currency(item.mrp)}<span>Disc {Number(item.discountPercent || 0).toFixed(2)}%</span></td>
-                      <td>{item.quantity}</td>
-                      <td>{currency(item.inclusivePrice)}</td>
-                      <td>{currency(item.taxableValue)}<span>Tax {Number(item.gstRate || 0)}%</span></td>
-                      <td><strong>{currency(item.lineTotal)}</strong></td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-              <div className="print-preview-totals">
-                <span>Total Qty <strong>{summary.quantity}</strong></span>
-                <span>Total Rate <strong>{currency(summary.subtotal)}</strong></span>
-                <span>Total GST <strong>{currency(summary.gst)}</strong></span>
-                <span>Total Disc <strong>{currency(summary.discountTotal)}</strong></span>
-                <span className="grand">Total Amount <strong>{currency(summary.total)}</strong></span>
-              </div>
-              {(payload.notes || payload.paymentTerms || payload.terms) ? (
-                <div className="print-preview-notes">
-                  {payload.notes ? <p><strong>Notes:</strong> {payload.notes}</p> : null}
-                  {(payload.paymentTerms || payload.terms) ? (
-                    <p><strong>Terms & Conditions:</strong> {[payload.paymentTerms, payload.terms].filter(Boolean).join(" ")}</p>
-                  ) : null}
-                </div>
-              ) : null}
-              {payload.printFooter ? <p className="print-preview-footer">{payload.printFooter}</p> : null}
-            </>
+            <div className="gst-preview-wrapper" dangerouslySetInnerHTML={{ __html: standardMarkup }} />
           ) : (
             <div dangerouslySetInnerHTML={{ __html: thermalMarkup }} />
           )}
@@ -1313,6 +1491,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
   const [invoiceStatusMenu, setInvoiceStatusMenu] = useState(null);
   const [invoiceBuilderDraft, setInvoiceBuilderDraft] = useState(() => makeInvoiceBuilderDraft());
   const [invoiceBuilderSearch, setInvoiceBuilderSearch] = useState("");
+  const [invoiceBuilderMatchIndex, setInvoiceBuilderMatchIndex] = useState(0);
   const messageTimer = useRef(null);
   const appWorkspaceRef = useRef(null);
   const posModuleContextRef = useRef(null);
@@ -1548,6 +1727,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     return `${dueDate.getFullYear()}-${String(dueDate.getMonth() + 1).padStart(2, "0")}-${String(dueDate.getDate()).padStart(2, "0")}`;
   }, [defaultDueDaysNumber]);
   const deferredInventorySearch = useDeferredValue(inventorySearch);
+  const deferredSellOnlineSearch = useDeferredValue(sellOnlineSearch);
   const workspaceStats = useMemo(() => ({
     customers: customers.length,
     invoices: allInvoices.length,
@@ -1578,7 +1758,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
   ]);
   const smartInventoryReview = useMemo(() => buildSmartInventoryReview(inventoryItems), [inventoryItems]);
   const sellOnlineProducts = useMemo(() => {
-    const search = normalizeKey(sellOnlineSearch);
+    const search = normalizeKey(deferredSellOnlineSearch);
     return inventoryItems.map((item, index) => {
       const id = getInventoryItemKey(item, index);
       const name = getInventoryItemName(item);
@@ -1599,7 +1779,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         searchable
       };
     }).filter((item) => !search || item.searchable.includes(search));
-  }, [inventoryItems, sellOnlineCatalog, sellOnlineSearch]);
+  }, [inventoryItems, sellOnlineCatalog, deferredSellOnlineSearch]);
   const selectedSellOnlineProducts = useMemo(() => (
     inventoryItems.map((item, index) => {
       const id = getInventoryItemKey(item, index);
@@ -1627,9 +1807,31 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
   const invoiceBuilderMatches = useMemo(() => (
     findInventoryMatches(inventoryItems, invoiceBuilderSearch).slice(0, 8)
   ), [inventoryItems, invoiceBuilderSearch]);
-  const invoiceBuilderSummary = useMemo(() => (
-    calculateInvoiceBuilderSummary(invoiceBuilderDraft.lines || [])
-  ), [invoiceBuilderDraft.lines]);
+  const standardInvoiceNumber = cleanText(invoiceBuilderDraft.invoiceNumber) || buildClientInvoiceNumber(invoiceBuilderDraft.issuedOn || todayISO());
+  const standardBillingDateLabel = formatDate(invoiceBuilderDraft.issuedOn || todayISO());
+  const standardDueDateLabel = formatDate(invoiceBuilderDraft.dueOn || defaultDueDate);
+  useEffect(() => {
+    setInvoiceBuilderMatchIndex(0);
+  }, [invoiceBuilderSearch, invoiceBuilderMatches.length]);
+  const invoiceBuilderCustomerMatches = useMemo(() => {
+    const queryTerms = [
+      normalizeKey(invoiceBuilderDraft.customerName),
+      normalizeKey(invoiceBuilderDraft.customerPhone)
+    ].filter((term) => term.length >= 2);
+    if (!queryTerms.length) {
+      return [];
+    }
+    return customers.filter((customer) => {
+      const searchable = normalizeKey([
+        customer.name,
+        getCustomerBusinessName(customer),
+        customer.phone,
+        customer.email,
+        customer.address
+      ].filter(Boolean).join(" "));
+      return queryTerms.some((term) => searchable.includes(term));
+    }).slice(0, 5);
+  }, [customers, invoiceBuilderDraft.customerName, invoiceBuilderDraft.customerPhone]);
   const selectedInvoice = useMemo(() => (
     selectedInvoiceId
       ? allInvoices.find((invoice) => (
@@ -1660,7 +1862,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     }
     return navigator.userAgentData?.platform || navigator.platform || "Unknown platform";
   }, []);
-  const isPOSView = activeView === "cinchPOSView";
+  const isBillingWorkspace = Boolean(appViews.find((view) => view.id === activeView)?.billing);
 
   function buildClientInvoiceNumber(issuedOn = todayISO()) {
     const prefix = cleanText(settings.invoicePrefix, defaultSettings.invoicePrefix).toUpperCase();
@@ -1696,6 +1898,10 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
 
   function makePrintPayloadFromInvoice(invoice, detail = null) {
     const invoiceDetail = detail || getInvoiceDetail(invoice);
+    const isStandardInvoiceDetail = invoiceDetail?.source === "standard-invoice";
+    const paperSize = isStandardInvoiceDetail ? "A4" : (settings.printPaperSize || defaultSettings.printPaperSize);
+    const printLayout = isStandardInvoiceDetail ? "invoice" : (settings.printLayout || defaultSettings.printLayout);
+    const printSettings = { ...settings, printPaperSize: paperSize, printLayout };
     const lines = Array.isArray(invoiceDetail?.items) ? invoiceDetail.items : [];
     const summaryRows = invoiceDetail?.summary || calculateInvoiceBuilderSummary(lines.map((line) => ({
       quantity: line.quantity,
@@ -1752,24 +1958,33 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       businessPhone: settings.businessPhone || "",
       businessEmail: settings.businessEmail || "",
       businessAddress: settings.businessAddress || "",
+      businessPan: settings.businessPan || "",
+      businessState: settings.businessState || "",
+      businessStateCode: settings.businessStateCode || "",
       gstin: settings.gstin || "",
       receiptSettings: buildReceiptSettings(settings),
       cashierName: settings.printCashierName || defaultSettings.printCashierName,
       counterName: settings.printCounterName || defaultSettings.printCounterName,
       orderType: settings.printOrderType || defaultSettings.printOrderType,
       logo: settings.printShopLogoOnBill ? (settings.storeLogo || settings.storeLogoUrl || "") : "",
-      paperSize: settings.printPaperSize || defaultSettings.printPaperSize,
-      printLayout: settings.printLayout || defaultSettings.printLayout,
+      storeStamp: settings.storeStamp || "",
+      ownerSignature: settings.ownerSignature || "",
+      paperSize,
+      printLayout,
       printMargin: settings.printMargin || defaultSettings.printMargin,
       printFooter: settings.printFooter || "",
-      printCalibration: getCalibrationForSettings(settings),
+      printCalibration: getCalibrationForSettings(printSettings),
       invoiceNumber: invoice?.invoice_number || invoice?.invoiceNumber || invoiceDetail?.invoiceNumber || "",
       date: invoice?.issued_on || invoice?.issuedOn || invoiceDetail?.issuedOn || todayISO(),
       dueDate: invoice?.due_on || invoice?.dueOn || invoiceDetail?.dueOn || "",
       customerName: cleanText(invoice?.customer_name || invoice?.customerName || customer.name, DEFAULT_WALK_IN_CUSTOMER_NAME),
       customerPhone: cleanText(invoice?.customer_phone || invoice?.customerPhone || customer.phone),
+      customerBusinessName: cleanText(invoiceDetail?.customerBusinessName || getCustomerBusinessName(customer)),
       customerEmail: cleanText(customer.email),
       customerAddress: cleanText(customer.address),
+      customerGstin: cleanText(customer.gstin || customer.gstNumber || customer.gst_number || invoiceDetail?.customerGstin),
+      placeOfSupply: cleanText(invoiceDetail?.placeOfSupply || settings.businessState || ""),
+      placeOfSupplyCode: cleanText(invoiceDetail?.placeOfSupplyCode || settings.businessStateCode || ""),
       paymentMethod: invoiceDetail?.paymentMethod || "Cash",
       paymentType: invoiceOutstandingAmount(invoice) > 0 ? "Partial / Pending" : "Full Payment",
       paidAmount: invoicePaidAmount(invoice),
@@ -1792,12 +2007,15 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     const nextDraft = makeInvoiceBuilderDraft({
       invoiceNumber: buildClientInvoiceNumber(todayISO()),
       dueOn: defaultDueDate,
+      placeOfSupply: settings.businessState || "",
       notes: settings.invoiceNotes || "",
       ...overrides
     });
     setInvoiceBuilderDraft(nextDraft);
     setInvoiceBuilderSearch("");
-    setActiveModal("invoice");
+    setActiveModal("");
+    setSelectedInvoiceId("");
+    switchView("standardInvoiceView");
   }
 
   function duplicateInvoiceToBuilder(invoice) {
@@ -1809,6 +2027,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       customerPhone: cleanText(customer.phone || getInvoicePhone(invoice)),
       customerEmail: cleanText(customer.email),
       customerAddress: cleanText(customer.address),
+      placeOfSupply: cleanText(detail?.placeOfSupply || settings.businessState),
       notes: cleanText(detail?.notes || invoice.notes || settings.invoiceNotes),
       paymentStatus: "pending",
       paymentAmount: "",
@@ -1817,6 +2036,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
             itemId: line.itemId || "",
             itemName: line.itemName || line.name || "",
             barcode: line.barcode || "",
+            hsn: line.hsn || line.hsnSac || line.hsn_sac || line.sac || "",
             quantity: line.quantity || 1,
             mrp: line.mrp || line.inclusivePrice || line.price || 0,
             inclusivePrice: line.inclusivePrice || line.price || 0,
@@ -2833,9 +3053,10 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
   function getCustomerStatus(customer) {
     const phone = normalizePhone(customer.phone).slice(-10);
     const name = cleanText(customer.name);
+    const businessName = cleanText(customer.businessName);
     const email = cleanText(customer.email);
     const address = cleanText(customer.address);
-    if (!phone && !name && !email && !address) {
+    if (!phone && !name && !businessName && !email && !address) {
       return `Customer details are optional. ${DEFAULT_WALK_IN_CUSTOMER_NAME} (${formatIndianPhone(DEFAULT_WALK_IN_CUSTOMER_PHONE)}) will be used if you save the bill without filling this section.`;
     }
     if (!phone && name) {
@@ -2963,6 +3184,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     const customer = getActiveBill(formId).customer || defaultPOSCustomer;
     const phone = normalizePhone(customer.phone).slice(-10);
     const name = cleanText(customer.name);
+    const businessName = cleanText(customer.businessName);
     const email = cleanText(customer.email);
     const address = cleanText(customer.address);
     const existingCustomer = phone.length === 10 ? findCustomerByPhone(phone) : null;
@@ -2970,7 +3192,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       updatePOSCustomer(formId, buildPOSCustomerFromRecord(existingCustomer));
       return { record: existingCustomer, usedWalkInCustomer: false };
     }
-    if (!phone && !name && !email && !address) {
+    if (!phone && !name && !businessName && !email && !address) {
       const walkInCustomer = await ensureDefaultWalkInCustomer();
       updatePOSCustomer(formId, buildPOSCustomerFromRecord(walkInCustomer));
       return { record: walkInCustomer, usedWalkInCustomer: true };
@@ -2979,7 +3201,8 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       name: name || DEFAULT_WALK_IN_CUSTOMER_NAME,
       phone: phone.length === 10 ? `+91${phone}` : "",
       email,
-      address
+      address,
+      businessName
     });
     replaceCustomerInState(newCustomer);
     updatePOSCustomer(formId, buildPOSCustomerFromRecord(newCustomer));
@@ -3054,7 +3277,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         ${safeTermsCombined ? `<p><strong>Terms & Conditions:</strong><br>${safeTermsCombined}</p>` : ""}
       </div>
     ` : "";
-    const invoiceBodyMarkup = `
+    const invoiceBodyMarkup = isInvoicePrint ? buildStandardGstInvoiceMarkup(payload) : `
       <div class="print-head">${logoMarkup}<h1>${safeBusinessName}</h1>${payload.ownerName ? `<p>${safeOwnerName}</p>` : ""}${businessContact ? `<p>${businessContact}</p>` : ""}${payload.businessAddress ? `<p>${safeBusinessAddress}</p>` : ""}${payload.gstin ? `<p>GSTIN: ${safeGstin}</p>` : ""}</div>
       <div class="print-meta">
         <p>Bill: ${safeInvoiceNumber}</p>
@@ -3122,7 +3345,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
           .grand { margin-top: ${isInvoicePrint ? "2px" : "3px"}; padding-top: ${isInvoicePrint ? "0" : "3px"}; border-top: ${isInvoicePrint ? "0" : "1px dashed #999"}; font-size: ${isInvoicePrint ? "15px" : "11.5px"}; font-weight: 700; }
           .print-notes { display: grid; gap: 4px; margin-top: 10px; padding-top: 8px; border-top: 1px dashed #777; color: #333; }
           .print-footer { margin-top: ${isInvoicePrint ? "16px" : "14px"}; padding-top: ${isInvoicePrint ? "10px" : "9px"}; border-top: 1px dashed #777; text-align: center; color: #444; font-size: ${isInvoicePrint ? "10px" : "8.8px"}; }
-          ${isInvoicePrint ? "" : THERMAL_RECEIPT_CSS}
+          ${isInvoicePrint ? GST_INVOICE_PRINT_CSS : THERMAL_RECEIPT_CSS}
           @media print { html, body { width: ${printPageWidth}; height: auto; overflow: visible; } .thermal-print .print-content { transform: none !important; width: 100% !important; } }
         </style>
       </head>
@@ -3295,17 +3518,24 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         businessPhone: settings.businessPhone || "",
         businessEmail: settings.businessEmail || "",
         businessAddress: settings.businessAddress || "",
-      gstin: settings.gstin || "",
-      receiptSettings: buildReceiptSettings(settings),
-      cashierName: settings.printCashierName || defaultSettings.printCashierName,
-      counterName: settings.printCounterName || defaultSettings.printCounterName,
-      orderType: settings.printOrderType || defaultSettings.printOrderType,
-      logo: settings.printShopLogoOnBill ? (settings.storeLogo || settings.storeLogoUrl || "") : "",
-        paperSize: settings.printPaperSize || defaultSettings.printPaperSize,
-        printLayout: settings.printLayout || defaultSettings.printLayout,
+        businessPan: settings.businessPan || "",
+        businessState: settings.businessState || "",
+        businessStateCode: settings.businessStateCode || "",
+        gstin: settings.gstin || "",
+        receiptSettings: buildReceiptSettings(settings),
+        cashierName: settings.printCashierName || defaultSettings.printCashierName,
+        counterName: settings.printCounterName || defaultSettings.printCounterName,
+        orderType: settings.printOrderType || defaultSettings.printOrderType,
+        logo: settings.printShopLogoOnBill ? (settings.storeLogo || settings.storeLogoUrl || "") : "",
+        paperSize: String(settings.printPaperSize || "").includes("mm") ? settings.printPaperSize : defaultSettings.printPaperSize,
+        printLayout: "thermal",
         printMargin: settings.printMargin || defaultSettings.printMargin,
         printFooter: settings.printFooter || "",
-        printCalibration: getCalibrationForSettings(settings),
+        printCalibration: getCalibrationForSettings({
+          ...settings,
+          printPaperSize: String(settings.printPaperSize || "").includes("mm") ? settings.printPaperSize : defaultSettings.printPaperSize,
+          printLayout: "thermal"
+        }),
         invoiceNumber: invoice.invoice_number || "",
         date: issuedOn,
         dueDate: defaultDueDate,
@@ -3315,6 +3545,9 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
           : (usedWalkInCustomer ? formatIndianPhone(DEFAULT_WALK_IN_CUSTOMER_PHONE) : ""),
         customerEmail: cleanText(savedCustomer?.email || customer.email),
         customerAddress: cleanText(savedCustomer?.address || customer.address),
+        customerBusinessName: cleanText(getCustomerBusinessName(savedCustomer) || customer.businessName),
+        placeOfSupply: settings.businessState || "",
+        placeOfSupplyCode: settings.businessStateCode || "",
         paymentMethod: customer.paymentMethod || "Cash",
         paymentType: paymentType === "partial" ? "Partial Payment" : "Full Payment",
         paidAmount,
@@ -3362,7 +3595,8 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
           name: cleanText(savedCustomer.name, DEFAULT_WALK_IN_CUSTOMER_NAME),
           phone: savedCustomer.phone || "",
           email: savedCustomer.email || "",
-          address: savedCustomer.address || ""
+          address: savedCustomer.address || "",
+          businessName: getCustomerBusinessName(savedCustomer) || cleanText(customer.businessName)
         },
         paymentMethod: customer.paymentMethod || "Cash",
         paymentType,
@@ -3546,6 +3780,15 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       showMessage("Select products before publishing the online store.");
       return;
     }
+    if (!settings.businessPhone && !settings.businessEmail) {
+      showMessage("Add a business phone or email in Business Management before publishing.");
+      return;
+    }
+    const outOfStockCount = selectedSellOnlineProducts.filter((product) => Number(product.stock || 0) <= 0).length;
+    if (outOfStockCount) {
+      showMessage(`Remove ${outOfStockCount} out-of-stock product(s) before publishing.`);
+      return;
+    }
     setOnlineStoreBusy(true);
     try {
       const payload = await publishOnlineStore({
@@ -3654,6 +3897,35 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     setInvoiceBuilderDraft((current) => ({ ...current, [field]: value }));
   }
 
+  function applyInvoiceBuilderCustomer(customer = {}, phoneOverride = "") {
+    const phone = normalizePhone(phoneOverride || customer.phone || "").slice(-10);
+    setInvoiceBuilderDraft((current) => ({
+      ...current,
+      customerId: customer.id ? String(customer.id) : current.customerId,
+      customerName: cleanText(customer.name, current.customerName),
+      customerPhone: phone || current.customerPhone,
+      customerEmail: cleanText(customer.email, current.customerEmail),
+      customerAddress: cleanText(customer.address, current.customerAddress),
+      customerBusinessName: getCustomerBusinessName(customer) || current.customerBusinessName
+    }));
+  }
+
+  function updateInvoiceBuilderPhone(value) {
+    const phone = normalizePhone(value).slice(-10);
+    setInvoiceBuilderDraft((current) => ({ ...current, customerPhone: phone }));
+    if (phone.length === 10) {
+      const matchedCustomer = findCustomerByPhone(phone);
+      if (matchedCustomer) {
+        applyInvoiceBuilderCustomer(matchedCustomer, phone);
+        showMessage(`Customer details filled for ${cleanText(matchedCustomer.name, phone)}.`);
+      }
+    }
+  }
+
+  function updateInvoiceBuilderName(value) {
+    setInvoiceBuilderDraft((current) => ({ ...current, customerName: value, customerId: "" }));
+  }
+
   function updateInvoiceBuilderLine(lineId, field, value) {
     setInvoiceBuilderDraft((current) => ({
       ...current,
@@ -3672,12 +3944,57 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     }));
   }
 
+  function isBlankInvoiceBuilderLine(line = {}) {
+    return !cleanText(line.itemName) && !cleanText(line.barcode) && Number(line.inclusivePrice || 0) <= 0 && Number(line.mrp || 0) <= 0;
+  }
+
   function addInvoiceBuilderLine(line = makeInvoiceBuilderLine()) {
-    setInvoiceBuilderDraft((current) => ({
-      ...current,
-      lines: [...(current.lines || []), line]
-    }));
+    const shouldPrioritizeAddedItem = !isBlankInvoiceBuilderLine(line);
+    setInvoiceBuilderDraft((current) => {
+      const currentLines = current.lines || [];
+      if (shouldPrioritizeAddedItem) {
+        const firstBlankIndex = currentLines.findIndex(isBlankInvoiceBuilderLine);
+        if (firstBlankIndex >= 0) {
+          return {
+            ...current,
+            lines: [
+              ...currentLines.slice(0, firstBlankIndex),
+              line,
+              currentLines[firstBlankIndex],
+              ...currentLines.slice(firstBlankIndex + 1)
+            ]
+          };
+        }
+      }
+      return {
+        ...current,
+        lines: [...currentLines, line]
+      };
+    });
     setInvoiceBuilderSearch("");
+  }
+
+  function addInvoiceBuilderMatch(item) {
+    if (!item) {
+      return;
+    }
+    addInvoiceBuilderLine(buildInvoiceBuilderLineFromInventory(item));
+  }
+
+  function handleInvoiceBuilderSearchKeyDown(event) {
+    if (!invoiceBuilderMatches.length) {
+      return;
+    }
+    if (event.key === "ArrowDown" || event.key === "ArrowRight") {
+      event.preventDefault();
+      setInvoiceBuilderMatchIndex((current) => Math.min(invoiceBuilderMatches.length - 1, current + 1));
+    } else if (event.key === "ArrowUp" || event.key === "ArrowLeft") {
+      event.preventDefault();
+      setInvoiceBuilderMatchIndex((current) => Math.max(0, current - 1));
+    } else if (event.key === "Enter") {
+      event.preventDefault();
+      addInvoiceBuilderMatch(invoiceBuilderMatches[invoiceBuilderMatchIndex] || invoiceBuilderMatches[0]);
+    }
   }
 
   function removeInvoiceBuilderLine(lineId) {
@@ -3692,6 +4009,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     const name = cleanText(invoiceBuilderDraft.customerName);
     const email = cleanText(invoiceBuilderDraft.customerEmail);
     const address = cleanText(invoiceBuilderDraft.customerAddress);
+    const customerBusinessName = cleanText(invoiceBuilderDraft.customerBusinessName);
     const selectedCustomer = invoiceBuilderDraft.customerId
       ? customers.find((customer) => String(customer.id || "") === String(invoiceBuilderDraft.customerId))
       : null;
@@ -3704,7 +4022,8 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         name: name || matchedCustomer.name,
         phone: `+91${phone}`,
         email: email || matchedCustomer.email,
-        address: address || matchedCustomer.address
+        address: address || matchedCustomer.address,
+        businessName: customerBusinessName || getCustomerBusinessName(matchedCustomer)
       });
       if (updatePayload) {
         const updatedCustomer = await updateCustomer(matchedCustomer.id, updatePayload);
@@ -3720,7 +4039,8 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       name: name || DEFAULT_WALK_IN_CUSTOMER_NAME,
       phone: phone.length === 10 ? `+91${phone}` : "",
       email,
-      address
+      address,
+      businessName: customerBusinessName
     });
     replaceCustomerInState(newCustomer);
     return newCustomer;
@@ -3728,6 +4048,8 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
 
   async function submitStandardInvoice(event) {
     event.preventDefault();
+    const submitAction = event.nativeEvent?.submitter?.value || "";
+    const shouldPrintInvoice = submitAction === "print";
     const lines = (invoiceBuilderDraft.lines || []).filter((line) => cleanText(line.itemName) && Number(line.quantity || 0) > 0 && Number(line.inclusivePrice || 0) > 0);
     if (!lines.length) {
       showMessage("Add at least one invoice item with name, quantity, and price.");
@@ -3740,7 +4062,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     const requestedPaidAmount = paymentStatus === "full"
       ? summaryRows.total
       : (paymentStatus === "partial" ? Math.min(summaryRows.total, Math.max(0, Number(invoiceBuilderDraft.paymentAmount || 0))) : 0);
-    const invoiceNumber = cleanText(invoiceBuilderDraft.invoiceNumber);
+    const invoiceNumber = cleanText(invoiceBuilderDraft.invoiceNumber) || buildClientInvoiceNumber(issuedOn);
 
     try {
       const savedCustomer = await resolveInvoiceBuilderCustomer();
@@ -3773,6 +4095,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
           itemId: line.itemId || "",
           itemName: cleanText(line.itemName),
           barcode: cleanText(line.barcode),
+          hsn: cleanText(line.hsn || line.hsnSac || line.hsn_sac || line.sac),
           quantity: Number(line.quantity || 0),
           mrp: Number(line.mrp || inclusivePrice || 0),
           inclusivePrice,
@@ -3783,7 +4106,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
           lineTotal: inclusivePrice * Number(line.quantity || 0)
         };
       });
-      saveInvoiceDetail(savedInvoice, {
+      const invoiceDetailPayload = {
         source: "standard-invoice",
         template: invoiceBuilderDraft.template,
         layout: invoiceBuilderDraft.layout,
@@ -3795,8 +4118,12 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
           name: savedCustomer.name,
           phone: savedCustomer.phone,
           email: savedCustomer.email,
-          address: savedCustomer.address
+          address: savedCustomer.address,
+          businessName: cleanText(invoiceBuilderDraft.customerBusinessName, getCustomerBusinessName(savedCustomer))
         },
+        customerBusinessName: cleanText(invoiceBuilderDraft.customerBusinessName, getCustomerBusinessName(savedCustomer)),
+        placeOfSupply: cleanText(invoiceBuilderDraft.placeOfSupply || settings.businessState),
+        placeOfSupplyCode: cleanText(settings.businessStateCode),
         paymentMethod: cleanText(invoiceBuilderDraft.paymentMethod, "Cash"),
         paymentType: paymentStatus,
         paidAmount: requestedPaidAmount,
@@ -3814,11 +4141,21 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         },
         summary: summaryRows,
         items: storedLines
-      });
+      };
+      saveInvoiceDetail(savedInvoice, invoiceDetailPayload);
       deductSoldInventory(storedLines);
       await loadDashboard();
+      if (shouldPrintInvoice) {
+        printPOSBill({
+          ...makePrintPayloadFromInvoice(savedInvoice, invoiceDetailPayload),
+          paperSize: "A4",
+          printLayout: "invoice",
+          printCalibration: getCalibrationForSettings({ ...settings, printPaperSize: "A4", printLayout: "invoice" })
+        });
+      }
       closeModal();
-      showMessage(requestedPaidAmount > 0 ? "Standard invoice created and payment recorded." : "Standard invoice created.");
+      switchView("invoicesView");
+      showMessage(shouldPrintInvoice ? "Standard invoice created and sent to print." : (requestedPaidAmount > 0 ? "Standard invoice created and payment recorded." : "Standard invoice created."));
     } catch (error) {
       showMessage(error.message || "Could not create the standard invoice.");
     }
@@ -4178,12 +4515,14 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     const nextEmail = cleanText(importedCustomer?.email || importedCustomer?.customerEmail, cleanText(existingCustomer.email));
     const nextAddress = cleanText(importedCustomer?.address || importedCustomer?.customerAddress, cleanText(existingCustomer.address));
     const nextPhone = cleanText(importedCustomer?.phone || importedCustomer?.customerPhone, cleanText(existingCustomer.phone));
+    const nextBusinessName = cleanText(importedCustomer?.businessName || importedCustomer?.business_name || importedCustomer?.customerBusinessName, getCustomerBusinessName(existingCustomer));
     const currentName = cleanText(existingCustomer.name);
     const currentEmail = cleanText(existingCustomer.email);
     const currentAddress = cleanText(existingCustomer.address);
     const currentPhone = cleanText(existingCustomer.phone);
+    const currentBusinessName = getCustomerBusinessName(existingCustomer);
     const phoneChanged = normalizePhone(currentPhone) !== normalizePhone(nextPhone);
-    const changed = nextName !== currentName || nextEmail !== currentEmail || nextAddress !== currentAddress || phoneChanged;
+    const changed = nextName !== currentName || nextEmail !== currentEmail || nextAddress !== currentAddress || phoneChanged || nextBusinessName !== currentBusinessName;
 
     if (!changed || !nextName) {
       return null;
@@ -4193,7 +4532,8 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       name: nextName,
       email: nextEmail,
       address: nextAddress,
-      phone: nextPhone
+      phone: nextPhone,
+      businessName: nextBusinessName
     };
   }
 
@@ -4561,7 +4901,8 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                 name: fallbackName,
                 email: customer.email,
                 address: customer.address,
-                phone: customer.phone
+                phone: customer.phone,
+                businessName: customer.businessName
               });
               knownCustomers.push(savedCustomer);
               transferSummary.customers += 1;
@@ -4606,7 +4947,8 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                     name: fallbackName,
                     email: invoice.customerEmail,
                     address: invoice.customerAddress,
-                    phone: invoice.customerPhone
+                    phone: invoice.customerPhone,
+                    businessName: invoice.customerBusinessName
                   });
                   knownCustomers.push(savedCustomer);
                   customerId = Number(savedCustomer.id || 0);
@@ -4878,6 +5220,10 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                     <input name="customer_name" type="text" autoComplete="name" placeholder="Optional customer name" value={customer.name || ""} onChange={(event) => updatePOSCustomer(formId, { name: event.target.value })} />
                   </label>
                   <label>
+                    Business Name
+                    <input name="customer_business_name" type="text" autoComplete="organization" placeholder="Optional business name" value={customer.businessName || ""} onChange={(event) => updatePOSCustomer(formId, { businessName: event.target.value })} />
+                  </label>
+                  <label>
                     Email
                     <input name="customer_email" type="email" autoComplete="email" placeholder="Optional email address" value={customer.email || ""} onChange={(event) => updatePOSCustomer(formId, { email: event.target.value })} />
                   </label>
@@ -5091,18 +5437,24 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
   return (
     <>
       <IconSprite />
-      <main className="desktop-app" data-active-view={activeView} data-pos-navigation={isPOSView && posNavigationOpen ? "open" : "closed"}>
-        {isPOSView ? (
+      <main className="desktop-app" data-active-view={activeView} data-billing-workspace={isBillingWorkspace ? "true" : "false"} data-pos-navigation={isBillingWorkspace && posNavigationOpen ? "open" : "closed"}>
+        {isBillingWorkspace ? (
           <button
-            className="pos-navigation-toggle"
+            className={`pos-navigation-toggle ${posNavigationOpen ? "open" : ""}`}
             type="button"
             aria-label={posNavigationOpen ? "Hide navigation" : "Show navigation"}
             aria-expanded={posNavigationOpen}
             onClick={() => setPosNavigationOpen((open) => !open)}
           >
-            <span></span>
-            <span></span>
-            <span></span>
+            {posNavigationOpen ? (
+              <span className="nav-toggle-arrow"></span>
+            ) : (
+              <>
+                <span></span>
+                <span></span>
+                <span></span>
+              </>
+            )}
           </button>
         ) : null}
         <section className="app-workspace" ref={appWorkspaceRef}>
@@ -5246,6 +5598,123 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
               </section>
             </section> : null}
 
+            {renderedViews.standardInvoiceView ? <section id="standardInvoiceView" className={`app-view standard-invoice-view ${activeView === "standardInvoiceView" ? "active" : ""}`} data-title="Standard Invoicing">
+              <section className="panel standard-invoice-panel">
+                <div className="panel-header">
+                  <div>
+                    <h2>Standard Invoicing</h2>
+                  </div>
+                </div>
+                <form className="invoice-builder invoice-builder-workspace" onSubmit={submitStandardInvoice}>
+                  <section className="invoice-builder-editor">
+                    <div className="standard-invoice-meta">
+                      <span><strong>INV. No.</strong> {standardInvoiceNumber}</span>
+                      <span><strong>Billing Date</strong> {standardBillingDateLabel}</span>
+                      <label className="standard-due-date-picker">
+                        <span><strong>Due Date</strong> {standardDueDateLabel}</span>
+                        <input type="date" value={invoiceBuilderDraft.dueOn} onChange={(event) => updateInvoiceBuilderField("dueOn", event.target.value)} aria-label="Change due date" />
+                      </label>
+                    </div>
+                    <section className="invoice-builder-section standard-stack-section">
+                      <div className="standard-party-card standard-business-card">
+                        <h3>Your Business Details</h3>
+                        <div className="standard-business-summary" aria-label="Prefilled business details">
+                          <div><span>Business Name</span><strong>{businessName || "Store Name"}</strong></div>
+                          <div><span>Contact Number</span><strong>{settings.businessPhone || "Not added"}</strong></div>
+                          <div><span>Email</span><strong>{settings.businessEmail || "Not added"}</strong></div>
+                          <div><span>PAN</span><strong>{settings.businessPan || "Not added"}</strong></div>
+                          <div><span>GSTIN</span><strong>{settings.gstin || "Not added"}</strong></div>
+                          <div><span>State</span><strong>{settings.businessState || "Not added"}{settings.businessStateCode ? ` (${settings.businessStateCode})` : ""}</strong></div>
+                          <div className="standard-business-address"><span>Address</span><strong>{settings.businessAddress || "Not added"}</strong></div>
+                        </div>
+                        <p className="standard-business-note">These details are pre-filled from Business Management and will be used on the printed GST invoice.</p>
+                      </div>
+                      <div className="standard-party-card standard-customer-card">
+                        <h3>Customer Info</h3>
+                        <div className="form-grid standard-customer-grid">
+                          <label>Business / Customer Name<input type="text" value={invoiceBuilderDraft.customerName} onChange={(event) => updateInvoiceBuilderName(event.target.value)} placeholder="Search or enter customer name" /></label>
+                          <label>Contact Number<input type="tel" value={invoiceBuilderDraft.customerPhone} onChange={(event) => updateInvoiceBuilderPhone(event.target.value)} placeholder="10 digit phone autofills saved customer" /></label>
+                          <label>Email <span className="optional-label">optional</span><input type="email" value={invoiceBuilderDraft.customerEmail} onChange={(event) => updateInvoiceBuilderField("customerEmail", event.target.value)} placeholder="Optional email" /></label>
+                          <label>Address<input type="text" value={invoiceBuilderDraft.customerAddress} onChange={(event) => updateInvoiceBuilderField("customerAddress", event.target.value)} placeholder="Customer address" /></label>
+                          <label>Place of Supply<input type="text" value={invoiceBuilderDraft.placeOfSupply} onChange={(event) => updateInvoiceBuilderField("placeOfSupply", event.target.value)} placeholder={settings.businessState || "Customer state"} /></label>
+                        </div>
+                        {invoiceBuilderCustomerMatches.length ? (
+                          <div className="invoice-builder-matches customer-match-strip">
+                            {invoiceBuilderCustomerMatches.map((customer) => (
+                              <button type="button" key={customer.id || `${customer.phone}-${customer.name}`} onClick={() => applyInvoiceBuilderCustomer(customer)}>
+                                <span>{cleanText(customer.name, getCustomerBusinessName(customer) || "Saved customer")}</span>
+                                <small>{normalizePhone(customer.phone) || "No phone"}{customer.address ? ` | ${customer.address}` : ""}</small>
+                              </button>
+                            ))}
+                          </div>
+                        ) : null}
+                      </div>
+                      <div className="standard-party-card standard-payment-card">
+                        <h3>Payment Information</h3>
+                        <div className="form-grid standard-payment-grid">
+                          <label>Payment Status<select value={invoiceBuilderDraft.paymentStatus} onChange={(event) => updateInvoiceBuilderField("paymentStatus", event.target.value)}><option value="pending">Pending</option><option value="full">Full Payment</option><option value="partial">Partial Payment</option></select></label>
+                          <label>Payment Method<select value={invoiceBuilderDraft.paymentMethod} onChange={(event) => updateInvoiceBuilderField("paymentMethod", event.target.value)}><option>Cash</option><option>UPI</option><option>Card</option><option>Bank Transfer</option></select></label>
+                          <label>Paid Amount<input type="number" min="0" step="0.01" value={invoiceBuilderDraft.paymentAmount} onChange={(event) => updateInvoiceBuilderField("paymentAmount", event.target.value)} placeholder="For partial payment" /></label>
+                        </div>
+                      </div>
+                    </section>
+                    <section className="invoice-builder-section">
+                      <h3>Items</h3>
+                      <div className="invoice-builder-search">
+                        <label>Search Inventory<input type="search" value={invoiceBuilderSearch} onChange={(event) => setInvoiceBuilderSearch(event.target.value)} onKeyDown={handleInvoiceBuilderSearchKeyDown} placeholder="Search and add inventory items" /></label>
+                        <button type="button" className="button button-secondary" onClick={() => addInvoiceBuilderLine()}>Add Item</button>
+                      </div>
+                      {invoiceBuilderMatches.length ? (
+                        <div className="invoice-builder-matches">
+                          {invoiceBuilderMatches.map((item, index) => (
+                            <button type="button" className={index === invoiceBuilderMatchIndex ? "active" : ""} key={getInventoryItemKey(item, index)} onClick={() => addInvoiceBuilderMatch(item)}>
+                              <span>{getInventoryItemName(item)}</span>
+                              <small>{getInventoryBarcodeLabel(item)} | {currency(item.inclusivePrice || item.inclusive_price || 0)}</small>
+                            </button>
+                          ))}
+                        </div>
+                      ) : null}
+                      <div className="invoice-builder-lines">
+                        <div className="invoice-builder-line invoice-builder-line-head" aria-hidden="true">
+                          <span>#</span>
+                          <span>Item</span>
+                          <span>Barcode</span>
+                          <span>Qty</span>
+                          <span>MRP</span>
+                          <span>SP</span>
+                          <span>Disc</span>
+                          <span>GST</span>
+                          <span>Total</span>
+                          <span></span>
+                        </div>
+                        {(invoiceBuilderDraft.lines || []).map((line, index) => (
+                          <article className="invoice-builder-line" key={line.id}>
+                            <span className="line-index">{index + 1}</span>
+                            <input type="text" value={line.itemName} onChange={(event) => updateInvoiceBuilderLine(line.id, "itemName", event.target.value)} placeholder="Item name" />
+                            <input type="text" value={line.barcode} onChange={(event) => updateInvoiceBuilderLine(line.id, "barcode", event.target.value)} placeholder="Barcode" />
+                            <input type="number" min="1" step="1" value={line.quantity} onChange={(event) => updateInvoiceBuilderLine(line.id, "quantity", event.target.value)} aria-label="Quantity" />
+                            <input type="number" min="0" step="0.01" value={line.mrp} onChange={(event) => updateInvoiceBuilderLine(line.id, "mrp", event.target.value)} aria-label="MRP" />
+                            <input type="number" min="0.01" step="0.01" value={line.inclusivePrice} onChange={(event) => updateInvoiceBuilderLine(line.id, "inclusivePrice", event.target.value)} aria-label="Selling price" />
+                            <input type="number" min="0" max="100" step="0.01" value={line.discountPercent === "" ? "" : Number(line.discountPercent || 0).toFixed(2)} onChange={(event) => updateInvoiceBuilderLine(line.id, "discountPercent", event.target.value)} aria-label="Discount" />
+                            <select value={line.gstRate} onChange={(event) => updateInvoiceBuilderLine(line.id, "gstRate", event.target.value)} aria-label="GST Rate"><option value="0">0%</option><option value="5">5%</option><option value="12">12%</option><option value="18">18%</option><option value="28">28%</option></select>
+                            <strong>{isBlankInvoiceBuilderLine(line) ? "" : currency(Number(line.inclusivePrice || 0) * Number(line.quantity || 0))}</strong>
+                            <button type="button" className="line-remove" onClick={() => removeInvoiceBuilderLine(line.id)}>&times;</button>
+                          </article>
+                        ))}
+                      </div>
+                    </section>
+                    <div className="standard-footer-row">
+                      <div className="modal-actions invoice-builder-actions standard-invoice-actions">
+                        <button type="button" className="button button-secondary" onClick={() => switchView("invoicesView")}>Cancel</button>
+                        <button type="submit" className="button button-secondary" value="save">Create Standard Invoice</button>
+                        <button type="submit" className="button button-primary" value="print">Print Invoice</button>
+                      </div>
+                    </div>
+                  </section>
+                </form>
+              </section>
+            </section> : null}
+
             {renderedViews.invoicesView ? <section id="invoicesView" className={`app-view ${activeView === "invoicesView" ? "active" : ""}`} data-title="Invoices">
               <section className="panel">
                 <div className="panel-header">
@@ -5261,6 +5730,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                         <tr>
                           <th>Serial No.</th>
                           <th>Customer Name</th>
+                          <th>Business Name</th>
                           <th>Phone No.</th>
                           <th>Date</th>
                           <th>Invoice Number</th>
@@ -5338,6 +5808,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                             <tr key={customer.id || customer.name || index}>
                               <td>{index + 1}</td>
                               <td>{customer.name}</td>
+                              <td>{getCustomerBusinessName(customer) || "Not added"}</td>
                               <td>{customer.phone || "Not added"}</td>
                               <td>{customer.email || "Not added"}</td>
                               <td>{customer.address || "Not added"}</td>
@@ -5372,7 +5843,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
             <span><span>{visibleBusinessName}</span><small>{authGateActive ? "Locked workspace" : "Store workspace"}</small></span>
           </button>
           <nav className="right-nav-links">
-            {navigationViews.map((view) => (
+            {navigationViews.filter((view) => !view.hidden).map((view) => (
               <button key={view.id} className={`nav-item ${view.billing ? "nav-billing" : ""} ${activeView === view.id ? "active" : ""}`} type="button" onClick={() => switchView(view.id)}>
                 <span className="nav-icon"><svg><use href={`#icon-${view.icon}`}></use></svg></span>
                 {view.title}
@@ -5416,6 +5887,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       <Modal open={activeModal === "customer"} title="Add Customer" subtitle="Create a customer record for invoices and future payment activity." onClose={closeModal}>
         <form onSubmit={submitCustomer}>
           <label>Customer Name<input name="name" type="text" placeholder="Northwind Labs" required /></label>
+          <label>Business Name<input name="businessName" type="text" placeholder="Optional business name" /></label>
           <div className="form-grid">
             <label>Email<input name="email" type="email" placeholder="Optional" /></label>
             <label>Phone<input name="phone" type="text" placeholder="Optional" /></label>
@@ -5579,122 +6051,6 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         ) : <Empty>Select an invoice to view complete details.</Empty>}
       </Modal>
 
-      <Modal open={activeModal === "invoice"} title="Create Standard Invoice" subtitle="Create a standard bill with items, customer details, taxes, discounts, terms, and a live print-ready preview." large cardClass="invoice-builder-modal" onClose={closeModal}>
-        <form className="invoice-builder" onSubmit={submitStandardInvoice}>
-          <section className="invoice-builder-editor">
-            <div className="invoice-builder-toolbar">
-              <label>Template<select value={invoiceBuilderDraft.template} onChange={(event) => updateInvoiceBuilderField("template", event.target.value)}><option value="standard">Standard Invoice</option><option value="gst">GST Invoice</option><option value="proforma">Proforma Invoice</option><option value="custom">Custom Invoice</option></select></label>
-              <label>Invoice Number<input type="text" value={invoiceBuilderDraft.invoiceNumber} onChange={(event) => updateInvoiceBuilderField("invoiceNumber", event.target.value)} placeholder={buildClientInvoiceNumber(todayISO())} /></label>
-              <label>Issued On<input type="date" value={invoiceBuilderDraft.issuedOn} onChange={(event) => updateInvoiceBuilderField("issuedOn", event.target.value)} /></label>
-              <label>Due On<input type="date" value={invoiceBuilderDraft.dueOn} onChange={(event) => updateInvoiceBuilderField("dueOn", event.target.value)} /></label>
-            </div>
-            <section className="invoice-builder-section">
-              <h3>Customer Details</h3>
-              <div className="form-grid settings-form-grid">
-                <label>Saved Customer<select value={invoiceBuilderDraft.customerId} onChange={(event) => {
-                  const customer = customers.find((entry) => String(entry.id) === String(event.target.value));
-                  setInvoiceBuilderDraft((current) => ({
-                    ...current,
-                    customerId: event.target.value,
-                    customerName: customer?.name || current.customerName,
-                    customerPhone: normalizePhone(customer?.phone || current.customerPhone).slice(-10),
-                    customerEmail: customer?.email || current.customerEmail,
-                    customerAddress: customer?.address || current.customerAddress
-                  }));
-                }}><option value="">New / Walk-in customer</option>{customers.map((customer) => <option key={customer.id} value={customer.id}>{customer.name}</option>)}</select></label>
-                <label>Name<input type="text" value={invoiceBuilderDraft.customerName} onChange={(event) => updateInvoiceBuilderField("customerName", event.target.value)} placeholder="Optional customer name" /></label>
-                <label>Phone<input type="tel" value={invoiceBuilderDraft.customerPhone} onChange={(event) => updateInvoiceBuilderField("customerPhone", event.target.value)} placeholder="10 digit phone" /></label>
-                <label>Email<input type="email" value={invoiceBuilderDraft.customerEmail} onChange={(event) => updateInvoiceBuilderField("customerEmail", event.target.value)} placeholder="Optional" /></label>
-                <label className="settings-span-2">Address<textarea rows="2" value={invoiceBuilderDraft.customerAddress} onChange={(event) => updateInvoiceBuilderField("customerAddress", event.target.value)} placeholder="Optional address"></textarea></label>
-              </div>
-            </section>
-            <section className="invoice-builder-section">
-              <h3>Items</h3>
-              <div className="invoice-builder-search">
-                <label>Search Inventory<input type="search" value={invoiceBuilderSearch} onChange={(event) => setInvoiceBuilderSearch(event.target.value)} placeholder="Search and add inventory items" /></label>
-                <button type="button" className="button button-secondary" onClick={() => addInvoiceBuilderLine()}>Add Manual Item</button>
-              </div>
-              {invoiceBuilderMatches.length ? (
-                <div className="invoice-builder-matches">
-                  {invoiceBuilderMatches.map((item, index) => (
-                    <button type="button" key={getInventoryItemKey(item, index)} onClick={() => addInvoiceBuilderLine(buildInvoiceBuilderLineFromInventory(item))}>
-                      <span>{getInventoryItemName(item)}</span>
-                      <small>{getInventoryBarcodeLabel(item)} | {currency(item.inclusivePrice || item.inclusive_price || 0)}</small>
-                    </button>
-                  ))}
-                </div>
-              ) : null}
-              <div className="invoice-builder-lines">
-                {(invoiceBuilderDraft.lines || []).map((line, index) => (
-                  <article className="invoice-builder-line" key={line.id}>
-                    <span className="line-index">{index + 1}</span>
-                    <input type="text" value={line.itemName} onChange={(event) => updateInvoiceBuilderLine(line.id, "itemName", event.target.value)} placeholder="Item name" required />
-                    <input type="text" value={line.barcode} onChange={(event) => updateInvoiceBuilderLine(line.id, "barcode", event.target.value)} placeholder="Barcode" />
-                    <input type="number" min="1" step="1" value={line.quantity} onChange={(event) => updateInvoiceBuilderLine(line.id, "quantity", event.target.value)} aria-label="Quantity" required />
-                    <input type="number" min="0" step="0.01" value={line.mrp} onChange={(event) => updateInvoiceBuilderLine(line.id, "mrp", event.target.value)} aria-label="MRP" />
-                    <input type="number" min="0.01" step="0.01" value={line.inclusivePrice} onChange={(event) => updateInvoiceBuilderLine(line.id, "inclusivePrice", event.target.value)} aria-label="Selling price" required />
-                    <input type="number" min="0" max="100" step="0.01" value={Number(line.discountPercent || 0).toFixed(2)} onChange={(event) => updateInvoiceBuilderLine(line.id, "discountPercent", event.target.value)} aria-label="Discount" />
-                    <select value={line.gstRate} onChange={(event) => updateInvoiceBuilderLine(line.id, "gstRate", event.target.value)} aria-label="GST Rate"><option value="0">0%</option><option value="5">5%</option><option value="12">12%</option><option value="18">18%</option><option value="28">28%</option></select>
-                    <strong>{currency(Number(line.inclusivePrice || 0) * Number(line.quantity || 0))}</strong>
-                    <button type="button" className="line-remove" onClick={() => removeInvoiceBuilderLine(line.id)}>&times;</button>
-                  </article>
-                ))}
-              </div>
-            </section>
-            <section className="invoice-builder-section">
-              <h3>Terms, Payment & Layout</h3>
-              <div className="form-grid settings-form-grid">
-                <label>Payment Status<select value={invoiceBuilderDraft.paymentStatus} onChange={(event) => updateInvoiceBuilderField("paymentStatus", event.target.value)}><option value="pending">Pending</option><option value="full">Full Payment</option><option value="partial">Partial Payment</option></select></label>
-                <label>Payment Method<select value={invoiceBuilderDraft.paymentMethod} onChange={(event) => updateInvoiceBuilderField("paymentMethod", event.target.value)}><option>Cash</option><option>UPI</option><option>Card</option><option>Bank Transfer</option></select></label>
-                <label>Paid Amount<input type="number" min="0" step="0.01" value={invoiceBuilderDraft.paymentAmount} onChange={(event) => updateInvoiceBuilderField("paymentAmount", event.target.value)} placeholder="For partial payment" /></label>
-                <label>Header Placement<select value={invoiceBuilderDraft.headerPlacement} onChange={(event) => updateInvoiceBuilderField("headerPlacement", event.target.value)}><option value="center">Centered</option><option value="left">Left aligned</option><option value="split">Logo left, details right</option></select></label>
-                <label>Logo Placement<select value={invoiceBuilderDraft.logoPlacement} onChange={(event) => updateInvoiceBuilderField("logoPlacement", event.target.value)}><option value="top">Top</option><option value="left">Left</option><option value="hidden">Hidden</option></select></label>
-                <label>Table Layout<select value={invoiceBuilderDraft.tableLayout} onChange={(event) => updateInvoiceBuilderField("tableLayout", event.target.value)}><option value="detailed">Detailed GST Table</option><option value="compact">Compact Table</option></select></label>
-                <label className="settings-span-2">Payment Terms<textarea rows="2" value={invoiceBuilderDraft.paymentTerms} onChange={(event) => updateInvoiceBuilderField("paymentTerms", event.target.value)}></textarea></label>
-                <label className="settings-span-2">Notes<textarea rows="2" value={invoiceBuilderDraft.notes} onChange={(event) => updateInvoiceBuilderField("notes", event.target.value)} placeholder="Optional invoice notes"></textarea></label>
-                <label className="settings-span-2">Terms & Conditions<textarea rows="2" value={invoiceBuilderDraft.terms} onChange={(event) => updateInvoiceBuilderField("terms", event.target.value)}></textarea></label>
-              </div>
-            </section>
-          </section>
-          <aside className="invoice-builder-preview-panel">
-            <div className={`a4-preview ${invoiceBuilderDraft.headerPlacement} logo-${invoiceBuilderDraft.logoPlacement}`}>
-              <header>
-                {invoiceBuilderDraft.logoPlacement !== "hidden" ? <StoreLogo source={storeLogoSource} fallback={fallbackInitials} className="a4-preview-logo" /> : null}
-                <div>
-                  <h3>{businessName}</h3>
-                  <p>{ownerName}</p>
-                  <p>{settings.businessPhone || settings.businessEmail || "Business contact not added"}</p>
-                  <p>{settings.gstin ? `GSTIN ${settings.gstin}` : "GSTIN not added"}</p>
-                </div>
-              </header>
-              <section className="a4-preview-meta">
-                <div><strong>Invoice</strong><span>{invoiceBuilderDraft.invoiceNumber || buildClientInvoiceNumber(todayISO())}</span></div>
-                <div><strong>Date</strong><span>{invoiceBuilderDraft.issuedOn}</span></div>
-                <div><strong>Customer</strong><span>{invoiceBuilderDraft.customerName || DEFAULT_WALK_IN_CUSTOMER_NAME}</span></div>
-              </section>
-              <table>
-                <thead><tr><th>Item</th><th>Qty</th><th>Rate</th><th>GST</th><th>Total</th></tr></thead>
-                <tbody>
-                  {(invoiceBuilderDraft.lines || []).filter((line) => cleanText(line.itemName)).slice(0, 8).map((line) => (
-                    <tr key={`preview-${line.id}`}><td>{line.itemName}</td><td>{line.quantity}</td><td>{currency(line.inclusivePrice)}</td><td>{line.gstRate}%</td><td>{currency(Number(line.inclusivePrice || 0) * Number(line.quantity || 0))}</td></tr>
-                  ))}
-                </tbody>
-              </table>
-              <div className="a4-preview-totals">
-                <span>Taxable {currency(invoiceBuilderSummary.subtotal)}</span>
-                <span>GST {currency(invoiceBuilderSummary.gst)}</span>
-                <strong>Grand Total {currency(invoiceBuilderSummary.total)}</strong>
-              </div>
-              <p>{invoiceBuilderDraft.terms}</p>
-            </div>
-            <div className="modal-actions invoice-builder-actions">
-              <button type="button" className="button button-secondary" onClick={closeModal}>Cancel</button>
-              <button type="submit" className="button button-primary">Create Standard Invoice</button>
-            </div>
-          </aside>
-        </form>
-      </Modal>
-
       <Modal open={activeModal === "settings"} title="Settings" subtitle="Change appearance and personalize this billing workspace." large cardClass="settings-modal-card" onClose={closeModal}>
         {SettingsForm()}
       </Modal>
@@ -5810,7 +6166,9 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         unit: "pcs",
         reorder_level: "5",
         max_stock_level: "25",
-        warehouse_id: activeWarehouseId || "main"
+        warehouse_id: activeWarehouseId || "main",
+        image_url: "",
+        image_name: ""
       };
     }
     function buildInventoryDraft(item) {
@@ -5839,7 +6197,9 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         max_stock_level: item.maxStockLevel !== undefined && item.maxStockLevel !== null
           ? String(item.maxStockLevel)
           : (item.max_stock_level !== undefined && item.max_stock_level !== null ? String(item.max_stock_level) : "25"),
-        warehouse_id: cleanText(item.warehouseId || item.warehouse_id, activeWarehouseId || "main")
+        warehouse_id: cleanText(item.warehouseId || item.warehouse_id, activeWarehouseId || "main"),
+        image_url: cleanText(item.imageUrl || item.image_url),
+        image_name: cleanText(item.imageName || item.image_name)
       };
     }
     const [draft, setDraft] = useState(makeEmptyInventoryDraft);
@@ -5862,6 +6222,21 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         ...current,
         stock: String(Math.max(0, Number(current.stock || 0) + (delta * adjustment)))
       }));
+    }
+    async function updateProductImage(file) {
+      if (!file) {
+        return;
+      }
+      try {
+        const image = await readFileAsDataURL(file);
+        setDraft((current) => ({
+          ...current,
+          image_url: image,
+          image_name: file.name
+        }));
+      } catch (error) {
+        showMessage(error.message || "Could not read the product image.");
+      }
     }
     const selectedInventoryItem = useMemo(() => (
       selectedInventoryItemId
@@ -5931,6 +6306,8 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         reorderLevel: nextReorderLevel,
         maxStockLevel: nextMaxStockLevel,
         warehouseId: cleanText(draft.warehouse_id, activeWarehouseId || "main"),
+        imageUrl: cleanText(draft.image_url),
+        imageName: cleanText(draft.image_name),
         mrp: nextMrp,
         inclusivePrice: nextInclusivePrice,
         discountPercent: calculateDiscountPercent(nextMrp, nextInclusivePrice),
@@ -5988,6 +6365,30 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                     </div>
                   ))}
                   <button className="button button-secondary barcode-add-button" type="button" onClick={() => setBarcodeInputs((current) => [...current, ""])}>Add Barcode</button>
+                </div>
+                <div className="inventory-image-editor">
+                  <div className="inventory-image-preview">
+                    {draft.image_url ? <img src={draft.image_url} alt="Product preview" /> : <span>No image</span>}
+                  </div>
+                  <div>
+                    <h3>Product Image</h3>
+                    <p className="record-meta">{draft.image_name || "Add a clear product photo for inventory and online catalog use."}</p>
+                  </div>
+                  <div className="record-actions">
+                    <label className="button button-secondary">Upload Image
+                      <input
+                        className="settings-hidden-input"
+                        type="file"
+                        accept="image/*"
+                        onChange={(event) => {
+                          const file = event.target.files?.[0];
+                          updateProductImage(file);
+                          event.target.value = "";
+                        }}
+                      />
+                    </label>
+                    <button type="button" className="button button-secondary" onClick={() => setDraft((current) => ({ ...current, image_url: "", image_name: "" }))}>Remove</button>
+                  </div>
                 </div>
               </section>
               <section className="inventory-form-section">
@@ -6087,6 +6488,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                 const itemName = getInventoryItemName(item) || "Untitled item";
                 const inclusivePrice = Number(item.inclusivePrice || item.inclusive_price || 0);
                 const barcode = getInventoryBarcodeLabel(item);
+                const productImage = cleanText(item.imageUrl || item.image_url);
                 const quantityLabel = `${Number(item.stock || 0)} ${item.unit || "pcs"}`;
                 const warehouseName = managedWarehouses.find((warehouse) => warehouse.id === (item.warehouseId || item.warehouse_id))?.name;
                 const isSelected = selectedInventoryItemId === itemKey || selectedInventoryItemId === String(item.id || "");
@@ -6106,6 +6508,9 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                     }}
                   >
                       <div className="inventory-item-compact-top">
+                        <div className="inventory-item-thumb">
+                          {productImage ? <img src={productImage} alt={`${itemName} product`} /> : <span>{itemName.charAt(0).toUpperCase()}</span>}
+                        </div>
                           <div className="inventory-item-copy">
                             <h3>{itemName}</h3>
                           <p className="inventory-compact-meta">Barcode {barcode}{warehouseName ? ` | ${warehouseName}` : ""}</p>
@@ -6137,9 +6542,12 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
   }
 
   function SellOnlineView({ active }) {
-    const visibleProducts = sellOnlineProducts.slice(0, 180);
+    const visibleProducts = sellOnlineProducts.slice(0, 80);
     const hiddenCount = Math.max(0, sellOnlineProducts.length - visibleProducts.length);
     const onlineStoreUrl = onlineStoreProfile?.public_url || "";
+    const selectedOutOfStock = selectedSellOnlineProducts.filter((product) => Number(product.stock || 0) <= 0).length;
+    const selectedValue = selectedSellOnlineProducts.reduce((total, product) => total + (Number(product.onlinePrice || 0) * Math.max(0, Number(product.stock || 0))), 0);
+    const publishReady = selectedSellOnlineProducts.length > 0 && !selectedOutOfStock && cleanText(businessName) && (settings.businessPhone || settings.businessEmail);
 
     return (
       <section id="sellOnlineView" className={`app-view ${active ? "active" : ""}`} data-title="Sell Online">
@@ -6147,13 +6555,31 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
           <div className="panel-header sell-online-header">
             <div>
               <h2>Sell Online</h2>
-              <div className="panel-subtitle">Publish selected inventory products to your public CinchPOS online store.</div>
+              <div className="panel-subtitle">Build a clean public catalog from inventory, review stock readiness, and publish to your CinchPOS online store.</div>
             </div>
             <div className="sell-online-stats">
               <span>{selectedSellOnlineProducts.length} selected</span>
               <span>{inventoryItems.length} inventory items</span>
-              {onlineStoreProfile?.slug ? <span>{onlineStoreProfile.slug}</span> : null}
+              <span>{onlineStoreProfile?.slug || "Not published"}</span>
             </div>
+          </div>
+
+          <div className="sell-online-command-strip">
+            <article>
+              <span>Catalog Readiness</span>
+              <strong>{publishReady ? "Ready" : "Needs review"}</strong>
+              <small>{selectedOutOfStock ? `${selectedOutOfStock} selected product(s) are out of stock` : "Only in-stock products should be published."}</small>
+            </article>
+            <article>
+              <span>Online Stock Value</span>
+              <strong>{currency(selectedValue)}</strong>
+              <small>Based on selected product stock and online price.</small>
+            </article>
+            <article>
+              <span>Store Identity</span>
+              <strong>{businessName}</strong>
+              <small>{settings.businessPhone || settings.businessEmail || "Add phone or email in Business Management."}</small>
+            </article>
           </div>
 
           <div className="sell-online-controls">
@@ -6181,6 +6607,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                     <h3>{product.name || "Untitled item"}</h3>
                     <p>Barcode {product.barcode || "Not added"}</p>
                     <span>Offline {currency(product.price)} | Online {currency(product.onlinePrice)} | Qty {product.stock}</span>
+                    {product.stock <= 0 ? <small className="sell-online-warning">Out of stock products should stay offline.</small> : null}
                   </div>
                   {product.selected ? (
                     <label className="sell-online-price-field">Online Price
@@ -6197,12 +6624,13 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                     type="button"
                     className={`button ${product.selected ? "button-secondary" : "button-primary"}`}
                     onClick={() => toggleSellOnlineProduct(product.id)}
+                    disabled={!product.selected && product.stock <= 0}
                   >
                     {product.selected ? "Remove" : "Sell Online"}
                   </button>
                 </article>
               ))}
-              {hiddenCount ? <p className="sell-online-more-note">Showing first 180 matches. Search by name or barcode to narrow the list.</p> : null}
+              {hiddenCount ? <p className="sell-online-more-note">Showing first 80 matches to keep this screen fast. Search by name or barcode to narrow the list.</p> : null}
             </div>
 
             <aside className="sell-online-summary">
@@ -6222,7 +6650,8 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                   </div>
                 ) : null}
               </div>
-              <button type="button" className="button button-primary" onClick={publishSellOnlineCatalog} disabled={onlineStoreBusy || !selectedSellOnlineProducts.length}>
+              {!publishReady ? <p className="sell-online-readiness-note">Add products with stock and keep business phone or email saved before publishing.</p> : null}
+              <button type="button" className="button button-primary" onClick={publishSellOnlineCatalog} disabled={onlineStoreBusy || !publishReady}>
                 {onlineStoreBusy ? "Publishing..." : "Publish Online Store"}
               </button>
               <div className="sell-online-selected-list">
@@ -7075,6 +7504,9 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         phone: cleanText(currentDraft.businessPhone),
         email: cleanText(currentDraft.businessEmail),
         address: cleanText(currentDraft.businessAddress),
+        pan: cleanText(currentDraft.businessPan).toUpperCase(),
+        state: cleanText(currentDraft.businessState),
+        stateCode: cleanText(currentDraft.businessStateCode),
         gstin: cleanText(currentDraft.gstin).toUpperCase(),
         logo: currentDraft.storeLogo || currentDraft.storeLogoUrl || "",
         status: "Active"
@@ -7086,7 +7518,10 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         ...primary,
         ...business,
         id: cleanText(business.id, index === 0 ? "primary" : `business-${index + 1}`),
-        name: cleanText(business.name, index === 0 ? primary.name : `Business ${index + 1}`)
+        name: cleanText(business.name, index === 0 ? primary.name : `Business ${index + 1}`),
+        pan: cleanText(business.pan || business.businessPan || primary.pan).toUpperCase(),
+        state: cleanText(business.state || business.businessState || primary.state),
+        stateCode: cleanText(business.stateCode || business.businessStateCode || primary.stateCode)
       }));
       if (!normalized.some((business) => business.id === activeId)) {
         normalized.unshift({ ...primary, id: activeId || "primary" });
@@ -7142,6 +7577,9 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
           businessPhone: selectedBusiness.phone,
           businessEmail: selectedBusiness.email,
           businessAddress: selectedBusiness.address,
+          businessPan: selectedBusiness.pan,
+          businessState: selectedBusiness.state,
+          businessStateCode: selectedBusiness.stateCode,
           gstin: selectedBusiness.gstin,
           storeLogo: selectedBusiness.logo || "",
           storeLogoUrl: "",
@@ -7159,6 +7597,9 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         phone: "",
         email: "",
         address: "",
+        pan: "",
+        state: "",
+        stateCode: "",
         gstin: "",
         logo: "",
         status: "Active"
@@ -7172,6 +7613,9 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         businessPhone: "",
         businessEmail: "",
         businessAddress: "",
+        businessPan: "",
+        businessState: "",
+        businessStateCode: "",
         gstin: "",
         storeLogo: "",
         storeLogoUrl: "",
@@ -7194,6 +7638,9 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
             businessPhone: selectedBusiness.phone,
             businessEmail: selectedBusiness.email,
             businessAddress: selectedBusiness.address,
+            businessPan: selectedBusiness.pan,
+            businessState: selectedBusiness.state,
+            businessStateCode: selectedBusiness.stateCode,
             gstin: selectedBusiness.gstin,
             storeLogo: selectedBusiness.logo || current.storeLogo
           } : {})
@@ -7224,6 +7671,9 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
           businessPhone: nextActive.phone,
           businessEmail: nextActive.email,
           businessAddress: nextActive.address,
+          businessPan: nextActive.pan,
+          businessState: nextActive.state,
+          businessStateCode: nextActive.stateCode,
           gstin: nextActive.gstin,
           storeLogo: nextActive.logo || "",
           storeLogoUrl: ""
@@ -7256,6 +7706,34 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
           warehouse.id === warehouseId ? { ...warehouse, ...patch } : warehouse
         ))
       }));
+    }
+
+    function deleteDraftWarehouse(warehouseId) {
+      const warehouses = getDraftWarehouses();
+      if (warehouses.length <= 1) {
+        showMessage("Keep at least one warehouse in the workspace.");
+        return;
+      }
+      const warehouse = warehouses.find((entry) => entry.id === warehouseId);
+      if (!window.confirm(`Delete ${warehouse?.name || "this warehouse"}? Inventory items assigned here will remain saved and can be reassigned later.`)) {
+        return;
+      }
+      setDraft((current) => {
+        const nextWarehouses = getDraftWarehouses(current).filter((entry) => entry.id !== warehouseId);
+        return {
+          ...current,
+          warehouses: nextWarehouses,
+          activeWarehouseId: current.activeWarehouseId === warehouseId ? nextWarehouses[0]?.id || "main" : current.activeWarehouseId
+        };
+      });
+    }
+
+    function getDraftWarehouseStats(warehouseId) {
+      const matchingItems = inventoryItems.filter((item) => cleanText(item.warehouseId || item.warehouse_id, "main") === warehouseId);
+      return {
+        items: matchingItems.length,
+        stock: matchingItems.reduce((total, item) => total + Number(item.stock || 0), 0)
+      };
     }
 
     function setDraftPrintProfile(paperSize, layout) {
@@ -7310,8 +7788,15 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         businessPhone: cleanText(draft.businessPhone),
         businessEmail: cleanText(draft.businessEmail),
         businessAddress: cleanText(draft.businessAddress),
+        businessPan: cleanText(draft.businessPan).toUpperCase(),
+        businessState: cleanText(draft.businessState),
+        businessStateCode: cleanText(draft.businessStateCode),
         gstin: cleanText(draft.gstin).toUpperCase(),
         storeLogoUrl: cleanText(draft.storeLogoUrl),
+        storeStamp: cleanText(draft.storeStamp),
+        storeStampName: cleanText(draft.storeStampName),
+        ownerSignature: cleanText(draft.ownerSignature),
+        ownerSignatureName: cleanText(draft.ownerSignatureName),
         invoicePrefix: cleanText(draft.invoicePrefix, defaultSettings.invoicePrefix),
         defaultDueDays: cleanText(draft.defaultDueDays, defaultSettings.defaultDueDays),
         invoiceNotes: cleanText(draft.invoiceNotes),
@@ -7497,7 +7982,10 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
               <label>Workspace Label<input name="ownerName" type="text" placeholder="Billing Workspace" value={draft.ownerName || ""} onChange={(event) => setDraft((current) => ({ ...current, ownerName: event.target.value }))} /></label>
               <label>Business Phone<input name="businessPhone" type="tel" placeholder="Store contact number" value={draft.businessPhone || ""} onChange={(event) => setDraft((current) => ({ ...current, businessPhone: event.target.value }))} /></label>
               <label>Business Email<input name="businessEmail" type="email" placeholder="store@example.com" value={draft.businessEmail || ""} onChange={(event) => setDraft((current) => ({ ...current, businessEmail: event.target.value }))} /></label>
+              <label>Business PAN<input name="businessPan" type="text" placeholder="ABCDE1234F" value={draft.businessPan || ""} onChange={(event) => setDraft((current) => ({ ...current, businessPan: event.target.value.toUpperCase() }))} /></label>
               <label>GSTIN<input name="gstin" type="text" placeholder="Optional GSTIN" value={draft.gstin || ""} onChange={(event) => setDraft((current) => ({ ...current, gstin: event.target.value.toUpperCase() }))} /></label>
+              <label>Business State<input name="businessState" type="text" placeholder="West Bengal" value={draft.businessState || ""} onChange={(event) => setDraft((current) => ({ ...current, businessState: event.target.value }))} /></label>
+              <label>State Code<input name="businessStateCode" type="text" placeholder="19" value={draft.businessStateCode || ""} onChange={(event) => setDraft((current) => ({ ...current, businessStateCode: event.target.value.replace(/\D/g, "").slice(0, 2) }))} /></label>
               <label className="settings-span-2">Business Address<textarea name="businessAddress" placeholder="Business address used on printed receipts" value={draft.businessAddress || ""} onChange={(event) => setDraft((current) => ({ ...current, businessAddress: event.target.value }))}></textarea></label>
             </div>
             <div className="record-list">
@@ -7513,7 +8001,9 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                   <span>{cleanText(draft.businessName, defaultSettings.businessName)}</span>
                   <span>{draft.businessPhone || "No business phone"}</span>
                   <span>{draft.businessEmail || "No business email"}</span>
+                  <span>{draft.businessPan || "PAN not added"}</span>
                   <span>{draft.gstin || "GSTIN not added"}</span>
+                  <span>{draft.businessState || "Business state not added"}</span>
                 </div>
                 {draft.businessAddress ? <p className="settings-inline-copy">{draft.businessAddress}</p> : null}
               </article>
@@ -7543,6 +8033,45 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
               </div>
               <button className="button button-secondary" type="button" onClick={() => setDraft((current) => ({ ...current, storeLogo: "", storeLogoUrl: "", logoName: "" }))}>Remove Logo</button>
             </div>
+            <div className="business-assets-grid">
+              {[
+                ["storeStamp", "storeStampName", "Store Stamp", "Upload the official shop stamp used on standard invoices."],
+                ["ownerSignature", "ownerSignatureName", "Owner Digital Signature", "Upload the owner's signature image for standard invoices."]
+              ].map(([assetKey, nameKey, title, help]) => (
+                <article className="business-asset-card" key={assetKey}>
+                  <div className="business-asset-preview">
+                    {draft[assetKey] ? <img src={draft[assetKey]} alt={`${title} preview`} /> : <span>{title.split(/\s+/).map((word) => word[0]).join("").slice(0, 2)}</span>}
+                  </div>
+                  <div>
+                    <h3>{title}</h3>
+                    <p className="record-meta">{help}</p>
+                    <small>{draft[nameKey] || "No file uploaded"}</small>
+                  </div>
+                  <div className="record-actions">
+                    <label className="button button-secondary">Upload
+                      <input
+                        className="settings-hidden-input"
+                        type="file"
+                        accept="image/*"
+                        onChange={async (event) => {
+                          const file = event.target.files?.[0];
+                          if (!file) return;
+                          try {
+                            const image = await readFileAsDataURL(file);
+                            setDraft((current) => ({ ...current, [assetKey]: image, [nameKey]: file.name }));
+                          } catch (error) {
+                            showMessage(error.message);
+                          } finally {
+                            event.target.value = "";
+                          }
+                        }}
+                      />
+                    </label>
+                    <button className="button button-secondary" type="button" onClick={() => setDraft((current) => ({ ...current, [assetKey]: "", [nameKey]: "" }))}>Remove</button>
+                  </div>
+                </article>
+              ))}
+            </div>
             <div className="management-dashboard">
               <article className="record-card management-card">
                 <div className="record-top">
@@ -7559,7 +8088,10 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                         <label>Business Name<input type="text" value={business.name} onChange={(event) => updateDraftBusiness(business.id, { name: event.target.value })} /></label>
                         <label>Phone<input type="tel" value={business.phone || ""} onChange={(event) => updateDraftBusiness(business.id, { phone: event.target.value })} /></label>
                         <label>Email<input type="email" value={business.email || ""} onChange={(event) => updateDraftBusiness(business.id, { email: event.target.value })} /></label>
+                        <label>PAN<input type="text" value={business.pan || ""} onChange={(event) => updateDraftBusiness(business.id, { pan: event.target.value.toUpperCase() })} /></label>
                         <label>GSTIN<input type="text" value={business.gstin || ""} onChange={(event) => updateDraftBusiness(business.id, { gstin: event.target.value.toUpperCase() })} /></label>
+                        <label>State<input type="text" value={business.state || ""} onChange={(event) => updateDraftBusiness(business.id, { state: event.target.value })} /></label>
+                        <label>State Code<input type="text" value={business.stateCode || ""} onChange={(event) => updateDraftBusiness(business.id, { stateCode: event.target.value.replace(/\D/g, "").slice(0, 2) })} /></label>
                       </div>
                       <label>Address<textarea rows="2" value={business.address || ""} onChange={(event) => updateDraftBusiness(business.id, { address: event.target.value })}></textarea></label>
                       <div className="management-actions">
@@ -7581,19 +8113,30 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                 </div>
                 <div className="management-list">
                   {draftWarehouses.map((warehouse) => (
-                    <article className={`management-row ${warehouse.id === (draft.activeWarehouseId || "main") ? "active" : ""}`} key={warehouse.id}>
-                      <div className="management-grid">
-                        <label>Warehouse Name<input type="text" value={warehouse.name} onChange={(event) => updateDraftWarehouse(warehouse.id, { name: event.target.value })} /></label>
-                        <label>Business<select value={warehouse.businessId} onChange={(event) => updateDraftWarehouse(warehouse.id, { businessId: event.target.value })}>{draftBusinesses.map((business) => <option key={business.id} value={business.id}>{business.name}</option>)}</select></label>
-                        <label>Status<select value={warehouse.status} onChange={(event) => updateDraftWarehouse(warehouse.id, { status: event.target.value })}><option>Active</option><option>Inactive</option></select></label>
-                        <label>Location<input type="text" value={warehouse.location || ""} onChange={(event) => updateDraftWarehouse(warehouse.id, { location: event.target.value })} /></label>
-                      </div>
-                      <div className="management-actions">
-                        <span className="record-chip">{warehouse.status}</span>
-                        <button type="button" className="button button-secondary" onClick={() => setDraft((current) => ({ ...current, activeWarehouseId: warehouse.id }))}>Switch</button>
-                        <button type="button" className="button button-secondary" onClick={() => updateDraftWarehouse(warehouse.id, { status: "Inactive" })}>Deactivate</button>
-                      </div>
-                    </article>
+                    (() => {
+                      const warehouseStats = getDraftWarehouseStats(warehouse.id);
+                      return (
+                        <article className={`management-row ${warehouse.id === (draft.activeWarehouseId || "main") ? "active" : ""}`} key={warehouse.id}>
+                          <div className="management-grid">
+                            <label>Warehouse Name<input type="text" value={warehouse.name} onChange={(event) => updateDraftWarehouse(warehouse.id, { name: event.target.value })} /></label>
+                            <label>Business<select value={warehouse.businessId} onChange={(event) => updateDraftWarehouse(warehouse.id, { businessId: event.target.value })}>{draftBusinesses.map((business) => <option key={business.id} value={business.id}>{business.name}</option>)}</select></label>
+                            <label>Status<select value={warehouse.status} onChange={(event) => updateDraftWarehouse(warehouse.id, { status: event.target.value })}><option>Active</option><option>Inactive</option></select></label>
+                            <label>Location<input type="text" value={warehouse.location || ""} onChange={(event) => updateDraftWarehouse(warehouse.id, { location: event.target.value })} /></label>
+                          </div>
+                          <div className="record-meta-grid warehouse-meta-grid">
+                            <span>{warehouseStats.items} product(s)</span>
+                            <span>{warehouseStats.stock} total stock</span>
+                            <span>{warehouse.businessId === (draft.activeBusinessId || "primary") ? "Current business" : "Linked business"}</span>
+                          </div>
+                          <div className="management-actions">
+                            <span className="record-chip">{warehouse.status}</span>
+                            <button type="button" className="button button-secondary" onClick={() => setDraft((current) => ({ ...current, activeWarehouseId: warehouse.id }))}>Switch</button>
+                            <button type="button" className="button button-secondary" onClick={() => updateDraftWarehouse(warehouse.id, { status: "Inactive" })}>Deactivate</button>
+                            <button type="button" className="button button-secondary" onClick={() => deleteDraftWarehouse(warehouse.id)} disabled={draftWarehouses.length <= 1}>Delete</button>
+                          </div>
+                        </article>
+                      );
+                    })()
                   ))}
                 </div>
               </article>

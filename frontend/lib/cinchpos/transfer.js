@@ -976,6 +976,7 @@ export function normalizeInventoryImport(row, index = 0) {
 export function normalizeCustomerImport(row) {
   return {
     name: cleanText(valueFrom(row, ["name", "customerName", "customer_name", "partyName", "party", "customer", "ledgerName"])),
+    businessName: cleanText(valueFrom(row, ["businessName", "business_name", "companyName", "company", "firmName", "firm", "shopName", "storeName", "tradeName"])),
     email: cleanText(valueFrom(row, ["email", "emailAddress", "emailId", "partyEmail"])),
     address: cleanText(valueFrom(row, ["address", "customerAddress", "customer_address", "partyAddress", "billingAddress", "shippingAddress"])),
     phone: cleanText(valueFrom(row, ["phone", "mobile", "contact", "phoneNumber", "customerPhone", "customer_phone", "mobileNumber", "mobileNo", "phoneNo", "partyPhone", "partyMobile", "whatsapp"]))
@@ -986,6 +987,7 @@ export function normalizeInvoiceImport(row) {
   return {
     customerId: cleanText(valueFrom(row, ["customerId", "customer_id"])),
     customerName: cleanText(valueFrom(row, ["customerName", "customer_name", "customer", "partyName", "party", "name", "ledgerName"])),
+    customerBusinessName: cleanText(valueFrom(row, ["customerBusinessName", "customer_business_name", "businessName", "business_name", "companyName", "company", "firmName", "firm", "shopName", "storeName", "tradeName"])),
     customerPhone: cleanText(valueFrom(row, ["customerPhone", "customer_phone", "phone", "mobile", "contact", "phoneNo", "mobileNo", "partyMobile"])),
     customerEmail: cleanText(valueFrom(row, ["customerEmail", "customer_email", "email", "emailId"])),
     customerAddress: cleanText(valueFrom(row, ["customerAddress", "customer_address", "address", "partyAddress", "billingAddress", "shippingAddress"])),
