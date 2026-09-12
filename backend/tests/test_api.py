@@ -307,6 +307,47 @@ class CinchPOSAPITestCase(unittest.TestCase):
         self.assertEqual(dashboard["summary"]["invoice_count"], 1)
         self.assertEqual(dashboard["summary"]["outstanding_payments"], 70.0)
 
+    def test_multiple_partial_payments_mark_invoice_paid_only_after_balance_clears(self):
+        customer = self.create_customer()
+        invoice = self.create_invoice(customer["id"], amount=1000.0).get_json()
+
+        for amount, expected_paid, expected_outstanding, expected_status in [
+            (200.0, 200.0, 800.0, "Pending"),
+            (500.0, 700.0, 300.0, "Pending"),
+            (300.0, 1000.0, 0.0, "Paid"),
+        ]:
+            response = self.client.post(
+                "/api/payments",
+                json={
+                    "invoice_id": invoice["id"],
+                    "amount": amount,
+                    "paid_on": self.backend.today_value().isoformat(),
+                    "method": "Cash",
+                    "notes": "Split payment",
+                },
+            )
+            self.assertEqual(response.status_code, 201)
+            current = self.client.get("/api/invoices").get_json()[0]
+            self.assertEqual(current["total_paid"], expected_paid)
+            self.assertEqual(current["outstanding"], expected_outstanding)
+            self.assertEqual(current["status"], expected_status)
+
+        payments = self.client.get("/api/payments").get_json()
+        self.assertEqual(len(payments), 3)
+        self.assertEqual(sum(payment["amount"] for payment in payments), 1000.0)
+
+        overpayment = self.client.post(
+            "/api/payments",
+            json={
+                "invoice_id": invoice["id"],
+                "amount": 1.0,
+                "paid_on": self.backend.today_value().isoformat(),
+                "method": "Cash",
+            },
+        )
+        self.assertEqual(overpayment.status_code, 400)
+        self.assertEqual(overpayment.get_json()["error"], "Payment exceeds outstanding amount.")
+
     def test_trend_endpoint_returns_custom_range_points(self):
         customer = self.create_customer()
         invoice = self.create_invoice(customer["id"], amount=200.0).get_json()

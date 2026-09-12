@@ -87,11 +87,18 @@ test("GSTR-1 workbook follows the reference ten-sheet structure", () => {
   assert.equal(workbook.Sheets.gstr1.A1.v, "Ardh Sainik Canteen");
   assert.equal(workbook.Sheets.gstr1.A5.v, "GSTR-1");
   assert.equal(workbook.Sheets.gstr1.A6.v, "Dated: 01/05/2026-31/05/2026");
+  assert.equal(workbook.Sheets.gstr1["!ref"], "A1:O38");
+  assert.equal(workbook.Sheets.b2b["!ref"], "A1:M1000");
+  assert.equal(workbook.Sheets["hsn(b2c)"]["!ref"], "A1:K1000");
+  assert.equal(workbook.Sheets.docs["!ref"], "A1:E1000");
 });
 
-test("GSTR-1 details split invoice rows by GST rate without repeating invoice fields", () => {
+test("GSTR-1 sheet keeps sales rows, totals, and return sections in the reference layout", () => {
   const worksheet = buildGstr1Workbook(report).Sheets.gstr1;
 
+  assert.equal(worksheet.A13.v, "Sales");
+  assert.equal(worksheet.A14.v, "GSTIN");
+  assert.equal(worksheet.C15.v, "State Code");
   assert.equal(worksheet.E16.v, "38750");
   assert.equal(worksheet.G16.v, 328);
   assert.equal(worksheet.H16.v, 5);
@@ -103,6 +110,65 @@ test("GSTR-1 details split invoice rows by GST rate without repeating invoice fi
   assert.equal(worksheet.I17.v, 100);
   assert.equal(worksheet.J17.v, 9);
   assert.equal(worksheet.K17.v, 9);
+  assert.equal(worksheet.L17.v, 0);
+  assert.equal(worksheet.M17.v, 0);
+  assert.equal(worksheet.N17.v, 18);
+  assert.equal(worksheet.A20.v, "Total");
+  assert.equal(worksheet.G20.v, 433);
+  assert.equal(worksheet.I20.v, 400);
+  assert.equal(worksheet.J20.v, 16.5);
+  assert.equal(worksheet.K20.v, 16.5);
+  assert.equal(worksheet.L20.v, 0);
+  assert.equal(worksheet.M20.v, 0);
+  assert.equal(worksheet.N20.v, 33);
+  assert.equal(worksheet.A25.v, "Sales Return");
+  assert.equal(worksheet.K27.v, "Central Tax Amount");
+  assert.equal(worksheet.L27.v, "State/UT Tax Amount");
+  assert.equal(worksheet.M27.v, "Integrated Tax Amount");
+  assert.equal(worksheet.N27.v, "Cess Amt.");
+  assert.equal(worksheet.O27.v, "Total Tax Amt.");
+  assert.equal(worksheet.H27.v, "Invoice Type");
+  assert.equal(worksheet.A29.v, "Total");
+  assert.equal(worksheet.K29.v, 0);
+  assert.equal(worksheet.L29.v, 0);
+  assert.equal(worksheet.M29.v, 0);
+  assert.equal(worksheet.N29.v, 0);
+  assert.equal(worksheet.O29.v, 0);
+  assert.equal(worksheet.A34.v, "Purchase Return");
+  assert.equal(worksheet.K36.v, "Central Tax Amount");
+  assert.equal(worksheet.L36.v, "State/UT Tax Amount");
+  assert.equal(worksheet.M36.v, "Integrated Tax Amount");
+  assert.equal(worksheet.N36.v, "Cess Amt.");
+  assert.equal(worksheet.O36.v, "Total Tax Amt.");
+  assert.equal(worksheet.A38.v, "Total");
+  assert.equal(worksheet.K38.v, 0);
+  assert.equal(worksheet.L38.v, 0);
+  assert.equal(worksheet.M38.v, 0);
+  assert.equal(worksheet.N38.v, 0);
+  assert.equal(worksheet.O38.v, 0);
+  assert.deepEqual(
+    worksheet["!cols"].map((column) => column.wch),
+    [29.5, 12, 12, 9.75, 13, 13, 11, 12, 11, 14.25, 16.5, 16.5, 16.5, 9.75, 9.75]
+  );
+});
+
+test("GST filing sheets keep the uploaded report template headers and widths", () => {
+  const workbook = buildGstr1Workbook(report);
+
+  assert.deepEqual(
+    workbook.Sheets.b2b["!cols"].map((column) => column.wch),
+    [18.5, 12, 13, 9.75, 14.25, 13, 13, 17.5, 12, 15.25, 4.25, 9.75, 11]
+  );
+  assert.deepEqual(
+    workbook.Sheets.b2cl["!cols"].map((column) => column.wch),
+    [15, 10.62, 15, 13.85, 18.38, 5.15, 13.85, 11.77, 16.15]
+  );
+  assert.equal(workbook.Sheets.b2b.A4.v, "GSTIN/UIN of Recipient");
+  assert.equal(workbook.Sheets.b2cl.I4.v, "E-Commerce GSTIN");
+  assert.equal(workbook.Sheets.b2cl.I2, undefined);
+  assert.equal(workbook.Sheets.b2cs.G2, undefined);
+  assert.equal(workbook.Sheets.cdnr.M2, undefined);
+  assert.equal(workbook.Sheets.docs.A4.v, "Nature of Document");
 });
 
 test("GSTR-1 classifies B2B, B2CS, HSN, and document summaries", () => {
@@ -116,6 +182,7 @@ test("GSTR-1 classifies B2B, B2CS, HSN, and document summaries", () => {
   assert.equal(workbook.Sheets.b2cs.D6.v, 18);
   assert.equal(workbook.Sheets.b2cs.E6.v, 100);
   assert.equal(workbook.Sheets["hsn(b2c)"].A3.v, 2);
+  assert.equal(workbook.Sheets["hsn(b2c)"].B5.v, "");
   assert.equal(workbook.Sheets.docs.D3.v, 2);
   assert.equal(workbook.Sheets.docs.B5.v, "38750");
   assert.equal(workbook.Sheets.docs.C5.v, "38751");
@@ -131,4 +198,3 @@ test("GSTR-1 workbook serializes as a valid XLSX payload and uses a readable fil
     "[Ardh Sainik Canteen] GSTR-1 from 01-05-2026 to 31-05-2026.xlsx"
   );
 });
-

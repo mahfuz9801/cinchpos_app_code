@@ -12,6 +12,9 @@ export function statusClass(status = "") {
   if (value === "overdue") {
     return "status-overdue";
   }
+  if (value === "partial") {
+    return "status-partial";
+  }
   return "status-pending";
 }
 

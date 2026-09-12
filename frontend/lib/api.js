@@ -316,6 +316,10 @@ export function getInvoices() {
   return fetchJSON("/api/invoices");
 }
 
+export function getPayments() {
+  return fetchJSON("/api/payments");
+}
+
 export function createInvoice(payload) {
   return fetchJSON("/api/invoices", {
     method: "POST",

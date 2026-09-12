@@ -12,6 +12,7 @@ import {
   getDashboard,
   getInvoices,
   getOnlineStoreProfile,
+  getPayments,
   getRecoverableLocalBillingData,
   getTrend,
   getWorkspaceSnapshot,
@@ -391,7 +392,6 @@ const MAX_THERMAL_PAGE_HEIGHT_MM = 280;
 
 const GST_INVOICE_PRINT_CSS = `
   * { box-sizing: border-box; }
-  @page { size: A4; margin: 10mm; }
   body { margin: 0; background: #ffffff; color: #000000; font-family: Arial, Helvetica, sans-serif; font-size: 10.5px; line-height: 1.22; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
   .gst-invoice-page { width: 100%; max-width: 190mm; margin: 0 auto; border: 1.4px solid #111111; background: #ffffff; color: #000000; }
   .gst-invoice-page h1, .gst-invoice-page h2, .gst-invoice-page h3, .gst-invoice-page p { margin: 0; }
@@ -415,23 +415,27 @@ const GST_INVOICE_PRINT_CSS = `
   .gst-items-table th:last-child, .gst-items-table td:last-child { border-right: 0; }
   .gst-items-table th { text-align: center; font-size: 9px; font-weight: 800; }
   .gst-items-table td span { display: block; margin-top: 1px; font-size: 8.5px; }
-  .gst-items-table th:nth-child(1) { width: 7%; }
-  .gst-items-table th:nth-child(2) { width: 28%; }
-  .gst-items-table th:nth-child(3) { width: 10%; }
-  .gst-items-table th:nth-child(4) { width: 10%; }
-  .gst-items-table th:nth-child(5), .gst-items-table th:nth-child(6), .gst-items-table th:nth-child(8), .gst-items-table th:nth-child(9) { width: 11%; }
-  .gst-items-table th:nth-child(7) { width: 8%; }
+  .gst-items-table th:nth-child(1) { width: 5%; }
+  .gst-items-table th:nth-child(2) { width: 24%; }
+  .gst-items-table th:nth-child(3) { width: 8%; }
+  .gst-items-table th:nth-child(4) { width: 7%; }
+  .gst-items-table th:nth-child(5), .gst-items-table th:nth-child(6), .gst-items-table th:nth-child(7), .gst-items-table th:nth-child(10), .gst-items-table th:nth-child(11) { width: 8%; }
+  .gst-items-table th:nth-child(8) { width: 9%; }
+  .gst-items-table th:nth-child(9) { width: 7%; }
+  .gst-hsn-cell { text-align: center; white-space: nowrap; font-variant-numeric: tabular-nums; }
   .gst-total-row td { border-bottom: 1.4px solid #111111; font-weight: 800; }
   .center { text-align: center; }
-  .numeric { text-align: right; }
+  .numeric { text-align: right; font-variant-numeric: tabular-nums; }
   .gst-bottom-grid { display: grid; grid-template-columns: minmax(0, 1.25fr) 98px minmax(220px, 0.8fr); min-height: 146px; border-bottom: 1.4px solid #111111; }
   .gst-words, .gst-pay-box, .gst-summary-box { padding: 6px 8px; border-right: 1.4px solid #111111; }
   .gst-summary-box { border-right: 0; }
   .gst-tax-words { display: block; margin-top: 4px; }
   .gst-tax-summary { margin-top: 8px; }
   .gst-tax-summary table { width: 100%; margin-top: 4px; border-collapse: collapse; table-layout: fixed; }
-  .gst-tax-summary th, .gst-tax-summary td { padding: 3px 4px; border: 1px solid #111111; font-size: 8.8px; vertical-align: top; }
+  .gst-tax-summary th, .gst-tax-summary td { padding: 3px 4px; border: 1px solid #111111; font-size: 8.4px; line-height: 1.15; vertical-align: middle; }
   .gst-tax-summary th { text-align: center; font-weight: 800; }
+  .gst-tax-summary th:first-child, .gst-tax-summary td:first-child { width: 16%; text-align: center; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .gst-tax-summary .numeric, .gst-tax-summary .center { white-space: nowrap; }
   .gst-terms { margin-top: 8px; padding-top: 6px; border-top: 1px solid #111111; }
   .gst-terms p { margin-top: 3px; overflow-wrap: anywhere; }
   .gst-sign-box { min-height: 44px; margin-top: 10px; padding-top: 5px; border-top: 1px solid #111111; }
@@ -440,10 +444,13 @@ const GST_INVOICE_PRINT_CSS = `
   .gst-qr-placeholder { display: grid; place-items: center; width: 64px; height: 64px; border: 2px solid #111111; font-size: 14px; font-weight: 900; }
   .gst-summary-box { display: grid; align-content: start; gap: 4px; }
   .gst-grand { margin-top: 2px; padding-top: 4px; border-top: 1.4px solid #111111; font-size: 12px; }
-  .gst-authorised { display: grid; justify-items: center; align-content: end; gap: 4px; min-height: 78px; margin-top: 8px; padding-top: 6px; border-top: 1px solid #111111; text-align: center; }
-  .gst-authorised span { font-size: 8.5px; }
-  .gst-signature-images { display: flex; justify-content: center; align-items: end; gap: 6px; min-height: 32px; }
-  .gst-authorised img { max-width: 92px; max-height: 36px; object-fit: contain; }
+  .gst-authorised { display: grid; grid-template-rows: auto auto minmax(44px, 1fr) auto; justify-items: center; gap: 4px; min-height: 118px; margin-top: 8px; padding: 6px 6px 5px; border-top: 1px solid #111111; text-align: center; }
+  .gst-authorised span { max-width: 100%; font-size: 8.2px; line-height: 1.15; }
+  .gst-signature-images { position: relative; display: grid; place-items: center; align-self: stretch; width: 100%; min-height: 44px; }
+  .gst-authorised img { max-width: 108px; object-fit: contain; }
+  .gst-authorised .gst-stamp { max-height: 44px; opacity: 0.72; }
+  .gst-authorised .gst-signature { position: absolute; bottom: 0; max-height: 32px; }
+  .gst-authorised strong:last-child { align-self: end; padding-top: 3px; }
   .gst-footer { display: flex; justify-content: space-between; gap: 10px; padding: 5px 8px; font-size: 10px; }
   @media print { body { background: #ffffff; } .gst-invoice-page { max-width: none; margin: 0; } }
 `;
@@ -499,6 +506,12 @@ function getPrintProfile(paperSize, layout = "") {
     ...profile,
     layout: layout || profile.layout
   };
+}
+
+function getStandardInvoicePaperSize(settingsLike = {}) {
+  const requestedSize = cleanText(settingsLike.standardInvoicePaperSize || settingsLike.printPaperSize, "A4");
+  const profile = PRINT_PAPER_PROFILES[requestedSize];
+  return profile?.layout === "invoice" ? requestedSize : "A4";
 }
 
 function toMicrons(mm) {
@@ -1181,7 +1194,7 @@ function buildStandardGstInvoiceMarkup(payload, detail = {}, { document = false 
     : [{ label: "CGST", amount: summary.gst / 2 }, { label: "SGST", amount: summary.gst / 2 }];
   const hsnSummaryRows = hsnTaxSummary.map((entry) => interStateSupply ? `
       <tr>
-        <td>${escapeHTML(entry.hsn)}</td>
+        <td class="gst-hsn-cell">${escapeHTML(entry.hsn)}</td>
         <td class="numeric">${currency(entry.taxable)}</td>
         <td class="center">${entry.gstRate.toFixed(2)}%</td>
         <td class="numeric">${currency(entry.igst)}</td>
@@ -1189,7 +1202,7 @@ function buildStandardGstInvoiceMarkup(payload, detail = {}, { document = false 
       </tr>
     ` : `
       <tr>
-        <td>${escapeHTML(entry.hsn)}</td>
+        <td class="gst-hsn-cell">${escapeHTML(entry.hsn)}</td>
         <td class="numeric">${currency(entry.taxable)}</td>
         <td class="center">${(entry.gstRate / 2).toFixed(2)}%</td>
         <td class="numeric">${currency(entry.cgst)}</td>
@@ -1200,6 +1213,9 @@ function buildStandardGstInvoiceMarkup(payload, detail = {}, { document = false 
     `).join("");
   const rows = (payload.items || []).map((item) => {
     const quantity = Math.max(0, Number(item.quantity || 0));
+    const mrp = Math.max(0, Number(item.mrp || item.inclusivePrice || item.price || 0));
+    const discountTotal = calculateLineDiscountAmount(item);
+    const discountPercent = Number(item.discountPercent || 0);
     const unitRate = Math.max(0, Number(item.taxableValue || 0));
     const taxableTotal = unitRate * quantity;
     const gstTotal = Math.max(0, Number(item.gstAmount || 0) * quantity);
@@ -1212,8 +1228,10 @@ function buildStandardGstInvoiceMarkup(payload, detail = {}, { document = false 
           ${item.description ? `<span>${escapeHTML(item.description)}</span>` : ""}
           ${item.barcode ? `<span>Barcode: ${escapeHTML(item.barcode)}</span>` : ""}
         </td>
-        <td class="center">${escapeHTML(cleanText(item.hsn || item.hsnSac || item.hsn_sac || item.sac, "-"))}</td>
+        <td class="gst-hsn-cell">${escapeHTML(cleanText(item.hsn || item.hsnSac || item.hsn_sac || item.sac, "-"))}</td>
         <td class="center">${quantity} ${escapeHTML(cleanText(item.unit, "Pcs"))}</td>
+        <td class="numeric">${currency(mrp)}</td>
+        <td class="numeric">${discountTotal > 0 ? `${currency(discountTotal)}${discountPercent > 0 ? `<span>${discountPercent.toFixed(2)}%</span>` : ""}` : "-"}</td>
         <td class="numeric">${currency(unitRate)}</td>
         <td class="numeric">${currency(taxableTotal)}</td>
         <td class="center">${Number(item.gstRate || 0).toFixed(2)}%</td>
@@ -1268,6 +1286,8 @@ function buildStandardGstInvoiceMarkup(payload, detail = {}, { document = false 
             <th>Name of Product / Service</th>
             <th>HSN / SAC</th>
             <th>Qty</th>
+            <th>MRP</th>
+            <th>Disc.</th>
             <th>Rate</th>
             <th>Taxable Value</th>
             <th>GST %</th>
@@ -1276,10 +1296,12 @@ function buildStandardGstInvoiceMarkup(payload, detail = {}, { document = false 
           </tr>
         </thead>
         <tbody>
-          ${rows || `<tr><td colspan="9" class="center">No invoice items</td></tr>`}
+          ${rows || `<tr><td colspan="11" class="center">No invoice items</td></tr>`}
           <tr class="gst-total-row">
             <td colspan="3" class="numeric"><strong>Total</strong></td>
             <td class="center"><strong>${summary.quantity}</strong></td>
+            <td class="numeric"><strong>${currency(summary.mrpTotal)}</strong></td>
+            <td class="numeric"><strong>${currency(summary.discountTotal)}</strong></td>
             <td></td>
             <td class="numeric"><strong>${currency(summary.subtotal)}</strong></td>
             <td></td>
@@ -1358,7 +1380,10 @@ function buildStandardGstInvoiceMarkup(payload, detail = {}, { document = false 
 }
 
 function buildInvoiceDownloadHTML(payload, detail = {}) {
-  return buildStandardGstInvoiceMarkup(payload, detail, { document: true });
+  const profile = getPrintProfile(payload.paperSize, payload.printLayout);
+  const pageRule = `@page { size: ${profile.pageSize || "A4"}; margin: ${profile.margin || "10mm"}; }`;
+  return buildStandardGstInvoiceMarkup(payload, detail, { document: true })
+    .replace("<style>", `<style>${pageRule}`);
 }
 
 function PrintPreviewDocument({ payload }) {
@@ -1375,7 +1400,7 @@ function PrintPreviewDocument({ payload }) {
       <div
         className="print-preview-paper"
         style={{
-          "--preview-paper-width": profile.layout === "invoice" ? "210mm" : profile.pageWidth,
+          "--preview-paper-width": profile.pageWidth,
           "--preview-padding": previewPadding,
           "--preview-scale": calibration.scale / 100
         }}
@@ -1403,6 +1428,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
   const [recentInvoices, setRecentInvoices] = useState([]);
   const [allInvoices, setAllInvoices] = useState([]);
   const [realInvoices, setRealInvoices] = useState([]);
+  const [payments, setPayments] = useState([]);
   const [alerts, setAlerts] = useState([]);
   const [customers, setCustomers] = useState([]);
   const [trend, setTrend] = useState([]);
@@ -1712,6 +1738,9 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
   const dashboardNetBalanceDirection = dashboardNetBalance < 0 ? "negative" : "positive";
   const isWorkspaceEmpty = !customers.length && !allInvoices.length && Number(currentSummary.invoice_count || 0) === 0;
   const outstandingInvoices = realInvoices.filter((invoice) => invoiceOutstandingAmount(invoice) > 0);
+  const prefillPaymentInvoice = prefillInvoiceId
+    ? outstandingInvoices.find((invoice) => cleanText(invoice.id || invoice.invoice_id) === cleanText(prefillInvoiceId)) || null
+    : null;
   const trendPeak = Math.max(...(trend.length ? trend : [{ value: 0 }]).map((point) => Number(point.value || 0)), 0);
   const trendCaption = {
     daily: "Collections in the last 7 days",
@@ -1804,12 +1833,14 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       };
     }).filter(Boolean)
   ), [inventoryItems, sellOnlineCatalog]);
+  const deferredInvoiceBuilderSearch = useDeferredValue(invoiceBuilderSearch);
   const invoiceBuilderMatches = useMemo(() => (
-    findInventoryMatches(inventoryItems, invoiceBuilderSearch).slice(0, 8)
-  ), [inventoryItems, invoiceBuilderSearch]);
+    findInventoryMatches(inventoryItems, deferredInvoiceBuilderSearch).slice(0, 8)
+  ), [inventoryItems, deferredInvoiceBuilderSearch]);
   const standardInvoiceNumber = cleanText(invoiceBuilderDraft.invoiceNumber) || buildClientInvoiceNumber(invoiceBuilderDraft.issuedOn || todayISO());
   const standardBillingDateLabel = formatDate(invoiceBuilderDraft.issuedOn || todayISO());
   const standardDueDateLabel = formatDate(invoiceBuilderDraft.dueOn || defaultDueDate);
+  const standardInvoicePaperSize = getStandardInvoicePaperSize(settings);
   useEffect(() => {
     setInvoiceBuilderMatchIndex(0);
   }, [invoiceBuilderSearch, invoiceBuilderMatches.length]);
@@ -1843,6 +1874,19 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
   const selectedInvoiceDetail = useMemo(() => (
     selectedInvoice ? getInvoiceDetail(selectedInvoice) : null
   ), [invoiceDetails, selectedInvoice]);
+  const selectedInvoicePayments = useMemo(() => {
+    const invoiceId = cleanText(selectedInvoice?.id || selectedInvoice?.invoice_id);
+    const invoiceNumber = cleanText(selectedInvoice?.invoice_number || selectedInvoice?.invoiceNumber);
+    if (!invoiceId && !invoiceNumber) {
+      return [];
+    }
+    return payments
+      .filter((payment) => (
+        (invoiceId && cleanText(payment.invoice_id) === invoiceId)
+        || (invoiceNumber && cleanText(payment.invoice_number) === invoiceNumber)
+      ))
+      .sort((a, b) => cleanText(a.paid_on).localeCompare(cleanText(b.paid_on)) || Number(a.id || 0) - Number(b.id || 0));
+  }, [payments, selectedInvoice]);
   const isOwner = cleanText(authState.role).toLowerCase() === "owner" || authState.userId === "local-owner" || hasPermission(authState, "*");
   const authGateActive = authState.required && !authState.authenticated;
   const visibleBusinessName = authGateActive ? APP_NAME : businessName;
@@ -1899,9 +1943,11 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
   function makePrintPayloadFromInvoice(invoice, detail = null) {
     const invoiceDetail = detail || getInvoiceDetail(invoice);
     const isStandardInvoiceDetail = invoiceDetail?.source === "standard-invoice";
-    const paperSize = isStandardInvoiceDetail ? "A4" : (settings.printPaperSize || defaultSettings.printPaperSize);
+    const paperSize = isStandardInvoiceDetail ? getStandardInvoicePaperSize(settings) : (settings.printPaperSize || defaultSettings.printPaperSize);
     const printLayout = isStandardInvoiceDetail ? "invoice" : (settings.printLayout || defaultSettings.printLayout);
     const printSettings = { ...settings, printPaperSize: paperSize, printLayout };
+    const invoicePaymentRows = getPaymentsForInvoice(invoice);
+    const paymentTotal = invoicePaymentRows.reduce((total, payment) => total + Number(payment.amount || 0), 0);
     const lines = Array.isArray(invoiceDetail?.items) ? invoiceDetail.items : [];
     const summaryRows = invoiceDetail?.summary || calculateInvoiceBuilderSummary(lines.map((line) => ({
       quantity: line.quantity,
@@ -1985,10 +2031,15 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       customerGstin: cleanText(customer.gstin || customer.gstNumber || customer.gst_number || invoiceDetail?.customerGstin),
       placeOfSupply: cleanText(invoiceDetail?.placeOfSupply || settings.businessState || ""),
       placeOfSupplyCode: cleanText(invoiceDetail?.placeOfSupplyCode || settings.businessStateCode || ""),
-      paymentMethod: invoiceDetail?.paymentMethod || "Cash",
-      paymentType: invoiceOutstandingAmount(invoice) > 0 ? "Partial / Pending" : "Full Payment",
-      paidAmount: invoicePaidAmount(invoice),
-      unpaidAmount: invoiceOutstandingAmount(invoice),
+      paymentMethod: invoiceDetail?.paymentMethod || invoicePaymentRows.at(-1)?.method || "Cash",
+      paymentType: invoiceOutstandingAmount(invoice) > 0 ? (invoicePaidAmount(invoice) > 0 ? "Partial Payment" : "Pending") : "Full Payment",
+      paidAmount: Math.max(invoicePaidAmount(invoice), paymentTotal, Number(invoiceDetail?.paidAmount || 0)),
+      unpaidAmount: Math.max(0, Number(invoice?.amount || invoiceDetail?.amount || printableSummary.total || 0) - Math.max(invoicePaidAmount(invoice), paymentTotal, Number(invoiceDetail?.paidAmount || 0))),
+      payments: invoicePaymentRows.length ? invoicePaymentRows.map((payment) => ({
+        method: cleanText(payment.method, "Payment"),
+        amount: Number(payment.amount || 0),
+        paidOn: cleanText(payment.paid_on)
+      })) : (Array.isArray(invoiceDetail?.payments) ? invoiceDetail.payments : []),
       notes: getPrintableInvoiceNotes(invoiceDetail?.notes, invoice?.notes, settings.invoiceNotes),
       paymentTerms: invoiceDetail?.paymentTerms || "",
       terms: invoiceDetail?.terms || "",
@@ -2060,11 +2111,28 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     return cleanText(invoice?.customer_phone || invoice?.customerPhone || findCustomerForInvoice(invoice)?.phone, "Not added");
   }
 
+  function getPaymentsForInvoice(invoice) {
+    const invoiceId = cleanText(invoice?.id || invoice?.invoice_id);
+    const invoiceNumber = cleanText(invoice?.invoice_number || invoice?.invoiceNumber);
+    if (!invoiceId && !invoiceNumber) {
+      return [];
+    }
+    return payments
+      .filter((payment) => (
+        (invoiceId && cleanText(payment.invoice_id) === invoiceId)
+        || (invoiceNumber && cleanText(payment.invoice_number) === invoiceNumber)
+      ))
+      .sort((a, b) => cleanText(a.paid_on).localeCompare(cleanText(b.paid_on)) || Number(a.id || 0) - Number(b.id || 0));
+  }
+
   function getInvoicePaymentStatus(invoice) {
     const outstandingAmount = invoiceOutstandingAmount(invoice);
     const amount = Number(invoice?.amount || 0);
     if (amount > 0 && outstandingAmount <= 0) {
       return "Paid";
+    }
+    if (invoicePaidAmount(invoice) > 0) {
+      return "Partial";
     }
     const rawStatus = cleanText(invoice?.status);
     const dueDate = cleanText(invoice?.due_on || invoice?.dueOn);
@@ -2614,9 +2682,10 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
   }, [can, workspaceLoaded]);
 
   const loadDashboard = useCallback(async () => {
-    const [dashboard, invoices, customerRows, trendRows] = await Promise.all([
+    const [dashboard, invoices, paymentRows, customerRows, trendRows] = await Promise.all([
       getDashboard(),
       getInvoices(),
+      getPayments(),
       getCustomers(),
       getTrend({
         view: trendView === "custom" && trendStartDate && trendEndDate ? "custom" : (trendView === "custom" ? "weekly" : trendView),
@@ -2627,6 +2696,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     setSummary(dashboard.summary);
     setRecentInvoices(dashboard.recent_invoices || []);
     setAllInvoices(invoices || []);
+    setPayments(Array.isArray(paymentRows) ? paymentRows : []);
     setAlerts(dashboard.alerts || []);
     setTrend(trendRows.points || []);
     setRealInvoices(invoices || []);
@@ -3462,11 +3532,12 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       return;
     }
     const detail = getInvoiceDetail(invoice);
+    const paperSize = getStandardInvoicePaperSize(settings);
     const payload = {
       ...makePrintPayloadFromInvoice(invoice, detail),
-      paperSize: "A4",
+      paperSize,
       printLayout: "invoice",
-      printCalibration: getCalibrationForSettings({ ...settings, printPaperSize: "A4", printLayout: "invoice" })
+      printCalibration: getCalibrationForSettings({ ...settings, printPaperSize: paperSize, printLayout: "invoice" })
     };
     const markup = buildInvoiceDownloadHTML(payload, detail || {});
     const blob = new Blob([markup], { type: "text/html;charset=utf-8" });
@@ -4128,6 +4199,12 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         paymentType: paymentStatus,
         paidAmount: requestedPaidAmount,
         unpaidAmount: Math.max(0, summaryRows.total - requestedPaidAmount),
+        payments: requestedPaidAmount > 0 ? [{
+          method: cleanText(invoiceBuilderDraft.paymentMethod, "Cash"),
+          amount: requestedPaidAmount,
+          paidOn: issuedOn,
+          notes: paymentStatus === "partial" ? "Partial payment recorded from standard invoice." : "Full payment recorded from standard invoice."
+        }] : [],
         paymentTerms: invoiceBuilderDraft.paymentTerms,
         notes: invoiceBuilderDraft.notes,
         terms: invoiceBuilderDraft.terms,
@@ -4146,11 +4223,12 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       deductSoldInventory(storedLines);
       await loadDashboard();
       if (shouldPrintInvoice) {
+        const paperSize = getStandardInvoicePaperSize(settings);
         printPOSBill({
           ...makePrintPayloadFromInvoice(savedInvoice, invoiceDetailPayload),
-          paperSize: "A4",
+          paperSize,
           printLayout: "invoice",
-          printCalibration: getCalibrationForSettings({ ...settings, printPaperSize: "A4", printLayout: "invoice" })
+          printCalibration: getCalibrationForSettings({ ...settings, printPaperSize: paperSize, printLayout: "invoice" })
         });
       }
       closeModal();
@@ -5614,6 +5692,14 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                         <span><strong>Due Date</strong> {standardDueDateLabel}</span>
                         <input type="date" value={invoiceBuilderDraft.dueOn} onChange={(event) => updateInvoiceBuilderField("dueOn", event.target.value)} aria-label="Change due date" />
                       </label>
+                      <label className="standard-paper-picker">
+                        <span><strong>Format</strong></span>
+                        <select value={standardInvoicePaperSize} onChange={(event) => setSettings((current) => ({ ...current, standardInvoicePaperSize: event.target.value }))} aria-label="Standard invoice paper format">
+                          <option value="A4">A4</option>
+                          <option value="A5">A5</option>
+                          <option value="Letter">Letter</option>
+                        </select>
+                      </label>
                     </div>
                     <section className="invoice-builder-section standard-stack-section">
                       <div className="standard-party-card standard-business-card">
@@ -5904,8 +5990,9 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       <Modal open={activeModal === "payment"} title="Record Payment" subtitle="Apply a payment to an outstanding invoice and update totals immediately." onClose={closeModal}>
         <form onSubmit={submitPayment}>
           <label>Invoice<select key={prefillInvoiceId || outstandingInvoices[0]?.id || "none"} name="invoice_id" required disabled={!outstandingInvoices.length} defaultValue={prefillInvoiceId || outstandingInvoices[0]?.id || ""}>{outstandingInvoices.length ? outstandingInvoices.map((invoice) => <option key={invoice.id} value={invoice.id}>{invoice.invoice_number} | {invoice.customer_name} | {currency(invoiceOutstandingAmount(invoice))}</option>) : <option value="">Create an invoice before recording a payment</option>}</select></label>
+          {prefillPaymentInvoice ? <p className="record-meta">Outstanding balance: <strong>{currency(invoiceOutstandingAmount(prefillPaymentInvoice))}</strong>. You can collect this in multiple payments until it becomes zero.</p> : null}
           <div className="form-grid">
-            <label>Payment Amount<input name="amount" type="number" min="0.01" step="0.01" placeholder="0.00" required /></label>
+            <label>Payment Amount<input name="amount" type="number" min="0.01" max={prefillPaymentInvoice ? invoiceOutstandingAmount(prefillPaymentInvoice) : undefined} step="0.01" placeholder="0.00" defaultValue={prefillPaymentInvoice ? invoiceOutstandingAmount(prefillPaymentInvoice) : ""} required /></label>
             <label>Paid On<input name="paid_on" type="date" defaultValue={todayISO()} required /></label>
           </div>
           <div className="form-grid">
@@ -6006,10 +6093,43 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                   <span>Due {formatDate(selectedInvoice.due_on || selectedInvoice.dueOn)}</span>
                   <span>Paid {currency(invoicePaidAmount(selectedInvoice))}</span>
                   <span>Outstanding {currency(invoiceOutstandingAmount(selectedInvoice))}</span>
-                  <span>Status {selectedInvoice.status}</span>
-                  <span>Method {selectedInvoiceDetail?.paymentMethod || "Not added"}</span>
+                  <span>Status {getInvoicePaymentStatus(selectedInvoice)}</span>
+                  <span>Last Method {selectedInvoicePayments.at(-1)?.method || selectedInvoiceDetail?.paymentMethod || "Not added"}</span>
                 </div>
+                {invoiceOutstandingAmount(selectedInvoice) > 0 ? (
+                  <button type="button" className="button button-primary record-payment-inline" onClick={() => openInvoicePaymentAction(selectedInvoice)}>Record Another Payment</button>
+                ) : null}
               </article>
+            </div>
+            <div className="record-card invoice-payment-history-card">
+              <h3>Payment History</h3>
+              {selectedInvoicePayments.length ? (
+                <div className="data-table-shell compact-table-shell">
+                  <table className="data-table">
+                    <thead>
+                      <tr><th>#</th><th>Paid On</th><th>Method</th><th>Notes</th><th>Amount</th><th>Balance After</th></tr>
+                    </thead>
+                    <tbody>
+                      {selectedInvoicePayments.reduce((rows, payment, index) => {
+                        const paidSoFar = rows.paidSoFar + Number(payment.amount || 0);
+                        const balanceAfter = Math.max(0, Number(selectedInvoice.amount || 0) - paidSoFar);
+                        rows.items.push(
+                          <tr key={payment.id || `${payment.paid_on}-${index}`}>
+                            <td>{index + 1}</td>
+                            <td>{formatDate(payment.paid_on)}</td>
+                            <td>{payment.method || "Payment"}</td>
+                            <td>{payment.notes || "-"}</td>
+                            <td>{currency(payment.amount)}</td>
+                            <td>{currency(balanceAfter)}</td>
+                          </tr>
+                        );
+                        rows.paidSoFar = paidSoFar;
+                        return rows;
+                      }, { paidSoFar: 0, items: [] }).items}
+                    </tbody>
+                  </table>
+                </div>
+              ) : <p className="record-meta">No payment has been recorded for this invoice yet.</p>}
             </div>
             <div className="data-table-shell invoice-line-shell">
               {(selectedInvoiceDetail?.items || []).length ? (
@@ -7802,6 +7922,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         invoiceNotes: cleanText(draft.invoiceNotes),
         startupView: sanitizedStartupView,
         printPaperSize: cleanText(draft.printPaperSize, defaultSettings.printPaperSize),
+        standardInvoicePaperSize: getStandardInvoicePaperSize(draft),
         printLayout: cleanText(draft.printLayout, defaultSettings.printLayout),
         printMargin: cleanText(draft.printMargin, defaultSettings.printMargin),
         printCalibrationProfiles: draft.printCalibrationProfiles && typeof draft.printCalibrationProfiles === "object" ? draft.printCalibrationProfiles : {},
@@ -8226,7 +8347,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                 </div>
                 <div className="segmented-control print-preview-switch">
                   <button type="button" className={activePrintProfile.layout === "thermal" ? "active" : ""} onClick={() => setDraftPrintProfile("80mm", "thermal")}>Thermal Printing</button>
-                  <button type="button" className={activePrintProfile.layout === "invoice" ? "active" : ""} onClick={() => setDraftPrintProfile("A4", "invoice")}>Standard Printing</button>
+                  <button type="button" className={activePrintProfile.layout === "invoice" ? "active" : ""} onClick={() => setDraftPrintProfile(getStandardInvoicePaperSize(draft), "invoice")}>Standard Printing</button>
                 </div>
               </div>
               <div className="print-settings-card">
@@ -8238,8 +8359,17 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                   <label>Paper Size<select name="printPaperSize" value={draft.printPaperSize || "80mm"} onChange={(event) => {
                     const nextPaperSize = event.target.value;
                     const profile = getPrintProfile(nextPaperSize);
-                    setDraft((current) => ({ ...current, printPaperSize: nextPaperSize, printLayout: profile.layout }));
+                    setDraft((current) => ({
+                      ...current,
+                      printPaperSize: nextPaperSize,
+                      printLayout: profile.layout,
+                      ...(profile.layout === "invoice" ? { standardInvoicePaperSize: nextPaperSize } : {})
+                    }));
                   }}><option value="58mm">58mm Thermal Bill</option><option value="76mm">76mm Thermal Bill</option><option value="80mm">80mm Thermal Bill</option><option value="A5">A5 Standard Bill</option><option value="A4">A4 Standard Bill</option><option value="Letter">Letter Standard Bill</option></select></label>
+                  <label>Standard Invoice Format<select name="standardInvoicePaperSize" value={getStandardInvoicePaperSize(draft)} onChange={(event) => {
+                    const nextPaperSize = event.target.value;
+                    setDraft((current) => ({ ...current, standardInvoicePaperSize: nextPaperSize, printPaperSize: nextPaperSize, printLayout: "invoice" }));
+                  }}><option value="A4">A4 GST Invoice</option><option value="A5">A5 GST Invoice</option><option value="Letter">Letter GST Invoice</option></select></label>
                   <label>Print Layout<select name="printLayout" value={printLayoutValue} onChange={(event) => setDraft((current) => ({ ...current, printLayout: event.target.value }))}><option value="thermal">Thermal Receipt</option><option value="invoice">Standard Invoice</option></select></label>
                   <label>Receipt Format<input type="text" value={printLayoutValue === "invoice" ? "Standard Invoice" : "Thermal Tax Invoice"} readOnly /></label>
                   <label>Print Margin<select name="printMargin" value={draft.printMargin || "default"} onChange={(event) => setDraft((current) => ({ ...current, printMargin: event.target.value }))}><option value="default">Recommended Margin</option><option value="none">No App Margin</option></select></label>

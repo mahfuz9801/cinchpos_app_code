@@ -20,6 +20,22 @@ const GST_STATE_BY_CODE = new Map(GST_STATES);
 const GST_STATE_BY_NAME = new Map(GST_STATES.map(([code, name]) => [normalizeKey(name), { code, name }]));
 const GST_RATES = [0, 0.1, 0.25, 1, 1.5, 3, 5, 6, 7.5, 12, 18, 28, 40];
 const B2CL_LIMIT = 100000;
+const GST_TEMPLATE_ROWS = 1000;
+const GSTR1_SALES_START_ROW = 16;
+const GSTR1_SECTION_GAP_ROWS = 4;
+
+const REFERENCE_WIDTHS = {
+  gstr1: [29.5, 12, 12, 9.75, 13, 13, 11, 12, 11, 14.25, 16.5, 16.5, 16.5, 9.75, 9.75],
+  b2b: [18.5, 12, 13, 9.75, 14.25, 13, 13, 17.5, 12, 15.25, 4.25, 9.75, 11],
+  b2cl: [15, 10.62, 15, 13.85, 18.38, 5.15, 13.85, 11.77, 16.15],
+  b2cs: [16, 13.8, 18.3, 6.1, 21.5, 11.6, 16],
+  cdnr: [18.5, 12, 12, 8.75, 11, 13, 13, 17.5, 9.75, 17.5, 13, 9.75, 11],
+  cdnur: [17.18, 18.27, 9.45, 11.64, 13.82, 13.82, 18.27, 5.09, 13.82, 11.64],
+  exemp: [50.18, 18.27, 35.82, 19.27],
+  hsnB2b: [17.18, 8.27, 6.18, 10.55, 9.45, 5.09, 13.82, 17.18, 14.91, 17.18, 11.64],
+  hsnB2c: [17.18, 8.27, 12.82, 10.55, 10.55, 6.18, 13.82, 17.18, 14.91, 17.18, 11.64],
+  docs: [40.5, 9.75, 9.75, 11, 11]
+};
 
 function cleanText(value, fallback = "") {
   const text = String(value ?? "").trim();
@@ -228,9 +244,12 @@ function normalizeRecords(records, businessState) {
   }).sort((a, b) => a.date.localeCompare(b.date) || a.number.localeCompare(b.number, undefined, { numeric: true }));
 }
 
-function makeSheet(rows, widths) {
+function makeSheet(rows, widths, { minRows = GST_TEMPLATE_ROWS, minCols = widths.length } = {}) {
   const worksheet = XLSX.utils.aoa_to_sheet(rows);
   worksheet["!cols"] = widths.map((width) => ({ wch: width }));
+  const endRow = Math.max(minRows, rows.length) - 1;
+  const endCol = Math.max(minCols, widths.length, ...rows.map((row) => row.length)) - 1;
+  worksheet["!ref"] = XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: endRow, c: endCol } });
   return worksheet;
 }
 
@@ -239,39 +258,70 @@ function sum(rows, field) {
 }
 
 function makeGstr1Sheet({ businessName, businessPhone, startDate, endDate, records, businessState }) {
-  const rows = [
-    [businessName],
-    [`Phone No: ${businessPhone || "Not added"}`],
-    [], [],
-    ["GSTR-1"],
-    [`Dated: ${displayDate(startDate)}-${displayDate(endDate)}`],
-    [], [], [], [], [], [],
-    ["Sales"],
-    ["GSTIN", "Customer Name", "Place of supply", "", "Invoice Details", "", "", "Total Tax%", "Taxable Value", "Amount of Tax", "", "", "", ""],
-    [" ", " ", "State Code", "State Name", "Invoice Number", "Invoice Date", "Invoice value", "", "", "Central Tax Amount", "State/UT Tax Amount", "Integrated Tax Amount", "Cess Amt.", "Total Tax Amt."]
-  ];
+  const rows = Array.from({ length: GSTR1_SALES_START_ROW - 1 }, () => []);
+  const setRow = (rowNumber, values) => {
+    while (rows.length < rowNumber) {
+      rows.push([]);
+    }
+    rows[rowNumber - 1] = values;
+  };
+  setRow(1, [businessName]);
+  setRow(2, [`Phone No: ${businessPhone || "Not added"}`]);
+  setRow(5, ["GSTR-1"]);
+  setRow(6, [`Dated: ${displayDate(startDate)}-${displayDate(endDate)}`]);
+  setRow(13, ["Sales"]);
+  setRow(14, ["GSTIN", "Customer Name", "Place of supply", "", "Invoice Details", "", "", "Total Tax%", "Taxable Value", "Amount of Tax", "", "", "", "", null]);
+  setRow(15, [" ", " ", "State Code", "State Name", "Invoice Number", "Invoice Date", "Invoice value", "", "", "Central Tax Amount", "State/UT Tax Amount", "Integrated Tax Amount", "Cess Amt.", "Total Tax Amt.", null]);
+  const totals = { value: 0, taxableValue: 0, central: 0, state: 0, integrated: 0, cess: 0, tax: 0 };
+  let nextSalesRow = GSTR1_SALES_START_ROW;
   records.forEach((record) => {
     record.rateGroups.forEach((group, index) => {
       const split = taxSplit(group, record.interstate);
-      rows.push([
-        index ? "" : record.customer.gstin,
+      const taxAmount = money(split.central + split.state + split.integrated);
+      if (!index) {
+        totals.value = money(totals.value + record.value);
+      }
+      totals.taxableValue = money(totals.taxableValue + group.taxableValue);
+      totals.central = money(totals.central + split.central);
+      totals.state = money(totals.state + split.state);
+      totals.integrated = money(totals.integrated + split.integrated);
+      totals.tax = money(totals.tax + taxAmount);
+      setRow(nextSalesRow, [
+        index ? "" : record.customer.gstin || null,
         index ? "" : (record.registered ? record.customer.name : "Cash Sale"),
         index ? "" : numberValue(record.customerState.code),
         index ? "" : record.customerState.name,
         index ? "" : record.number,
         index ? "" : displayDate(record.date),
         index ? "" : record.value,
-        group.rate || "",
+        group.rate || null,
         group.taxableValue,
         split.central,
         split.state,
         split.integrated,
         0,
-        money(split.central + split.state + split.integrated)
+        taxAmount,
+        ""
       ]);
+      nextSalesRow += 1;
     });
   });
-  return makeSheet(rows, [19, 22, 12, 22, 22, 14, 15, 12, 15, 18, 20, 19, 12, 16]);
+  const salesTotalRow = nextSalesRow + 1;
+  const salesReturnTitleRow = salesTotalRow + GSTR1_SECTION_GAP_ROWS + 1;
+  const purchaseReturnTitleRow = salesReturnTitleRow + GSTR1_SECTION_GAP_ROWS + 5;
+  setRow(salesTotalRow, ["Total", "", "", "", "", "", totals.value, "", totals.taxableValue, totals.central, totals.state, totals.integrated, totals.cess, totals.tax, null]);
+  setRow(salesReturnTitleRow, ["Sales Return"]);
+  setRow(salesReturnTitleRow + 1, ["GSTIN", "Customer Name", "Place of supply", "", "Invoice Details", "", "", "", "Total Tax%", "Taxable Value", "Amount of Tax", "", "", "", ""]);
+  setRow(salesReturnTitleRow + 2, [" ", " ", "State Code", "State Name", "Invoice Number", "Invoice Date", "Invoice value", "Invoice Type", "", "", "Central Tax Amount", "State/UT Tax Amount", "Integrated Tax Amount", "Cess Amt.", "Total Tax Amt."]);
+  setRow(salesReturnTitleRow + 4, ["Total", "", "", "", "", "", 0, "", "", 0, 0, 0, 0, 0, 0]);
+  setRow(purchaseReturnTitleRow, ["Purchase Return"]);
+  setRow(purchaseReturnTitleRow + 1, ["GSTIN", "Customer Name", "Place of supply", "", "Invoice Details", "", "", "", "Total Tax%", "Taxable Value", "Amount of Tax", "", "", "", ""]);
+  setRow(purchaseReturnTitleRow + 2, [" ", " ", "State Code", "State Name", "Invoice Number", "Invoice Date", "Invoice value", "Invoice Type", "", "", "Central Tax Amount", "State/UT Tax Amount", "Integrated Tax Amount", "Cess Amt.", "Total Tax Amt."]);
+  setRow(purchaseReturnTitleRow + 4, ["Total", "", "", "", "", "", 0, "", "", 0, 0, 0, 0, 0, 0]);
+  return makeSheet(rows, REFERENCE_WIDTHS.gstr1, {
+    minRows: rows.length,
+    minCols: 15
+  });
 }
 
 function makeB2bSheet(records) {
@@ -288,7 +338,7 @@ function makeB2bSheet(records) {
     [recipients, "", registered.length, "", sum(registered, "value"), "", "", "", "", "", "", sum(detailRows.map((row) => ({ value: row[11] })), "value"), 0],
     ["GSTIN/UIN of Recipient", "Receiver Name", "Invoice Number", "Invoice date", "Invoice Value", "Place Of Supply", "Reverse Charge", "Applicable % of Tax Rate", "Invoice Type", "E-Commerce GSTIN", "Rate", "Taxable Value", "Cess Amount"],
     ...detailRows
-  ], [19, 22, 22, 14, 15, 24, 15, 22, 17, 20, 8, 15, 12]);
+  ], REFERENCE_WIDTHS.b2b);
 }
 
 function makeB2clSheet(records) {
@@ -299,11 +349,11 @@ function makeB2clSheet(records) {
   ]));
   return makeSheet([
     ["Summary For B2CL"],
-    ["No. of Invoices", "", "Total Invoice Value", "", "", "", "Total Taxable Value", "Total Cess", ""],
-    [invoices.length, "", sum(invoices, "value"), "", "", "", sum(detailRows.map((row) => ({ value: row[6] })), "value"), 0, ""],
+    ["No. of Invoices", "", "Total Invoice Value", "", "", "", "Total Taxable Value", "Total Cess", null],
+    [invoices.length, "", sum(invoices, "value"), "", "", "", sum(detailRows.map((row) => ({ value: row[6] })), "value"), 0, null],
     ["Invoice Number", "Invoice date", "Invoice Value", "Place Of Supply", "Applicable % of Tax Rate", "Rate", "Taxable Value", "Cess Amount", "E-Commerce GSTIN"],
     ...detailRows
-  ], [22, 14, 15, 24, 22, 8, 15, 12, 20]);
+  ], REFERENCE_WIDTHS.b2cl);
 }
 
 function makeB2csSheet(records) {
@@ -325,20 +375,20 @@ function makeB2csSheet(records) {
   ]);
   return makeSheet([
     ["Summary For B2CS"],
-    ["", "", "", "", "Total Taxable Value", "Total Cess", ""],
-    ["", "", "", "", sum(detailRows.map((row) => ({ value: row[4] })), "value"), 0, ""],
+    ["", "", "", "", "Total Taxable Value", "Total Cess", null],
+    ["", "", "", "", sum(detailRows.map((row) => ({ value: row[4] })), "value"), 0, null],
     ["Type", "Place Of Supply", "Applicable % of Tax Rate", "Rate", "Taxable Value", "Cess Amount", "E-Commerce GSTIN"],
     ...detailRows
-  ], [16, 24, 22, 8, 16, 12, 20]);
+  ], REFERENCE_WIDTHS.b2cs);
 }
 
 function makeCdnrSheet() {
   return makeSheet([
     ["Summary For CDNR"],
-    ["No. of Recipients", "No. of Notes", "", "", "", "", "", "Total Note Value", "", "", "Total Taxable Value", "Total Cess", ""],
-    [0, 0, "", "", "", "", "", 0, "", "", 0, 0, ""],
+    ["No. of Recipients", "No. of Notes", "", "", "", "", "", "Total Note Value", "", "", "Total Taxable Value", "Total Cess", null],
+    [0, 0, "", "", "", "", "", 0, "", "", 0, 0, null],
     ["GSTIN/UIN of Recipient", "Receiver Name", "Note Number", "Note Date", "Note Type", "Place Of Supply", "Reverse Charge", "Note Supply Type", "Note Value", "Applicable % of Tax Rate", "Rate", "Taxable Value", "Cess Amount"]
-  ], [19, 20, 18, 14, 12, 24, 15, 18, 14, 22, 8, 15, 12]);
+  ], REFERENCE_WIDTHS.cdnr);
 }
 
 function makeCdnurSheet() {
@@ -347,7 +397,7 @@ function makeCdnurSheet() {
     ["", "No. of Notes/Vouchers", "", "", "", "Total Note Value", "", "", "Total Taxable Value", "Total Cess"],
     ["", 0, "", "", "", 0, "", "", 0, 0],
     ["UR Type", "Note Number", "Note Date", "Note Type", "Place Of Supply", "Note Value", "Applicable % of Tax Rate", "Rate", "Taxable Value", "Cess Amount"]
-  ], [17, 18, 14, 12, 24, 14, 22, 8, 15, 12]);
+  ], REFERENCE_WIDTHS.cdnur);
 }
 
 function makeExemptSheet(records, businessState) {
@@ -374,7 +424,7 @@ function makeExemptSheet(records, businessState) {
     ["", sum(rows.map((row) => ({ value: row[1] })), "value"), 0, 0],
     ["Description", "Nil Rated Supplies", "Exempted(other than nil rated/non GST supply)", "Non-GST Supplies"],
     ...rows
-  ], [50, 19, 36, 20]);
+  ], REFERENCE_WIDTHS.exemp);
 }
 
 function makeHsnSheet(records, registered) {
@@ -397,9 +447,7 @@ function makeHsnSheet(records, registered) {
         central: 0,
         state: 0
       };
-      if (current.description !== item.name) {
-        current.description = "";
-      }
+      current.description = "";
       current.quantity = money(current.quantity + item.quantity);
       current.totalValue = money(current.totalValue + item.totalValue);
       current.taxableValue = money(current.taxableValue + item.taxableValue);
@@ -419,7 +467,7 @@ function makeHsnSheet(records, registered) {
     [detailRows.length, "", "", "", sum(detailRows.map((row) => ({ value: row[4] })), "value"), "", sum(detailRows.map((row) => ({ value: row[6] })), "value"), sum(detailRows.map((row) => ({ value: row[7] })), "value"), sum(detailRows.map((row) => ({ value: row[8] })), "value"), sum(detailRows.map((row) => ({ value: row[9] })), "value"), 0],
     ["HSN", "Description", "UQC", "Total Quantity", "Total Value", "Rate", "Taxable Value", "Integrated Tax Amount", "Central Tax Amount", "State/UT Tax Amount", "Cess Amount"],
     ...detailRows
-  ], [17, 28, 18, 14, 15, 8, 16, 19, 17, 19, 12]);
+  ], registered ? REFERENCE_WIDTHS.hsnB2b : REFERENCE_WIDTHS.hsnB2c);
 }
 
 function makeDocsSheet(records) {
@@ -430,7 +478,7 @@ function makeDocsSheet(records) {
     ["", "", "", numbers.length, 0],
     ["Nature of Document", "Sr. No. From", "Sr. No. To", "Total Number", "Cancelled"],
     ["Invoices for outward supply", numbers[0] || "", numbers.at(-1) || "", numbers.length, 0]
-  ], [41, 22, 22, 14, 14]);
+  ], REFERENCE_WIDTHS.docs);
 }
 
 export function buildGstr1Workbook({

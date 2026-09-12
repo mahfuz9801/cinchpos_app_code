@@ -1247,6 +1247,11 @@ body[data-appearance="dark"] .record-chip.warning {
     background: var(--yellow-soft);
 }
 
+.status-partial {
+    color: #5e4b00;
+    background: color-mix(in srgb, var(--yellow-soft) 72%, var(--green-soft));
+}
+
 .status-overdue {
     color: var(--red);
     background: var(--red-soft);
@@ -1257,6 +1262,10 @@ body[data-appearance="dark"] .status-paid {
 }
 
 body[data-appearance="dark"] .status-pending {
+    color: var(--yellow);
+}
+
+body[data-appearance="dark"] .status-partial {
     color: var(--yellow);
 }
 
@@ -6495,7 +6504,8 @@ body[data-preview-watermark="off"] .pos-preview-scroll::before {
 }
 
 .standard-invoice-meta > span,
-.standard-due-date-picker {
+.standard-due-date-picker,
+.standard-paper-picker {
     display: inline-flex;
     align-items: center;
     gap: 5px;
@@ -6513,7 +6523,8 @@ body[data-preview-watermark="off"] .pos-preview-scroll::before {
     font-weight: 700;
 }
 
-.standard-due-date-picker {
+.standard-due-date-picker,
+.standard-paper-picker {
     cursor: pointer;
 }
 
@@ -6538,6 +6549,17 @@ body[data-preview-watermark="off"] .pos-preview-scroll::before {
     margin: 0;
     opacity: 1;
     cursor: pointer;
+}
+
+.standard-paper-picker select {
+    min-width: 62px;
+    height: 24px;
+    padding: 2px 22px 2px 8px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: var(--surface);
+    color: var(--ink);
+    font-size: 0.82rem;
 }
 
 .standard-customer-grid label,

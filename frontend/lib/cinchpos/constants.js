@@ -32,6 +32,7 @@ export const defaultSettings = {
   invoiceNotes: "",
   startupView: "dashboardView",
   printPaperSize: "80mm",
+  standardInvoicePaperSize: "A4",
   printLayout: "thermal",
   printMargin: "default",
   printCalibrationProfiles: {},
