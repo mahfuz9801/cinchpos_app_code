@@ -148,3 +148,30 @@ test("getPOSBillSummary totals quantity, taxable value, GST, and grand total", (
   assert.ok(summary.gst > 0);
   assert.equal(Number(summary.total.toFixed(2)), 90);
 });
+
+test("findInventoryItemsByBarcode scales to 5,000 items in sub-millisecond lookup time", () => {
+  const largeCatalog = Array.from({ length: 5000 }, (_, i) => ({
+    id: `item-${i}`,
+    itemName: `Product Item ${i}`,
+    barcodes: [`890100000${i}`, `PLU${i}`],
+    inclusivePrice: 100 + (i % 50),
+    gstRate: 18
+  }));
+
+  const start = performance.now();
+  for (let scan = 0; scan < 100; scan += 1) {
+    const matches = findInventoryItemsByBarcode(largeCatalog, `890100000${scan * 40}`);
+    assert.equal(matches.length, 1);
+    assert.equal(matches[0].id, `item-${scan * 40}`);
+  }
+  const duration = performance.now() - start;
+  // 100 barcode lookups in a 5,000 item catalog must take well under 50ms total (< 0.5ms per lookup)
+  assert.ok(duration < 50, `100 lookups took ${duration.toFixed(2)}ms, expected < 50ms`);
+});
+
+test("buildPOSSearchPatch returns immediate barcode match for scanned item", () => {
+  const patch = buildPOSSearchPatch(inventoryItems, "12345");
+  assert.equal(patch.matchMode, "barcode");
+  assert.equal(patch.matches.length, 1);
+  assert.equal(patch.matches[0].itemName, "Green Tea");
+});

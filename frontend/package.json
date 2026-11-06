@@ -1,6 +1,6 @@
 {
   "name": "cinchpos-frontend",
-  "version": "1.0.14",
+  "version": "1.0.15",
   "description": "CinchPOS desktop billing and ERP app.",
   "author": "CinchLive Technologies Pvt. Ltd.",
   "private": true,
@@ -33,6 +33,7 @@
   "devDependencies": {
     "electron": "^41.2.1",
     "electron-builder": "^26.8.1",
+    "firebase-tools": "^15.34.2",
     "next": "16.2.4",
     "png-to-ico": "^3.0.1",
     "react": "19.2.5",

@@ -128,22 +128,83 @@ export function buildPOSLineItem(item) {
   };
 }
 
+const inventoryBarcodeIndexCache = new WeakMap();
+
+export function getInventoryBarcodeIndex(items) {
+  if (!Array.isArray(items)) {
+    return { exactMap: new Map(), itemsWithBarcodes: [] };
+  }
+  let cached = inventoryBarcodeIndexCache.get(items);
+  if (cached) {
+    return cached;
+  }
+
+  const exactMap = new Map();
+  const itemsWithBarcodes = [];
+
+  for (let i = 0; i < items.length; i += 1) {
+    const item = items[i];
+    const barcodes = getInventoryItemBarcodes(item);
+    if (barcodes.length) {
+      itemsWithBarcodes.push({ item, barcodes });
+      for (let j = 0; j < barcodes.length; j += 1) {
+        const rawBarcode = barcodes[j];
+        const lower = cleanText(rawBarcode).toLowerCase();
+        const normalized = normalizeKey(rawBarcode);
+
+        if (lower) {
+          const list = exactMap.get(lower);
+          if (list) {
+            if (!list.includes(item)) {
+              list.push(item);
+            }
+          } else {
+            exactMap.set(lower, [item]);
+          }
+        }
+        if (normalized && normalized !== lower) {
+          const list = exactMap.get(normalized);
+          if (list) {
+            if (!list.includes(item)) {
+              list.push(item);
+            }
+          } else {
+            exactMap.set(normalized, [item]);
+          }
+        }
+      }
+    }
+  }
+
+  cached = { exactMap, itemsWithBarcodes };
+  inventoryBarcodeIndexCache.set(items, cached);
+  return cached;
+}
+
 export function findInventoryItemsByBarcode(items, query) {
   const search = cleanText(query).toLowerCase();
   const normalizedSearch = normalizeKey(query);
   if (!search) {
     return [];
   }
-  return items.filter((item) => getInventoryItemBarcodes(item).some((barcode) => {
-    const savedBarcode = barcode.toLowerCase();
-    return savedBarcode === search || normalizeKey(savedBarcode) === normalizedSearch;
-  }));
+  const index = getInventoryBarcodeIndex(items);
+  const direct = index.exactMap.get(search);
+  if (direct && direct.length) {
+    return direct;
+  }
+  if (normalizedSearch && normalizedSearch !== search) {
+    const normalized = index.exactMap.get(normalizedSearch);
+    if (normalized && normalized.length) {
+      return normalized;
+    }
+  }
+  return [];
 }
 
 export function isBarcodeLikeQuery(query) {
   const cleaned = cleanText(query);
   const normalized = normalizeKey(cleaned);
-  return normalized.length >= 5 && /\d/.test(normalized) && !/\s/.test(cleaned);
+  return normalized.length >= 4 && /\d/.test(normalized) && !/\s/.test(cleaned);
 }
 
 export function findInventoryItemsByBarcodeCandidate(items, query) {
@@ -156,11 +217,19 @@ export function findInventoryItemsByBarcodeCandidate(items, query) {
   }
   const search = cleanText(query).toLowerCase();
   const normalizedSearch = normalizeKey(query);
-  return items.filter((item) => getInventoryItemBarcodes(item).some((barcode) => {
-    const savedBarcode = barcode.toLowerCase();
-    const normalizedBarcode = normalizeKey(savedBarcode);
-    return savedBarcode.includes(search) || normalizedBarcode.includes(normalizedSearch);
-  }));
+  const index = getInventoryBarcodeIndex(items);
+  const results = [];
+  for (let i = 0; i < index.itemsWithBarcodes.length; i += 1) {
+    const entry = index.itemsWithBarcodes[i];
+    const matched = entry.barcodes.some((barcode) => {
+      const savedBarcode = barcode.toLowerCase();
+      return savedBarcode.includes(search) || normalizeKey(savedBarcode).includes(normalizedSearch);
+    });
+    if (matched) {
+      results.push(entry.item);
+    }
+  }
+  return results;
 }
 
 function getInventorySearchName(item) {
@@ -227,26 +296,37 @@ export function findInventoryMatches(items, query) {
     return [];
   }
 
-  return items
-    .map((item, index) => {
-      const nameScore = scoreInventoryName(item, search, normalizedSearch);
-      const barcodeScore = scoreInventoryBarcode(item, query);
-      return {
+  const exactBarcodeMatches = findInventoryItemsByBarcode(items, query);
+  if (exactBarcodeMatches.length) {
+    return exactBarcodeMatches;
+  }
+
+  const scored = [];
+  for (let index = 0; index < items.length; index += 1) {
+    const item = items[index];
+    const nameScore = scoreInventoryName(item, search, normalizedSearch);
+    const barcodeScore = scoreInventoryBarcode(item, query);
+    const score = Math.min(nameScore, barcodeScore);
+    if (Number.isFinite(score)) {
+      scored.push({
         item,
         index,
-        score: Math.min(nameScore, barcodeScore),
+        score,
         name: getInventorySearchName(item).toLowerCase()
-      };
-    })
-    .filter((entry) => Number.isFinite(entry.score))
-    .sort((first, second) => {
-      if (first.score !== second.score) {
-        return first.score - second.score;
-      }
-      const nameSort = first.name.localeCompare(second.name);
-      return nameSort || first.index - second.index;
-    })
-    .map((entry) => entry.item);
+      });
+    }
+  }
+
+  scored.sort((first, second) => {
+    if (first.score !== second.score) {
+      return first.score - second.score;
+    }
+    if (first.name < second.name) return -1;
+    if (first.name > second.name) return 1;
+    return first.index - second.index;
+  });
+
+  return scored.map((entry) => entry.item);
 }
 
 export function findInventoryItemForPOS(items, query) {
@@ -284,6 +364,14 @@ export function buildPOSSearchPatch(items, value) {
       matches: barcodeMatches,
       matchMode: "barcode",
       matchMessage: `${barcodeMatches.length} products use barcode ${query}. Choose the correct item.`
+    };
+  }
+  if (barcodeMatches.length === 1) {
+    return {
+      itemQuery: value,
+      matches: barcodeMatches,
+      matchMode: "barcode",
+      matchMessage: `1 product found for barcode ${query}.`
     };
   }
 

@@ -3741,7 +3741,36 @@ def record_payment():
 
     return jsonify({"message": "Payment recorded successfully."}), 201
 
+try:
+    from google import genai
+    from google.genai import types
+    # Force your Flask backend to pull from your ₹28,664 welcome credits
+    if os.path.exists("Gemini-key.json"):
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "Gemini-key.json"
+    gemini_client = genai.Client(vertexai=True)
+except Exception:
+    genai = None
+    types = None
+    gemini_client = None
 
+# Create a clean AI endpoint for your website/application frontend
+@app.route("/api/ai-chat", methods=["POST"])
+def ai_chat_endpoint():
+    try:
+        if not gemini_client:
+            return jsonify({"error": "Gemini AI is not configured or dependency is missing."}), 503
+        data = request.get_json()
+        user_prompt = data.get("prompt", "")
+        if not user_prompt:
+            return jsonify({"error": "Prompt is required"}), 400
+        # Route query through Gemini 3.8 Flash using your credits
+        response = gemini_client.models.generate_content(
+            model='gemini-3.8-flash',
+            contents=user_prompt,
+        )
+        return jsonify({"response": response.text}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 if __name__ == "__main__":
     host = os.getenv("HOST", "127.0.0.1")
     port = int(os.getenv("PORT", "5000"))

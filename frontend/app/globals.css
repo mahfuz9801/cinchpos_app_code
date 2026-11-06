@@ -6872,7 +6872,37 @@ body[data-preview-watermark="off"] .pos-preview-scroll::before {
 }
 
 .auth-modal-card {
-    width: min(520px, calc(100vw - 32px));
+    width: min(480px, calc(100vw - 32px));
+    max-height: calc(100vh - 48px);
+    overflow-y: auto;
+    overflow-x: hidden;
+}
+
+.auth-modal-card .modal-head {
+    margin-bottom: 12px;
+}
+
+.auth-modal-title {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 1.15rem;
+    font-weight: 700;
+}
+
+.auth-modal-logo {
+    width: 28px;
+    height: 28px;
+    flex: 0 0 auto;
+}
+
+.auth-modal-card .auth-workspace-card {
+    border: 0;
+    border-radius: 0;
+    box-shadow: none;
+    padding: 0;
+    background: transparent;
+    gap: 14px;
 }
 
 .auth-panel {
@@ -7168,6 +7198,45 @@ body[data-preview-watermark="off"] .pos-preview-scroll::before {
     grid-template-columns: auto minmax(100px, 1fr) auto;
     gap: 8px;
     align-items: center;
+}
+
+.auth-otp-trigger-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+}
+
+.auth-otp-trigger-row .auth-otp-btn {
+    flex: 1;
+}
+
+.auth-otp-verify-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto auto;
+    gap: 8px;
+    align-items: center;
+}
+
+.auth-link-button {
+    border: 0;
+    background: transparent;
+    color: var(--accent-strong);
+    font-size: 0.8rem;
+    font-weight: 600;
+    cursor: pointer;
+    text-decoration: underline;
+    padding: 6px 4px;
+    white-space: nowrap;
+}
+
+.auth-link-button:hover {
+    color: var(--text);
+}
+
+.auth-link-button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
 }
 
 .auth-otp-note {

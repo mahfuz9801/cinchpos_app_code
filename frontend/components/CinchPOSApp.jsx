@@ -103,9 +103,9 @@ import {
   deletePOSBillFromInstance,
   findInventoryItemForPOS,
   findInventoryItemsByBarcode,
-  findInventoryItemsByBarcodeCandidate,
   findInventoryMatches,
   getPOSBillSummary,
+  isBarcodeLikeQuery,
   makeBill,
   makeInitialPOSState,
   makePOSInstance,
@@ -1462,6 +1462,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
   const [account, setAccount] = useState(defaultAccount);
   const [authState, setAuthState] = useState(() => makeSignedOutAuthState({ configured: true, required: true }));
   const [authBusy, setAuthBusy] = useState(false);
+  const [authAction, setAuthAction] = useState("");
   const [authRoles, setAuthRoles] = useState([]);
   const [authPermissionCatalog, setAuthPermissionCatalog] = useState({});
   const [employeeAccessRole, setEmployeeAccessRole] = useState("salesman");
@@ -2607,6 +2608,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     let removeListener = null;
 
     async function initializeAuth() {
+      setAuthAction("init");
       setAuthBusy(true);
       const cachedAccountSession = await readAccountAuthSession();
       if (cachedAccountSession?.authState?.token && !cancelled) {
@@ -2627,6 +2629,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
           // Keep the saved account session active; the next API call can reconnect when the service is ready.
         }
         setAuthBusy(false);
+        setAuthAction("");
         return;
       }
       const cachedSession = await readOfflineAuthSession();
@@ -2653,9 +2656,13 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         await syncAuthContext(null, { silent: true });
       }
       setAuthBusy(false);
+      setAuthAction("");
     }
 
-    initializeAuth().catch(() => setAuthBusy(false));
+    initializeAuth().catch(() => {
+      setAuthBusy(false);
+      setAuthAction("");
+    });
 
     return () => {
       cancelled = true;
@@ -2872,6 +2879,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         showMessage("Phone number must be 10 digits.");
         return;
       }
+      setAuthAction("register");
       setAuthBusy(true);
       try {
         const payload = await registerCinchAccount({
@@ -2889,6 +2897,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         showMessage(error instanceof Error ? error.message : "Could not create account.");
       } finally {
         setAuthBusy(false);
+        setAuthAction("");
       }
       return;
     }
@@ -2898,6 +2907,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       showMessage("Enter email id or phone number and password.");
       return;
     }
+    setAuthAction("login");
     setAuthBusy(true);
     try {
       const payload = await loginCinchAccount({ identifier, password });
@@ -2908,6 +2918,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       showMessage(error instanceof Error ? error.message : "Login failed.");
     } finally {
       setAuthBusy(false);
+      setAuthAction("");
     }
   }
 
@@ -2920,6 +2931,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       showMessage("Enter your email id or phone number.");
       return;
     }
+    setAuthAction("send_otp");
     setAuthBusy(true);
     try {
       const payload = await requestCinchAccountOtp({
@@ -2939,6 +2951,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       showMessage(error instanceof Error ? error.message : "Could not send OTP.");
     } finally {
       setAuthBusy(false);
+      setAuthAction("");
     }
   }
 
@@ -2953,6 +2966,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       showMessage("Enter your email id or phone number and OTP.");
       return;
     }
+    setAuthAction("verify_otp");
     setAuthBusy(true);
     try {
       const payload = await verifyCinchAccountOtp({ identifier, otp });
@@ -2961,6 +2975,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       showMessage(error instanceof Error ? error.message : "OTP login failed.");
     } finally {
       setAuthBusy(false);
+      setAuthAction("");
     }
   }
 
@@ -2990,6 +3005,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
   }
 
   async function signOutOfAuth() {
+    setAuthAction("logout");
     setAuthBusy(true);
     try {
       if (authState.token) {
@@ -3015,6 +3031,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       showMessage(error instanceof Error ? error.message : "Could not sign out.");
     } finally {
       setAuthBusy(false);
+      setAuthAction("");
     }
   }
 
@@ -3157,10 +3174,6 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     });
   }
 
-  function handlePOSItemSearch(formId, value) {
-    updatePOSItemSearch(formId, value, { autoAdd: false });
-  }
-
   function handlePOSSearchEnter(formId, value) {
     const query = cleanText(value);
     if (!query) {
@@ -3189,12 +3202,14 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       }
       return;
     }
-    const fallbackMatch = instance.matchMode === "barcode" ? null : instance.matches?.[0];
-    const liveFallbackMatch = options.query !== undefined ? findInventoryMatches(inventoryItems, query).slice(0, 1)[0] : fallbackMatch;
-    const item = selectedItem
-      || barcodeMatches[0]
-      || findInventoryItemForPOS(inventoryItems, query)
-      || liveFallbackMatch;
+    let item = selectedItem || barcodeMatches[0];
+    if (!item) {
+      item = findInventoryItemForPOS(inventoryItems, query);
+    }
+    if (!item) {
+      const fallbackMatch = instance.matchMode === "barcode" ? null : instance.matches?.[0];
+      item = options.query !== undefined ? findInventoryMatches(inventoryItems, query).slice(0, 1)[0] : fallbackMatch;
+    }
     if (!item) {
       if (!options.silent) {
         showMessage(instance.matchMode === "barcode"
@@ -5134,7 +5149,6 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     handlePOSPhone,
     updatePOSCustomer,
     getCustomerStatus,
-    handlePOSItemSearch,
     updatePOSItemSearch,
     handlePOSSearchEnter,
     addPOSItem,
@@ -5176,7 +5190,6 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       handlePOSPhone,
       updatePOSCustomer,
       getCustomerStatus,
-      handlePOSItemSearch,
       updatePOSItemSearch,
       handlePOSSearchEnter,
       addPOSItem,
@@ -5194,15 +5207,18 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     const [keyboardShift, setKeyboardShift] = useState(false);
     const [keyboardCaps, setKeyboardCaps] = useState(false);
     const lastAutoBarcodeRef = useRef("");
+    const posSearchInputRef = useRef(null);
     const instance = getPOSInstance(formId);
+    const [itemQueryDraft, setItemQueryDraft] = useState(() => instance.itemQuery || "");
     const bill = getActiveBill(formId);
     const customer = { ...defaultPOSCustomer, ...(bill.customer || {}) };
     const items = bill.items || [];
     const posSummary = getPOSBillSummary(items);
     const matchListId = `${formId}ProductMatches`;
-    const visibleMatches = instance.matchMode === "barcode"
-      ? (instance.matches || [])
-      : (instance.matches || []).slice(0, 8);
+    const matchesAreCurrent = String(instance.itemQuery || "") === itemQueryDraft;
+    const visibleMatches = matchesAreCurrent
+      ? (instance.matchMode === "barcode" ? (instance.matches || []) : (instance.matches || []).slice(0, 8))
+      : [];
     const paidAmount = customer.paymentType === "partial"
       ? Math.min(posSummary.total, Math.max(0, Number(customer.partialAmount || 0)))
       : posSummary.total;
@@ -5225,33 +5241,58 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     const activeKeyboardRows = keyboardMode === "letters" ? keyboardLetterRows : keyboardNumberRows;
 
     useEffect(() => {
-      const query = cleanText(instance.itemQuery);
+      posSearchInputRef.current?.focus();
+    }, [formId, instance.activeBillId, items.length]);
+
+    useEffect(() => {
+      const savedQuery = String(instance.itemQuery || "");
+      if (savedQuery !== itemQueryDraft) {
+        setItemQueryDraft(savedQuery);
+      }
+    }, [instance.itemQuery]);
+
+    useEffect(() => {
+      const query = cleanText(itemQueryDraft);
       if (!query) {
         lastAutoBarcodeRef.current = "";
+        if (instance.itemQuery) {
+          updatePOSItemSearch(formId, "", { autoAdd: false });
+        }
         return;
       }
-      const barcodeMatches = findInventoryItemsByBarcodeCandidate(inventoryItems, query);
-      if (barcodeMatches.length === 1) {
-        const autoBarcodeKey = `${formId}:${normalizeKey(query)}:${getInventoryItemKey(barcodeMatches[0])}`;
+
+      const exactBarcodeMatches = isBarcodeLikeQuery(query)
+        ? findInventoryItemsByBarcode(inventoryItems, query)
+        : [];
+      if (exactBarcodeMatches.length === 1) {
+        const autoBarcodeKey = `${formId}:${normalizeKey(query)}:${getInventoryItemKey(exactBarcodeMatches[0])}`;
         if (lastAutoBarcodeRef.current === autoBarcodeKey) {
           return;
         }
-        const exactMatch = findInventoryItemsByBarcode(inventoryItems, query).length === 1;
-        const timer = window.setTimeout(() => {
-          lastAutoBarcodeRef.current = autoBarcodeKey;
-          addPOSItem(formId, barcodeMatches[0], { query, silent: true });
-        }, exactMatch ? 40 : 280);
-        return () => window.clearTimeout(timer);
+        lastAutoBarcodeRef.current = autoBarcodeKey;
+        setItemQueryDraft("");
+        addPOSItem(formId, exactBarcodeMatches[0], { query, silent: true });
+        posSearchInputRef.current?.focus();
+        return;
       }
+
+      if (isBarcodeLikeQuery(query)) {
+        return;
+      }
+
       lastAutoBarcodeRef.current = "";
-    }, [formId, instance.itemQuery, inventoryItems]);
+      const timer = window.setTimeout(() => {
+        updatePOSItemSearch(formId, itemQueryDraft, { autoAdd: false });
+      }, 140);
+      return () => window.clearTimeout(timer);
+    }, [formId, inventoryItems, itemQueryDraft]);
 
     function pressKeyboardKey(key) {
       const value = key === "Rs" ? "Rs " : key;
       const resolvedValue = keyboardMode === "letters" && value.length === 1
         ? (showUppercaseKeyboard ? value.toUpperCase() : value)
         : value;
-      updatePOSItemSearch(formId, (currentValue) => `${currentValue}${resolvedValue}`);
+      setItemQueryDraft((currentValue) => `${currentValue}${resolvedValue}`);
       if (keyboardShift && !keyboardCaps) {
         setKeyboardShift(false);
       }
@@ -5374,20 +5415,39 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                 <div className="pos-item-entry">
                   <label>
                     Search Item
-                    <input name="item_name" type="text" autoComplete="off" placeholder="Scan barcode or search item name" value={instance.itemQuery || ""} aria-expanded={Boolean(instance.matches?.length)} aria-controls={matchListId} onChange={(event) => handlePOSItemSearch(formId, event.target.value)} onKeyDown={(event) => {
+                    <input ref={posSearchInputRef} name="item_name" type="text" autoComplete="off" placeholder="Scan barcode or search item name" value={itemQueryDraft} aria-expanded={Boolean(visibleMatches.length)} aria-controls={matchListId} onChange={(event) => setItemQueryDraft(event.target.value)} onKeyDown={(event) => {
                       if (event.key === "Enter") {
                         event.preventDefault();
-                        handlePOSSearchEnter(formId, event.currentTarget.value);
+                        const query = event.currentTarget.value;
+                        const exactBarcodeMatches = findInventoryItemsByBarcode(inventoryItems, query);
+                        const autoBarcodeKey = exactBarcodeMatches.length === 1
+                          ? `${formId}:${normalizeKey(query)}:${getInventoryItemKey(exactBarcodeMatches[0])}`
+                          : "";
+                        if (autoBarcodeKey && lastAutoBarcodeRef.current !== autoBarcodeKey) {
+                          lastAutoBarcodeRef.current = autoBarcodeKey;
+                          setItemQueryDraft("");
+                          addPOSItem(formId, exactBarcodeMatches[0], { query, silent: true });
+                        } else if (!autoBarcodeKey) {
+                          setItemQueryDraft("");
+                          handlePOSSearchEnter(formId, query);
+                        }
                       }
                     }} />
                   </label>
-                  <button type="button" className="button button-secondary" onClick={() => addPOSItem(formId, null, { query: instance.itemQuery })}>Add Item</button>
+                  <button type="button" className="button button-secondary" onClick={() => {
+                    const query = itemQueryDraft;
+                    setItemQueryDraft("");
+                    addPOSItem(formId, null, { query });
+                  }}>Add Item</button>
                 </div>
-                <div id={matchListId} className={`pos-match-list ${instance.matchMode === "barcode" ? "barcode-match-list" : ""}`} hidden={!instance.matches?.length}>
+                <div id={matchListId} className={`pos-match-list ${matchesAreCurrent && instance.matchMode === "barcode" ? "barcode-match-list" : ""}`} hidden={!visibleMatches.length}>
                   <div className="pos-match-title">{instance.matchMessage || "Choose the product to add"}</div>
                   <div className="pos-match-grid">
                     {visibleMatches.map((item, index) => (
-                      <button key={getInventoryItemKey(item, index)} type="button" className="pos-match-card" onClick={() => addPOSItem(formId, item)}>
+                      <button key={getInventoryItemKey(item, index)} type="button" className="pos-match-card" onClick={() => {
+                        setItemQueryDraft("");
+                        addPOSItem(formId, item);
+                      }}>
                         <span>{getInventoryItemName(item) || "Inventory item"}</span>
                         <small>{currency(item.inclusivePrice || item.inclusive_price || 0)}</small>
                         <em>{getInventoryBarcodeLabel(item)}{Number(item.stock || 0) ? ` | Stock ${item.stock}` : ""}</em>
@@ -6175,16 +6235,20 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         {SettingsForm()}
       </Modal>
 
-      <Modal open={activeModal === "login"} title="CinchPOS Account" subtitle="Login or create your shop account." cardClass="auth-modal-card" onClose={closeModal}>
+      <Modal
+        open={activeModal === "login"}
+        title={
+          <span className="auth-modal-title">
+            <AppLogo className="auth-modal-logo" />
+            <span>CinchPOS Account</span>
+          </span>
+        }
+        subtitle={authFormMode === "register" ? "Create a new shop account" : "Sign in to access your shop workspace"}
+        cardClass="auth-modal-card"
+        onClose={closeModal}
+      >
         <div className="auth-panel">
           <div className="auth-workspace-card">
-            <div className="auth-simple-head">
-              <AppLogo />
-              <div>
-                <span>{authFormMode === "register" ? "Create Account" : "Login"}</span>
-                <p>{authFormMode === "register" ? "Business name, one contact detail, and a strong password are enough." : "Use your email id or phone number with password, or login with OTP."}</p>
-              </div>
-            </div>
             <div className="auth-mode-tabs" role="tablist" aria-label="Account action">
               <button type="button" className={authFormMode === "login" ? "active" : ""} onClick={() => setAuthFormMode("login")}>Login</button>
               <button type="button" className={authFormMode === "register" ? "active" : ""} onClick={() => setAuthFormMode("register")}>Create Account</button>
@@ -6195,10 +6259,10 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                   <input type="text" value={authForm.businessName} onChange={(event) => updateAuthForm("businessName", event.target.value)} placeholder="Store or company name" required />
                 </label>
                 <label>Email ID or Phone Number
-                  <input type="text" autoComplete="email tel" value={authForm.contact} onChange={(event) => updateAuthForm("contact", event.target.value)} placeholder="owner email or 10 digit phone" required />
+                  <input type="text" autoComplete="email tel" value={authForm.contact} onChange={(event) => updateAuthForm("contact", event.target.value)} placeholder="Owner email or 10-digit phone" required />
                 </label>
                 <label>Password
-                  <input type="password" autoComplete="new-password" value={authForm.password} onChange={(event) => updateAuthForm("password", event.target.value)} placeholder="Password" required />
+                  <input type="password" autoComplete="new-password" value={authForm.password} onChange={(event) => updateAuthForm("password", event.target.value)} placeholder="Create password" required />
                 </label>
                 <div className="password-rules">
                   <span>8+ characters</span>
@@ -6208,33 +6272,77 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                   <span>No spaces</span>
                 </div>
                 <div className="modal-actions auth-form-actions">
-                  <button type="button" className="button button-secondary" onClick={closeModal} disabled={authGateActive}>Cancel</button>
-                  <button type="submit" className="button button-primary" disabled={authBusy}>{authBusy ? "Creating..." : "Create Account"}</button>
+                  <button type="button" className="button button-secondary" onClick={() => (authGateActive ? setAuthFormMode("login") : closeModal())}>Cancel</button>
+                  <button type="submit" className="button button-primary" disabled={authBusy}>{authAction === "register" ? "Creating..." : "Create Account"}</button>
                 </div>
               </form>
             ) : (
               <form className="auth-form auth-form-single" onSubmit={submitCinchAccountAuth}>
                 <label>Email ID or Phone Number
-                  <input type="text" autoComplete="email tel" value={authForm.identifier} onChange={(event) => updateAuthForm("identifier", event.target.value)} placeholder="registered email or phone" required />
+                  <input type="text" autoComplete="email tel" value={authForm.identifier} onChange={(event) => updateAuthForm("identifier", event.target.value)} placeholder="Registered email or phone number" required />
                 </label>
                 <label>Password
-                  <input type="password" autoComplete="current-password" value={authForm.password} onChange={(event) => updateAuthForm("password", event.target.value)} placeholder="Password" />
+                  <input type="password" autoComplete="current-password" value={authForm.password} onChange={(event) => updateAuthForm("password", event.target.value)} placeholder="Enter your password" />
                 </label>
-                <button type="submit" className="button button-primary" disabled={authBusy}>{authBusy ? "Checking..." : "Login"}</button>
+                <button type="submit" className="button button-primary" disabled={authBusy}>{authAction === "login" ? "Checking..." : "Login"}</button>
                 <div className="auth-divider"><span>or login with OTP</span></div>
-                <div className="auth-otp-row">
-                  <button type="button" className="button button-secondary" onClick={requestCinchOtp} disabled={authBusy}>{authBusy ? "Sending..." : (authForm.otpSent ? "Resend OTP" : "Send OTP")}</button>
-                  <input type="text" inputMode="numeric" value={authForm.otpCode} onChange={(event) => updateAuthForm("otpCode", event.target.value)} placeholder="Enter OTP" />
-                  <button type="button" className="button button-primary" onClick={verifyCinchOtp} disabled={authBusy || !authForm.otpSent}>{authBusy ? "Verifying..." : "Verify OTP"}</button>
-                </div>
+                {authForm.otpSent ? (
+                  <div className="auth-otp-block">
+                    <div className="auth-otp-row auth-otp-verify-row">
+                      <input
+                        type="text"
+                        inputMode="numeric"
+                        autoComplete="one-time-code"
+                        value={authForm.otpCode}
+                        onChange={(event) => updateAuthForm("otpCode", event.target.value)}
+                        placeholder="Enter 6-digit OTP"
+                        autoFocus
+                      />
+                      <button
+                        type="button"
+                        className="button button-primary"
+                        onClick={verifyCinchOtp}
+                        disabled={authBusy || !authForm.otpCode?.trim()}
+                      >
+                        {authAction === "verify_otp" ? "Verifying..." : "Verify OTP"}
+                      </button>
+                      <button
+                        type="button"
+                        className="button button-secondary"
+                        onClick={requestCinchOtp}
+                        disabled={authBusy}
+                      >
+                        {authAction === "send_otp" ? "Resending..." : "Resend"}
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="auth-otp-trigger-row">
+                    <button
+                      type="button"
+                      className="button button-secondary auth-otp-btn"
+                      onClick={requestCinchOtp}
+                      disabled={authBusy}
+                    >
+                      {authAction === "send_otp" ? "Sending OTP..." : "Send Login OTP"}
+                    </button>
+                    <button
+                      type="button"
+                      className="auth-link-button"
+                      onClick={() => updateAuthForm("otpSent", true)}
+                    >
+                      Enter OTP directly
+                    </button>
+                  </div>
+                )}
                 {authForm.otpMessage ? <p className="auth-otp-note">{authForm.otpMessage}</p> : null}
               </form>
             )}
-            <p className="auth-simple-note">CinchPOS keeps the customer ID hidden and generated automatically. Your password is never stored in the app.</p>
+            <p className="auth-simple-note">Passwords are encrypted securely. CinchPOS never stores your raw credentials on this device.</p>
             {authState.authenticated ? (
               <div className="modal-actions auth-form-actions">
                 <button type="button" className="button button-secondary" onClick={pullCloudWorkspace} disabled={cloudSyncBusy}>Pull Cloud Data</button>
-                <button type="button" className="button button-secondary" onClick={signOutOfAuth} disabled={authBusy}>Logout</button>
+                <button type="button" className="button button-secondary" onClick={signOutOfAuth} disabled={authBusy}>{authAction === "logout" ? "Logging out..." : "Logout"}</button>
                 <button type="button" className="button button-primary" onClick={closeModal}>Done</button>
               </div>
             ) : null}
@@ -8778,7 +8886,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                 <span className="record-chip">{account.loggedIn ? (authState.offline ? "Offline Cache" : "Active") : "Signed Out"}</span>
               </div>
               <div className="record-actions settings-data-actions">
-                <button className="button button-secondary" type="button" disabled={!account.loggedIn || authBusy} onClick={signOutOfAuth}>Logout</button>
+                <button className="button button-secondary" type="button" disabled={!account.loggedIn || authBusy} onClick={signOutOfAuth}>{authAction === "logout" ? "Logging out..." : "Logout"}</button>
               </div>
             </article>
           </div>
