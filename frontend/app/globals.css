@@ -3077,6 +3077,23 @@ body[data-appearance="dark"] .inventory-smart-button strong {
     min-width: 0;
 }
 
+.inventory-item-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.inventory-item-actions .button {
+  padding: 6px 10px;
+  font-size: 12px;
+}
+
+.inventory-deletion-audit {
+  margin-top: 18px;
+  border-top: 1px solid var(--line);
+  padding-top: 16px;
+}
+
 .inventory-item-price {
     color: var(--muted);
     font-size: 0.78rem;

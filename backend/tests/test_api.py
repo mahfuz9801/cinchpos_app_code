@@ -74,6 +74,37 @@ class CinchPOSAPITestCase(unittest.TestCase):
         self.assertEqual(payload["schema_version"], self.backend.SCHEMA_VERSION)
         self.assertTrue(payload["database"].endswith(".db"))
 
+    def test_customer_search_and_pagination_return_bounded_results(self):
+        self.create_customer(name="Alpha Traders", phone="+919811111111")
+        self.create_customer(name="Beta Traders", phone="+919822222222")
+        self.create_customer(name="Gamma Retail", phone="+919833333333")
+
+        response = self.client.get("/api/customers?q=traders&limit=1&offset=1")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["total"], 2)
+        self.assertEqual(len(payload["items"]), 1)
+        self.assertEqual(payload["items"][0]["name"], "Beta Traders")
+
+    def test_inventory_deletion_is_audited(self):
+        item = {
+            "id": "item-123",
+            "itemName": "Audit Product",
+            "stock": 8,
+            "mrp": 120,
+            "inclusivePrice": 100,
+        }
+        response = self.client.post("/api/inventory/deletions", json={"item": item})
+
+        self.assertEqual(response.status_code, 201)
+        logs_response = self.client.get("/api/inventory/deletions")
+        self.assertEqual(logs_response.status_code, 200)
+        logs = logs_response.get_json()
+        self.assertEqual(logs[0]["inventoryItemId"], "item-123")
+        self.assertEqual(logs[0]["itemName"], "Audit Product")
+        self.assertEqual(logs[0]["item"]["stock"], 8)
+
     def test_customer_account_register_login_logout_and_snapshot(self):
         weak_response = self.client.post(
             "/api/auth/register",

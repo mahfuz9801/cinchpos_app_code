@@ -117,6 +117,8 @@ PASSWORD_RULES = {
 DB_INDEX_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS idx_customers_phone ON customers(phone)",
     "CREATE INDEX IF NOT EXISTS idx_customers_business_id ON customers(business_id)",
+    "CREATE INDEX IF NOT EXISTS idx_customers_business_name ON customers(business_id, name COLLATE NOCASE)",
+    "CREATE INDEX IF NOT EXISTS idx_customers_business_phone ON customers(business_id, phone)",
     "CREATE INDEX IF NOT EXISTS idx_invoices_customer_id ON invoices(customer_id)",
     "CREATE INDEX IF NOT EXISTS idx_invoices_business_id ON invoices(business_id)",
     "CREATE INDEX IF NOT EXISTS idx_invoices_issued_on ON invoices(issued_on)",
@@ -144,6 +146,7 @@ DB_INDEX_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS idx_online_products_store_id ON online_products(store_id)",
     "CREATE INDEX IF NOT EXISTS idx_online_orders_business_id ON online_orders(business_id)",
     "CREATE INDEX IF NOT EXISTS idx_online_orders_store_id ON online_orders(store_id)",
+    "CREATE INDEX IF NOT EXISTS idx_inventory_deletion_logs_business_created ON inventory_deletion_logs(business_id, created_at DESC)",
 )
 
 PERMISSIONS = {
@@ -1327,6 +1330,21 @@ def ensure_auth_schema(conn):
             device_info TEXT DEFAULT '',
             detail_json TEXT NOT NULL DEFAULT '{}',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS inventory_deletion_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            business_id TEXT NOT NULL,
+            inventory_item_id TEXT DEFAULT '',
+            item_name TEXT NOT NULL,
+            item_snapshot_json TEXT NOT NULL DEFAULT '{}',
+            deleted_by TEXT DEFAULT '',
+            deleted_role TEXT DEFAULT '',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (business_id) REFERENCES businesses (id)
         )
         """
     )
@@ -3403,17 +3421,113 @@ def dashboard_trend():
 @app.route("/api/customers", methods=["GET"])
 @require_permission("customers:read")
 def list_customers():
+    search = (request.args.get("q") or "").strip()
+    limit_text = (request.args.get("limit") or "").strip()
+    offset_text = (request.args.get("offset") or "").strip()
+    try:
+        limit = min(2000, max(1, int(limit_text))) if limit_text else None
+        offset = max(0, int(offset_text)) if offset_text else 0
+    except ValueError:
+        return jsonify({"error": "limit and offset must be whole numbers."}), 400
+
+    params = [current_business_id()]
+    where_clause = "WHERE business_id = ?"
+    if search:
+        escaped_search = search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        like = f"%{escaped_search}%"
+        where_clause += " AND (name LIKE ? ESCAPE '\\' OR phone LIKE ? ESCAPE '\\' OR business_name LIKE ? ESCAPE '\\' OR email LIKE ? ESCAPE '\\')"
+        params.extend([like, like, like, like])
     with closing(get_connection()) as conn:
-        rows = conn.execute(
-            """
+        total = conn.execute(f"SELECT COUNT(*) AS total FROM customers {where_clause}", params).fetchone()["total"]
+        query = f"""
             SELECT id, name, email, address, phone, business_name, created_at
             FROM customers
-            WHERE business_id = ?
+            {where_clause}
             ORDER BY name ASC
+        """
+        if limit:
+            query += " LIMIT ? OFFSET ?"
+            rows = conn.execute(query, [*params, limit, offset]).fetchall()
+        else:
+            rows = conn.execute(query, params).fetchall()
+    serialized = [serialize_customer(row) for row in rows]
+    if search or limit is not None or offset:
+        return jsonify({"items": serialized, "total": total, "limit": limit or total, "offset": offset})
+    return jsonify(serialized)
+
+
+def inventory_deletion_is_allowed(context):
+    return is_owner_context(context) or normalize_role_key(context.get("role")) == "stock_manager"
+
+
+@app.route("/api/inventory/deletions", methods=["GET", "POST"])
+@require_permission("inventory:write")
+def inventory_deletions():
+    context = current_auth_context()
+    if not inventory_deletion_is_allowed(context):
+        return jsonify({"error": "Only the owner or stock manager can delete inventory products."}), 403
+
+    business_id = current_business_id()
+    if request.method == "GET":
+        try:
+            limit = min(250, max(1, int(request.args.get("limit") or 100)))
+        except ValueError:
+            return jsonify({"error": "limit must be a whole number."}), 400
+        with closing(get_connection()) as conn:
+            rows = conn.execute(
+                """
+                SELECT id, inventory_item_id, item_name, item_snapshot_json,
+                       deleted_by, deleted_role, created_at
+                FROM inventory_deletion_logs
+                WHERE business_id = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (business_id, limit),
+            ).fetchall()
+        return jsonify([
+            {
+                "id": row["id"],
+                "inventoryItemId": row["inventory_item_id"],
+                "itemName": row["item_name"],
+                "item": json_loads(row["item_snapshot_json"], {}),
+                "deletedBy": row["deleted_by"],
+                "deletedRole": row["deleted_role"],
+                "deletedAt": row["created_at"],
+            }
+            for row in rows
+        ])
+
+    data = request.get_json() or {}
+    item = data.get("item") if isinstance(data.get("item"), dict) else {}
+    item_name = str(item.get("itemName") or item.get("item_name") or item.get("name") or "").strip()
+    if not item_name:
+        return jsonify({"error": "A deleted product name is required for the audit record."}), 400
+    inventory_item_id = str(item.get("id") or data.get("inventoryItemId") or "").strip()
+    with closing(get_connection()) as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO inventory_deletion_logs (
+                business_id, inventory_item_id, item_name, item_snapshot_json,
+                deleted_by, deleted_role
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (current_business_id(),),
-        ).fetchall()
-    return jsonify([serialize_customer(row) for row in rows])
+            (
+                business_id,
+                inventory_item_id,
+                item_name,
+                json_dumps(item),
+                context.get("user_id", ""),
+                normalize_role_key(context.get("role")),
+            ),
+        )
+        conn.commit()
+    log_auth_event("inventory.product_deleted", context, {
+        "inventory_item_id": inventory_item_id,
+        "item_name": item_name,
+    })
+    return jsonify({"id": cursor.lastrowid, "status": "recorded"}), 201
 
 
 @app.route("/api/customers", methods=["POST"])

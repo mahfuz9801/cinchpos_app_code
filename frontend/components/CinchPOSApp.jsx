@@ -21,6 +21,7 @@ import {
   loginCinchAccount,
   logoutCinchAccount,
   publishOnlineStore,
+  recordInventoryDeletion,
   recordPayment,
   recoverLocalBillingData,
   registerCinchAccount,
@@ -1445,6 +1446,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
   const [inventorySearch, setInventorySearch] = useState("");
   const [inventorySort, setInventorySort] = useState("nameAsc");
   const [inventoryItems, setInventoryItems] = useState([]);
+  const [inventoryDeletionLogs, setInventoryDeletionLogs] = useState([]);
   const [inventoryVisibleCount, setInventoryVisibleCount] = useState(120);
   const [sellOnlineSearch, setSellOnlineSearch] = useState("");
   const [sellOnlineCatalog, setSellOnlineCatalog] = useState({});
@@ -1888,7 +1890,22 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       ))
       .sort((a, b) => cleanText(a.paid_on).localeCompare(cleanText(b.paid_on)) || Number(a.id || 0) - Number(b.id || 0));
   }, [payments, selectedInvoice]);
+  const customerPhoneIndex = useMemo(() => {
+    const index = new Map();
+    customers.forEach((customer) => {
+      const digits = String(customer?.phone || "").replace(/\D+/g, "");
+      if (!digits) {
+        return;
+      }
+      index.set(digits, customer);
+      if (digits.length >= 10) {
+        index.set(digits.slice(-10), customer);
+      }
+    });
+    return index;
+  }, [customers]);
   const isOwner = cleanText(authState.role).toLowerCase() === "owner" || authState.userId === "local-owner" || hasPermission(authState, "*");
+  const canDeleteInventory = isOwner || cleanText(authState.role).toLowerCase() === "stock_manager";
   const authGateActive = authState.required && !authState.authenticated;
   const visibleBusinessName = authGateActive ? APP_NAME : businessName;
   const visibleOwnerName = authGateActive ? "Secure Workspace" : ownerName;
@@ -2268,6 +2285,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     setSettings(storedSettings);
     setAccount({ ...defaultAccount, ...readStoredJSON(storageKeys.account, defaultAccount) });
     setInventoryItems(readStoredJSON(storageKeys.inventory, []));
+    setInventoryDeletionLogs(readStoredJSON(storageKeys.inventoryDeletionLogs, []));
     setBankAccount(readStoredJSON(storageKeys.bank, null));
     const storedPurchaseRecords = readStoredJSON(storageKeys.purchases, []);
     const legacyPurchaseBills = readStoredJSON(storageKeys.purchaseBills, []);
@@ -2300,6 +2318,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     settings,
     account,
     inventoryItems,
+    inventoryDeletionLogs,
     bankAccount,
     purchaseRecords,
     expenseRecords,
@@ -2315,6 +2334,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     employees,
     expenseRecords,
     inventoryItems,
+    inventoryDeletionLogs,
     invoiceDetails,
     posState,
     purchaseRecords,
@@ -2336,6 +2356,9 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     }
     if (Array.isArray(payload.inventoryItems)) {
       setInventoryItems(payload.inventoryItems);
+    }
+    if (Array.isArray(payload.inventoryDeletionLogs)) {
+      setInventoryDeletionLogs(payload.inventoryDeletionLogs);
     }
     if ("bankAccount" in payload) {
       setBankAccount(payload.bankAccount || null);
@@ -2414,6 +2437,12 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     }
     writeStoredJSON(storageKeys.inventory, inventoryItems);
   }, [inventoryItems, workspaceLoaded]);
+  useEffect(() => {
+    if (!workspaceLoaded) {
+      return;
+    }
+    writeStoredJSON(storageKeys.inventoryDeletionLogs, inventoryDeletionLogs);
+  }, [inventoryDeletionLogs, workspaceLoaded]);
   useEffect(() => {
     if (!workspaceLoaded) {
       return;
@@ -2693,7 +2722,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       getDashboard(),
       getInvoices(),
       getPayments(),
-      getCustomers(),
+      getCustomers({ limit: 2000 }),
       getTrend({
         view: trendView === "custom" && trendStartDate && trendEndDate ? "custom" : (trendView === "custom" ? "weekly" : trendView),
         startDate: trendView === "custom" ? trendStartDate : undefined,
@@ -2707,7 +2736,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     setAlerts(dashboard.alerts || []);
     setTrend(trendRows.points || []);
     setRealInvoices(invoices || []);
-    setCustomers(customerRows || []);
+    setCustomers(Array.isArray(customerRows) ? customerRows : (customerRows?.items || []));
   }, [trendEndDate, trendStartDate, trendView]);
 
   const recoverPreviousLocalBilling = useCallback(async () => {
@@ -3053,7 +3082,8 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
     if (!normalizedPhone) {
       return null;
     }
-    return customers.find((customer) => phonesMatch(customer.phone, normalizedPhone)) || null;
+    const digits = String(normalizedPhone).replace(/\D+/g, "");
+    return customerPhoneIndex.get(digits) || customerPhoneIndex.get(digits.slice(-10)) || null;
   }
 
   function replaceCustomerInState(customerRecord) {
@@ -6557,6 +6587,58 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
       setDraft(buildInventoryDraft(nextItem));
       showMessage(selectedInventoryItem ? "Inventory item updated." : "Inventory item saved with stock, pricing, and date details.");
     }
+    async function deleteInventoryItem(item, itemIndex) {
+      if (!canDeleteInventory) {
+        showMessage("Only the owner or stock manager can delete inventory products.");
+        return;
+      }
+      const itemName = getInventoryItemName(item) || "this product";
+      if (!window.confirm(`Delete ${itemName}? Its details will remain in the deletion record, but it will no longer be available for billing or online sales.`)) {
+        return;
+      }
+      const itemKey = getInventoryItemKey(item, itemIndex);
+      const deletedAt = new Date().toISOString();
+      const auditRecord = {
+        id: `inventory-delete-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        inventoryItemId: String(item.id || itemKey),
+        itemName,
+        item: { ...item },
+        deletedBy: cleanText(authState.name || authState.email || authState.customerId || authState.userId, "Current user"),
+        deletedRole: cleanText(authState.role, "owner"),
+        deletedAt,
+        syncStatus: authState.offline ? "Saved locally" : "Syncing"
+      };
+
+      setInventoryItems((current) => current.filter((entry, index) => (
+        String(entry.id || "") !== String(item.id || "") && getInventoryItemKey(entry, index) !== itemKey
+      )));
+      setSellOnlineCatalog((current) => {
+        const next = { ...current };
+        delete next[itemKey];
+        delete next[String(item.id || "")];
+        return next;
+      });
+      setInventoryDeletionLogs((current) => [auditRecord, ...current].slice(0, 1000));
+      if (selectedInventoryItemId === itemKey || selectedInventoryItemId === String(item.id || "")) {
+        resetInventoryEditor();
+      }
+
+      if (!authState.offline) {
+        try {
+          await recordInventoryDeletion({ inventoryItemId: auditRecord.inventoryItemId, item: auditRecord.item });
+          setInventoryDeletionLogs((current) => current.map((record) => (
+            record.id === auditRecord.id ? { ...record, syncStatus: "Recorded" } : record
+          )));
+        } catch (error) {
+          setInventoryDeletionLogs((current) => current.map((record) => (
+            record.id === auditRecord.id ? { ...record, syncStatus: "Saved locally" } : record
+          )));
+          showMessage(`${itemName} was deleted. The audit record is saved locally and will sync when the billing service is available.`);
+          return;
+        }
+      }
+      showMessage(`${itemName} deleted and recorded in the inventory audit.`);
+    }
     if (!active) {
       return <section id="inventoryView" className="app-view" data-title="Inventory"></section>;
     }
@@ -6750,7 +6832,21 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                       </div>
                       <div className="inventory-item-compact-bottom">
                         <span className="inventory-item-price">Price <strong>{currency(inclusivePrice)}</strong></span>
-                        <span className="inventory-item-open">{isSelected ? "Selected" : "View details"}</span>
+                        <div className="inventory-item-actions">
+                          {canDeleteInventory ? (
+                            <button
+                              type="button"
+                              className="button button-secondary danger-action"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                deleteInventoryItem(item, index);
+                              }}
+                            >
+                              Delete
+                            </button>
+                          ) : null}
+                          <span className="inventory-item-open">{isSelected ? "Selected" : "View details"}</span>
+                        </div>
                       </div>
                   </article>
                 );
@@ -6762,6 +6858,29 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
                   Load More Items
                 </button>
               </div>
+            ) : null}
+            {canDeleteInventory && inventoryDeletionLogs.length ? (
+              <section className="inventory-deletion-audit" aria-label="Recent product deletions">
+                <div className="panel-header">
+                  <div>
+                    <h3>Recent Product Deletions</h3>
+                    <div className="panel-subtitle">Product snapshots are retained for accountability and restore reference.</div>
+                  </div>
+                </div>
+                <div className="record-list">
+                  {inventoryDeletionLogs.slice(0, 5).map((record) => (
+                    <article className="record-card" key={record.id}>
+                      <div className="record-top">
+                        <div>
+                          <h3>{record.itemName}</h3>
+                          <p className="record-meta">{record.deletedBy} | {record.deletedRole} | {formatDate(record.deletedAt)}</p>
+                        </div>
+                        <span className="record-chip">{record.syncStatus || "Recorded"}</span>
+                      </div>
+                    </article>
+                  ))}
+                </div>
+              </section>
             ) : null}
           </section>
         </div>
@@ -8085,6 +8204,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
           settings: { ...defaultSettings, ...settings },
           account,
           inventory: inventoryItems,
+          inventoryDeletionLogs,
           bankAccount,
           purchaseRecords,
           expenseRecords,
@@ -8123,6 +8243,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         setSettings({ ...defaultSettings, ...(snapshot.settings || {}) });
         setAccount({ ...defaultAccount, ...(snapshot.account || {}) });
         setInventoryItems(Array.isArray(snapshot.inventory) ? snapshot.inventory : []);
+        setInventoryDeletionLogs(Array.isArray(snapshot.inventoryDeletionLogs) ? snapshot.inventoryDeletionLogs : []);
         setBankAccount(snapshot.bankAccount ?? null);
         setPurchaseRecords(mergePurchaseCollections(snapshot.purchaseRecords, snapshot.purchaseBills));
         setExpenseRecords(Array.isArray(snapshot.expenseRecords) ? snapshot.expenseRecords : []);
@@ -8147,6 +8268,7 @@ export default function CinchPOSApp({ initialView = "dashboard" }) {
         return;
       }
       setInventoryItems([]);
+      setInventoryDeletionLogs([]);
       setSellOnlineCatalog({});
       setBankAccount(null);
       setPurchaseRecords([]);

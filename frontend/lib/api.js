@@ -294,8 +294,19 @@ export function getPublicOnlineInvoice(orderId) {
   return fetchJSON(`/api/public/orders/${encodeURIComponent(orderId)}/invoice`);
 }
 
-export function getCustomers() {
-  return fetchJSON("/api/customers");
+export function getCustomers({ query = "", limit, offset } = {}) {
+  const params = new URLSearchParams();
+  if (query) {
+    params.set("q", query);
+  }
+  if (limit) {
+    params.set("limit", String(limit));
+  }
+  if (offset) {
+    params.set("offset", String(offset));
+  }
+  const suffix = params.size ? `?${params.toString()}` : "";
+  return fetchJSON(`/api/customers${suffix}`);
 }
 
 export function createCustomer(payload) {
@@ -308,6 +319,13 @@ export function createCustomer(payload) {
 export function updateCustomer(customerId, payload) {
   return fetchJSON(`/api/customers/${customerId}`, {
     method: "PUT",
+    body: JSON.stringify(payload)
+  });
+}
+
+export function recordInventoryDeletion(payload) {
+  return fetchJSON("/api/inventory/deletions", {
+    method: "POST",
     body: JSON.stringify(payload)
   });
 }

@@ -93,6 +93,7 @@ export const storageKeys = {
   settings: "cinchPOSSettings",
   account: "cinchPOSAccount",
   inventory: "cinchPOSInventory",
+  inventoryDeletionLogs: "cinchPOSInventoryDeletionLogs",
   bank: "cinchPOSBankAccount",
   purchases: "cinchPOSPurchases",
   expenses: "cinchPOSExpenses",
